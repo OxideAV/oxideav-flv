@@ -83,12 +83,16 @@ fn walk_real_flv_sample() {
     let mut video_count = 0u32;
     let mut keyframe_count = 0u32;
     let mut first_keyframe_bytes: Option<Vec<u8>> = None;
+    let mut first_audio_bytes: Option<Vec<u8>> = None;
     let mut last_pts: i64 = 0;
     loop {
         match dmx.next_packet() {
             Ok(pkt) => {
                 if pkt.stream_index == audio_idx {
                     audio_count += 1;
+                    if first_audio_bytes.is_none() {
+                        first_audio_bytes = Some(pkt.data.clone());
+                    }
                 } else if pkt.stream_index == video_idx {
                     video_count += 1;
                     if pkt.flags.keyframe {
@@ -108,6 +112,37 @@ fn walk_real_flv_sample() {
             Err(e) => panic!("demux error: {e}"),
         }
     }
+
+    // --- MP3 sanity: the first audio packet should start with the 11-bit
+    // MPEG audio syncword (0xFFE).
+    let mp3 = first_audio_bytes.expect("captured first audio");
+    assert!(mp3.len() >= 4, "MP3 packet too short");
+    let sync = ((mp3[0] as u16) << 3) | ((mp3[1] as u16) >> 5);
+    assert_eq!(sync & 0x07FF, 0x07FF, "MP3 syncword missing");
+    // --- VP6 sanity: the first keyframe body should parse as a keyframe
+    // with a non-zero mb_width / mb_height. Manually decode enough of the
+    // VP6 frame header to verify without pulling in oxideav-vp6 as a
+    // cross-crate dev-dep (that would be a circular dep for the
+    // standalone release of these crates).
+    let vp6 = first_keyframe_bytes.expect("captured first keyframe");
+    // vp6[0] is the FLV 1-byte VP6 adjustment byte; vp6[1..] is the
+    // actual VP6 bitstream.
+    assert!(vp6.len() > 8, "VP6 keyframe too short");
+    let stream = &vp6[1..];
+    let frame_mode = stream[0] >> 7;
+    assert_eq!(frame_mode, 0, "first VP6 frame should be a keyframe");
+    let separated_coeff = stream[0] & 0x01;
+    let offset = if separated_coeff != 0 { 4 } else { 2 };
+    assert!(stream.len() > offset + 3, "VP6 header too short");
+    let mb_height = stream[offset] as u32;
+    let mb_width = stream[offset + 1] as u32;
+    assert!(mb_width > 0 && mb_width < 256);
+    assert!(mb_height > 0 && mb_height < 256);
+    eprintln!(
+        "VP6 keyframe[0]: {}x{}px (mb_w={mb_width} mb_h={mb_height})",
+        mb_width * 16,
+        mb_height * 16
+    );
     eprintln!(
         "sample: audio={audio_count} video={video_count} keyframes={keyframe_count} \
          last_pts={last_pts}ms duration={}us",
@@ -116,13 +151,10 @@ fn walk_real_flv_sample() {
     assert!(audio_count > 0, "no audio packets");
     assert!(video_count > 0, "no video packets");
     assert!(keyframe_count > 0, "no video keyframes");
-    // Spot-check the first keyframe: VP6 payloads have a 1-byte FLV
-    // adjustment prefix, then the coded bitstream. Just make sure we
-    // got some plausible amount of data.
-    let kf = first_keyframe_bytes.expect("keyframe captured");
+    // Spot-check the first keyframe was a plausible size.
     assert!(
-        kf.len() > 16,
+        vp6.len() > 16,
         "first keyframe suspiciously short ({} bytes)",
-        kf.len()
+        vp6.len()
     );
 }
