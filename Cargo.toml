@@ -1,0 +1,18 @@
+[package]
+name = "oxideav-flv"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-flv"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust Flash Video (FLV) container demuxer for oxideav"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-flv"
+keywords = ["multimedia", "flv", "flash", "container", "pure-rust"]
+categories = ["multimedia::video", "parser-implementations"]
+
+[dependencies]
+oxideav-core = "0.1"
+oxideav-container = "0.1"
