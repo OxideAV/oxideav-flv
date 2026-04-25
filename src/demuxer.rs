@@ -24,11 +24,11 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use oxideav_container::{Demuxer, ReadSeek};
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, Packet, Result, SampleFormat, StreamInfo,
     TimeBase,
 };
+use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::amf0::{parse_amf0_value, AmfValue};
 use crate::header::FlvHeader;

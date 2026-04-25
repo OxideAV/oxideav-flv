@@ -17,7 +17,7 @@ pub mod demuxer;
 pub mod header;
 pub mod tag;
 
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 
 pub use amf0::{parse_amf0_value, AmfValue};
 pub use demuxer::{open as open_demuxer, FlvDemuxer};
@@ -40,7 +40,7 @@ pub fn register(reg: &mut ContainerRegistry) {
 /// `0`. The four-byte magic is `FLV\x01` followed by a flags byte and a
 /// 4-byte big-endian `DataOffset` of 9. The check is deliberately tight
 /// so we don't grab random files that happen to start with `FL`.
-fn probe(p: &oxideav_container::ProbeData) -> u8 {
+fn probe(p: &oxideav_core::ProbeData) -> u8 {
     if p.buf.len() < 9 {
         return 0;
     }

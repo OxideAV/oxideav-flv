@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 
-use oxideav_container::ReadSeek;
+use oxideav_core::ReadSeek;
 use oxideav_core::{Error, NullCodecResolver};
 use oxideav_flv::open_demuxer;
 
