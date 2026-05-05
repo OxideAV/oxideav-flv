@@ -30,10 +30,19 @@ pub use tag::{
 
 /// Register the demuxer, its probe, and the `.flv` extension with a
 /// [`ContainerRegistry`].
-pub fn register(reg: &mut ContainerRegistry) {
+pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_demuxer("flv", demuxer::open);
     reg.register_extension("flv", "flv");
     reg.register_probe("flv", probe);
+}
+
+/// Install the FLV container into a [`oxideav_core::RuntimeContext`].
+///
+/// Convenience wrapper around [`register_containers`] that matches the
+/// uniform `register(&mut RuntimeContext)` entry point every sibling
+/// crate exposes.
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    register_containers(&mut ctx.containers);
 }
 
 /// Content probe — returns `100` for a well-formed FLV signature, else
@@ -58,4 +67,16 @@ fn probe(p: &oxideav_core::ProbeData) -> u8 {
         return 0;
     }
     100
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_via_runtime_context_installs_container() {
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        register(&mut ctx);
+        assert_eq!(ctx.containers.container_for_extension("flv"), Some("flv"));
+    }
 }
