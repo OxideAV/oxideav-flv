@@ -24,7 +24,12 @@ oxideav-flv = "0.0"
   payload + close.
 - Script tag (type 0x12, AMF0 `onMetaData`) — parsed for `duration`,
   `width`, `height`, `videocodecid`, `audiocodecid`, `framerate`,
-  `audiodatarate`, `videodatarate`, `creationdate`, etc.
+  `audiodatarate`, `videodatarate`, `creationdate`, etc. The optional
+  `keyframes` toc (`filepositions[]` / `times[]`) is harvested for
+  O(log n) seeks.
+- `Demuxer::seek_to` — bisects the `keyframes` toc when present,
+  otherwise scans tags forward to the first video keyframe (or audio
+  packet, for audio-only files) at-or-after the requested pts.
 - Audio tag (0x08):
   - Codec id 2 = MP3, 14 = MP3 8 kHz.
   - Codec id 10 = AAC. First packet-type byte distinguishes

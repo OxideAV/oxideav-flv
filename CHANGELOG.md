@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Demuxer::seek_to` — O(log n) bisect on the `onMetaData.keyframes`
+  toc (`filepositions[]` / `times[]`) when present, scan-forward
+  fallback otherwise. Audio-only files use the scan path against
+  every audio tag (each is independently decodable).
+
 ## [0.0.3](https://github.com/OxideAV/oxideav-flv/compare/v0.0.2...v0.0.3) - 2026-05-06
 
 ### Other

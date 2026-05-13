@@ -37,6 +37,21 @@ use crate::tag::{
     AUDIO_CODEC_AAC, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A,
 };
 
+/// Parsed `keyframes` toc from the `onMetaData` script tag — the
+/// `filepositions[]` / `times[]` arrays most FLV encoders write near
+/// the start of the file. Parallel arrays of equal length; entries
+/// are sorted by `times` ascending. When present, seeks are O(log n)
+/// bisects on `times`.
+#[derive(Clone, Debug, Default)]
+struct KeyframeIndex {
+    /// Absolute byte offsets of each video keyframe tag (the TagType
+    /// byte, *not* the preceding PreviousTagSize prefix).
+    file_positions: Vec<u64>,
+    /// Wall-clock times in **seconds** of each keyframe (`f64` as
+    /// stored in AMF0). Same length as `file_positions`.
+    times_seconds: Vec<f64>,
+}
+
 const STREAM_AUDIO: u32 = 0;
 const STREAM_VIDEO: u32 = 1;
 
@@ -52,6 +67,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
     let mut streams_by_type: [Option<StreamInfo>; 2] = [None, None];
     let mut metadata: Vec<(String, String)> = Vec::new();
     let mut duration_micros: Option<i64> = None;
+    let mut keyframe_index: Option<KeyframeIndex> = None;
     // Scan up to a reasonable cap — we only need one audio + one video tag
     // plus the script tag. Keep a hard limit so pathological files can't
     // force us to pre-read the whole input here.
@@ -83,7 +99,12 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
 
         match kind {
             TagType::ScriptData => {
-                parse_script_body(&body, &mut metadata, &mut duration_micros);
+                parse_script_body(
+                    &body,
+                    &mut metadata,
+                    &mut duration_micros,
+                    &mut keyframe_index,
+                );
             }
             TagType::Audio => {
                 if streams_by_type[STREAM_AUDIO as usize].is_none() && !body.is_empty() {
@@ -135,6 +156,8 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
         // we surface exactly one config packet before the first data packet
         // for each of those codecs.
         pending_packet: None,
+        first_tag_pos,
+        keyframe_index,
     }))
 }
 
@@ -148,6 +171,16 @@ pub struct FlvDemuxer {
     audio_stream_index: Option<u32>,
     video_stream_index: Option<u32>,
     pending_packet: Option<Packet>,
+    /// Byte offset of the first FLV tag (immediately after the file
+    /// header + leading PreviousTagSize). Used as the "rewind to
+    /// start" landing point for `seek_to(0)` and as the lower bound
+    /// for scan-forward seeks.
+    first_tag_pos: u64,
+    /// Cached `keyframes` table parsed out of `onMetaData`. `None` when
+    /// no script tag was present, when the tag did not carry a
+    /// `keyframes` object, or when the arrays were mismatched /
+    /// truncated. Callers fall back to scan-forward.
+    keyframe_index: Option<KeyframeIndex>,
 }
 
 impl std::fmt::Debug for FlvDemuxer {
@@ -157,6 +190,10 @@ impl std::fmt::Debug for FlvDemuxer {
             .field("duration_micros", &self.duration_micros)
             .field("audio_stream_index", &self.audio_stream_index)
             .field("video_stream_index", &self.video_stream_index)
+            .field(
+                "keyframe_index_entries",
+                &self.keyframe_index.as_ref().map(|i| i.file_positions.len()),
+            )
             .finish()
     }
 }
@@ -226,6 +263,134 @@ impl Demuxer for FlvDemuxer {
 
     fn duration_micros(&self) -> Option<i64> {
         self.duration_micros
+    }
+
+    /// Seek to the nearest video keyframe at or before `pts` (in the
+    /// stream's time base — always 1/1000 s for FLV).
+    ///
+    /// Two paths:
+    ///
+    /// 1. **Toc path** — when `onMetaData.keyframes` carries parallel
+    ///    `filepositions[]` / `times[]` arrays, binary-search `times`
+    ///    for the largest entry ≤ target_seconds and jump to the
+    ///    corresponding byte offset. O(log n).
+    /// 2. **Scan path** — rewind to the start of the tag stream and
+    ///    walk tags forward, returning the first video keyframe tag
+    ///    whose timestamp is ≥ target_pts. (We can't reliably scan
+    ///    *backwards* in a flat tag stream without an index, so for
+    ///    target_pts > 0 we land "at or after" rather than "at or
+    ///    before". `seek_to(0)` always lands at the start.)
+    ///
+    /// Audio-only streams have no notion of "keyframe" (every audio
+    /// packet is independently decodable) — for the audio stream the
+    /// scan path stops at the first audio tag ≥ target_pts.
+    ///
+    /// `pts` is clamped at zero; values past the end of the file land
+    /// at the last keyframe (toc path) or fall through to EOF on the
+    /// next `next_packet()` call (scan path).
+    fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        // Validate the requested stream index.
+        if (stream_index as usize) >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "FLV: stream index {stream_index} out of range (have {} stream(s))",
+                self.streams.len()
+            )));
+        }
+        let target_pts_ms = pts.max(0);
+
+        // Reset transient state so callers don't see a stale pending
+        // packet from before the seek.
+        self.pending_packet = None;
+
+        // Toc path — only meaningful when video is present (the toc
+        // describes video keyframes).
+        if let (Some(idx), Some(_video_stream_index)) =
+            (self.keyframe_index.clone(), self.video_stream_index)
+        {
+            // Defensive: empty / mismatched arrays should have been
+            // rejected at parse time, but guard anyway.
+            if !idx.times_seconds.is_empty() && idx.times_seconds.len() == idx.file_positions.len()
+            {
+                let target_seconds = (target_pts_ms as f64) / 1000.0;
+                let pos = match idx.times_seconds.binary_search_by(|t| {
+                    t.partial_cmp(&target_seconds)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }) {
+                    Ok(i) => i,
+                    // bisect-left: `i` is the first entry strictly
+                    // greater than target. Step back to the entry at
+                    // or before target (clamping to 0).
+                    Err(i) => i.saturating_sub(1),
+                };
+                let dest = idx.file_positions[pos];
+                // `dest` is the absolute byte offset of the keyframe
+                // tag's TagType byte. Seek there so `next_packet` can
+                // re-read the tag header from that point.
+                self.input.seek(SeekFrom::Start(dest))?;
+                let landed_ms = (idx.times_seconds[pos] * 1000.0).round() as i64;
+                return Ok(landed_ms);
+            }
+        }
+
+        // Scan path — walk tags from the start looking for a video
+        // keyframe ≥ target_pts (or, for audio-only files, any audio
+        // tag ≥ target_pts).
+        self.input.seek(SeekFrom::Start(self.first_tag_pos))?;
+        // Are we seeking on the audio or video stream?
+        let seeking_video = match self.video_stream_index {
+            Some(i) => i == stream_index,
+            None => false,
+        };
+        loop {
+            let tag_pos = self.input.stream_position()?;
+            let header = match TagHeader::read(&mut *self.input) {
+                Ok(h) => h,
+                Err(Error::Eof) => {
+                    // Past EOF — land at the end. `next_packet` will
+                    // surface EOF on the next call.
+                    return Ok(target_pts_ms);
+                }
+                Err(e) => return Err(e),
+            };
+            let kind = match header.kind {
+                Some(k) => k,
+                None => {
+                    skip_bytes(&mut *self.input, header.data_size as u64 + 4)?;
+                    continue;
+                }
+            };
+            let want_match = match kind {
+                TagType::Video if seeking_video || self.video_stream_index.is_some() => {
+                    // Peek the first byte of the body for the keyframe
+                    // flag without consuming the rest of the tag.
+                    if header.data_size == 0 {
+                        false
+                    } else {
+                        let mut b = [0u8; 1];
+                        self.input.read_exact(&mut b)?;
+                        let vh = VideoTagHeader::parse(b[0]);
+                        // Rewind past the byte we just peeked so the
+                        // tag is fully unread when we either jump out
+                        // or skip past it below.
+                        self.input.seek(SeekFrom::Current(-1))?;
+                        vh.is_keyframe() && (header.timestamp_ms as i64) >= target_pts_ms
+                    }
+                }
+                TagType::Audio if !seeking_video && self.video_stream_index.is_none() => {
+                    // Audio-only: every audio packet is a keyframe.
+                    (header.timestamp_ms as i64) >= target_pts_ms
+                }
+                _ => false,
+            };
+            if want_match {
+                // Rewind to the start of this tag so `next_packet`
+                // re-reads its header on the next call.
+                self.input.seek(SeekFrom::Start(tag_pos))?;
+                return Ok(header.timestamp_ms as i64);
+            }
+            // Skip body + trailing PreviousTagSize and try the next.
+            skip_bytes(&mut *self.input, header.data_size as u64 + 4)?;
+        }
     }
 }
 
@@ -409,6 +574,7 @@ fn parse_script_body(
     body: &[u8],
     metadata: &mut Vec<(String, String)>,
     duration_micros: &mut Option<i64>,
+    keyframe_index: &mut Option<KeyframeIndex>,
 ) {
     // Script tag body = (AMF0 name, AMF0 value). We only care when the
     // name is "onMetaData" — other variants are rarer and safely ignored.
@@ -429,7 +595,7 @@ fn parse_script_body(
     };
     // Walk top-level object/ecma-array keys and pull them into the
     // metadata bag. Numbers become their displayed form, strings pass
-    // through, everything else is skipped.
+    // through, the `keyframes` object is harvested for the seek toc.
     let entries = match &value {
         AmfValue::Object(v) | AmfValue::EcmaArray(v) => v.as_slice(),
         _ => return,
@@ -450,9 +616,78 @@ fn parse_script_body(
             }
             AmfValue::Boolean(b) => metadata.push((k.clone(), b.to_string())),
             AmfValue::String(s) => metadata.push((k.clone(), s.clone())),
+            AmfValue::Object(_) | AmfValue::EcmaArray(_)
+                if k == "keyframes" && keyframe_index.is_none() =>
+            {
+                *keyframe_index = parse_keyframes_object(v);
+            }
             _ => {}
         }
     }
+}
+
+/// Pull the parallel `filepositions[]` / `times[]` arrays out of a
+/// `keyframes` AMF0 object. Returns `None` when either array is
+/// missing, of the wrong type, or has a mismatched length — callers
+/// fall back to scan-forward seeking on `None`.
+///
+/// Per spec the entries are sorted ascending by `times`. We don't
+/// re-sort: a producer that emits an out-of-order toc is malformed.
+fn parse_keyframes_object(v: &AmfValue) -> Option<KeyframeIndex> {
+    let entries: &[(String, AmfValue)] = match v {
+        AmfValue::Object(b) | AmfValue::EcmaArray(b) => b,
+        _ => return None,
+    };
+    let mut file_positions: Option<Vec<u64>> = None;
+    let mut times_seconds: Option<Vec<f64>> = None;
+    for (k, val) in entries {
+        let arr = match val {
+            AmfValue::StrictArray(a) => a,
+            _ => continue,
+        };
+        let mut nums: Vec<f64> = Vec::with_capacity(arr.len());
+        for av in arr {
+            if let AmfValue::Number(n) = av {
+                if !n.is_finite() {
+                    return None;
+                }
+                nums.push(*n);
+            } else {
+                return None;
+            }
+        }
+        match k.as_str() {
+            "filepositions" => {
+                let mut out = Vec::with_capacity(nums.len());
+                for n in nums {
+                    if n < 0.0 || n > u64::MAX as f64 {
+                        return None;
+                    }
+                    out.push(n as u64);
+                }
+                file_positions = Some(out);
+            }
+            "times" => times_seconds = Some(nums),
+            _ => {}
+        }
+    }
+    let fp = file_positions?;
+    let ts = times_seconds?;
+    if fp.is_empty() || fp.len() != ts.len() {
+        return None;
+    }
+    // Reject NaNs / non-monotonic timing — those would break the
+    // bisect later. We allow exact-duplicate timestamps (rare but
+    // legal when two keyframes share a millisecond).
+    for w in ts.windows(2) {
+        if w[1] < w[0] {
+            return None;
+        }
+    }
+    Some(KeyframeIndex {
+        file_positions: fp,
+        times_seconds: ts,
+    })
 }
 
 fn metadata_lookup_u32(metadata: &[(String, String)], key: &str) -> Option<u32> {
