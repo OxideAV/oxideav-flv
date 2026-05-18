@@ -200,18 +200,45 @@ pub enum FrameType {
     Inter,
     DisposableInter,
     GeneratedKey,
+    /// Per E.4.3.1 "video info/command frame" — body[1] is a UI8 command
+    /// byte, not codec data. Commands defined: `0` = start of client-side
+    /// seeking video sequence, `1` = end. The flag is surfaced so the
+    /// demuxer can route the tag away from the decoder (no codec on
+    /// earth wants to parse it as a frame).
     VideoInfo,
     Unknown(u8),
 }
 
 impl FrameType {
-    fn from_u8(v: u8) -> Self {
+    pub fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::Key,
             2 => Self::Inter,
             3 => Self::DisposableInter,
             4 => Self::GeneratedKey,
             5 => Self::VideoInfo,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+/// Body-byte command values for [`FrameType::VideoInfo`] tags
+/// (spec E.4.3.1 / E.4.3 VideoTagBody, IF FrameType == 5 branch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoInfoCommand {
+    /// `0` — start of client-side-seeking video sequence.
+    StartClientSeek,
+    /// `1` — end of client-side-seeking video sequence.
+    EndClientSeek,
+    /// Any other UI8 — spec-unknown but preserved verbatim.
+    Unknown(u8),
+}
+
+impl VideoInfoCommand {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::StartClientSeek,
+            1 => Self::EndClientSeek,
             other => Self::Unknown(other),
         }
     }
@@ -234,6 +261,139 @@ impl VideoTagHeader {
 
     pub fn is_keyframe(self) -> bool {
         matches!(self.frame_type, FrameType::Key | FrameType::GeneratedKey)
+    }
+
+    /// True when this is a video info / command frame (spec
+    /// FrameType == 5). The body of such tags is **not** codec data —
+    /// the demuxer surfaces them with `flags.discard` set so decoders
+    /// skip them.
+    pub fn is_video_info(self) -> bool {
+        matches!(self.frame_type, FrameType::VideoInfo)
+    }
+}
+
+// ---- encrypted-tag (Annex F) preamble parser -----------------------------
+
+/// Parsed [`EncryptionTagHeader`] + [`FilterParams`] preamble of an
+/// encrypted FLV tag (spec Annex F.3.1 / F.3.2).
+///
+/// Layout when the `Filter` bit of the [`TagHeader`] is set:
+///
+/// ```text
+///   0   1   NumFilters (UI8, shall be 1)
+///   1   N   FilterName (UTF-8, NUL-terminated STRING)
+///   N+1 3   Length     (UI24 BE — bytes of FilterParams that follow)
+///   N+4 L   FilterParams
+/// ```
+///
+/// Two FilterName values are spec-defined:
+/// `"Encryption"` (FLV encryption version 1) and `"SE"` (Selective
+/// Encryption, version 2). Both wrap an `EncryptionFilterParams` or
+/// `SelectiveEncryptionFilterParams` body whose first member is the
+/// 16-byte AES-CBC initialisation vector.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncryptedTagPreamble {
+    pub filter_name: String,
+    /// `true` for non-selective `"Encryption"`, `false` for `"SE"`.
+    /// When `"SE"`, [`Self::is_encrypted`] tells whether *this* tag is
+    /// actually ciphertext (vs in-the-clear with the SE wrapper).
+    pub full_encryption: bool,
+    /// Selective-encryption per-tag indicator. Always `true` for
+    /// non-selective encryption; for `"SE"`, the UB[1] EncryptedAU bit.
+    pub is_encrypted: bool,
+    /// AES-CBC IV — present when [`Self::is_encrypted`] is true.
+    pub iv: Option<[u8; 16]>,
+    /// Number of bytes consumed from the tag body. The remaining
+    /// `tag_data_size - bytes_consumed` bytes are the (possibly
+    /// encrypted) ciphertext body.
+    pub bytes_consumed: usize,
+}
+
+impl EncryptedTagPreamble {
+    /// Parse the EncryptionTagHeader + FilterParams from the start of a
+    /// filtered tag body. Returns `Err(Error::InvalidData)` on a
+    /// malformed preamble (truncated string, NumFilters != 1, unknown
+    /// FilterName, missing IV).
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        if body.is_empty() {
+            return Err(Error::invalid("FLV encrypted tag: empty body"));
+        }
+        let num_filters = body[0];
+        if num_filters != 1 {
+            return Err(Error::invalid(format!(
+                "FLV encrypted tag: NumFilters {num_filters} != 1"
+            )));
+        }
+        // STRING (UTF-8, NUL-terminated, per E.4.4 "STRING" type).
+        let name_start = 1;
+        let nul = body[name_start..]
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or_else(|| Error::invalid("FLV encrypted tag: unterminated FilterName"))?;
+        let filter_name = std::str::from_utf8(&body[name_start..name_start + nul])
+            .map_err(|_| Error::invalid("FLV encrypted tag: non-UTF-8 FilterName"))?
+            .to_string();
+        let name_end = name_start + nul + 1; // skip NUL
+        if body.len() < name_end + 3 {
+            return Err(Error::invalid("FLV encrypted tag: truncated Length"));
+        }
+        let params_len = ((body[name_end] as usize) << 16)
+            | ((body[name_end + 1] as usize) << 8)
+            | (body[name_end + 2] as usize);
+        let params_start = name_end + 3;
+        if body.len() < params_start + params_len {
+            return Err(Error::invalid(
+                "FLV encrypted tag: truncated FilterParams body",
+            ));
+        }
+        let params = &body[params_start..params_start + params_len];
+
+        let (full_encryption, is_encrypted, iv) = match filter_name.as_str() {
+            "Encryption" => {
+                // EncryptionFilterParams: UI8[16] IV.
+                if params.len() < 16 {
+                    return Err(Error::invalid(
+                        "FLV Encryption FilterParams: IV must be 16 bytes",
+                    ));
+                }
+                let mut iv = [0u8; 16];
+                iv.copy_from_slice(&params[..16]);
+                (true, true, Some(iv))
+            }
+            "SE" => {
+                // SelectiveEncryptionFilterParams: UB[1] EncryptedAU +
+                // UB[7] Reserved + IF EncryptedAU UI8[16] IV.
+                if params.is_empty() {
+                    return Err(Error::invalid("FLV SE FilterParams: empty"));
+                }
+                let encrypted_au = (params[0] >> 7) & 0x01 == 1;
+                let iv = if encrypted_au {
+                    if params.len() < 17 {
+                        return Err(Error::invalid(
+                            "FLV SE FilterParams: truncated IV (EncryptedAU=1 needs 1+16 bytes)",
+                        ));
+                    }
+                    let mut iv = [0u8; 16];
+                    iv.copy_from_slice(&params[1..17]);
+                    Some(iv)
+                } else {
+                    None
+                };
+                (false, encrypted_au, iv)
+            }
+            other => {
+                return Err(Error::invalid(format!(
+                    "FLV encrypted tag: unknown FilterName {other:?}"
+                )));
+            }
+        };
+        Ok(Self {
+            filter_name,
+            full_encryption,
+            is_encrypted,
+            iv,
+            bytes_consumed: params_start + params_len,
+        })
     }
 }
 
@@ -302,5 +462,104 @@ mod tests {
     fn eof_read_on_empty() {
         let mut c = Cursor::new(&[] as &[u8]);
         assert!(matches!(TagHeader::read(&mut c), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn encryption_preamble_v1_full_encryption() {
+        // NumFilters=1, FilterName="Encryption\0", Length=16, IV bytes 0x10..0x1F.
+        let mut body = vec![1u8];
+        body.extend_from_slice(b"Encryption\0");
+        body.push(0); // length hi
+        body.push(0); // length mid
+        body.push(16); // length lo (16 bytes IV)
+        let iv: [u8; 16] = std::array::from_fn(|i| 0x10 + i as u8);
+        body.extend_from_slice(&iv);
+        body.extend_from_slice(b"cipherbytes"); // trailing ciphertext
+
+        let p = EncryptedTagPreamble::parse(&body).unwrap();
+        assert_eq!(p.filter_name, "Encryption");
+        assert!(p.full_encryption);
+        assert!(p.is_encrypted);
+        assert_eq!(p.iv, Some(iv));
+        // 1 + len("Encryption\0")=11 + 3 + 16 = 31
+        assert_eq!(p.bytes_consumed, 31);
+        assert_eq!(&body[p.bytes_consumed..], b"cipherbytes");
+    }
+
+    #[test]
+    fn encryption_preamble_v2_selective_unencrypted() {
+        // SE with EncryptedAU=0: just one byte, no IV.
+        let mut body = vec![1u8];
+        body.extend_from_slice(b"SE\0");
+        body.push(0);
+        body.push(0);
+        body.push(1); // length = 1
+        body.push(0x00); // EncryptedAU=0
+        body.extend_from_slice(b"plaintext");
+
+        let p = EncryptedTagPreamble::parse(&body).unwrap();
+        assert_eq!(p.filter_name, "SE");
+        assert!(!p.full_encryption);
+        assert!(!p.is_encrypted);
+        assert_eq!(p.iv, None);
+        // 1 + 3 + 3 + 1 = 8
+        assert_eq!(p.bytes_consumed, 8);
+        assert_eq!(&body[p.bytes_consumed..], b"plaintext");
+    }
+
+    #[test]
+    fn encryption_preamble_v2_selective_encrypted_with_iv() {
+        let mut body = vec![1u8];
+        body.extend_from_slice(b"SE\0");
+        body.push(0);
+        body.push(0);
+        body.push(17); // length = 1 + 16
+        body.push(0x80); // EncryptedAU=1
+        let iv: [u8; 16] = [0xAA; 16];
+        body.extend_from_slice(&iv);
+
+        let p = EncryptedTagPreamble::parse(&body).unwrap();
+        assert!(p.is_encrypted);
+        assert_eq!(p.iv, Some(iv));
+    }
+
+    #[test]
+    fn encryption_preamble_rejects_unknown_filter_name() {
+        let mut body = vec![1u8];
+        body.extend_from_slice(b"Bogus\0");
+        body.push(0);
+        body.push(0);
+        body.push(0); // length 0
+        assert!(matches!(
+            EncryptedTagPreamble::parse(&body),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn encryption_preamble_rejects_truncated_length() {
+        // FilterName terminator present but no length follows.
+        let body = b"\x01Encryption\0\x00";
+        assert!(matches!(
+            EncryptedTagPreamble::parse(body),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn video_info_command_decode() {
+        // FrameType=5, codec_id=2 (Sorenson) -> 0x52
+        let h = VideoTagHeader::parse(0x52);
+        assert!(h.is_video_info());
+        assert!(!h.is_keyframe());
+        assert_eq!(
+            VideoInfoCommand::from_u8(0),
+            VideoInfoCommand::StartClientSeek
+        );
+        assert_eq!(
+            VideoInfoCommand::from_u8(1),
+            VideoInfoCommand::EndClientSeek
+        );
+        assert_eq!(VideoInfoCommand::from_u8(7), VideoInfoCommand::Unknown(7));
     }
 }

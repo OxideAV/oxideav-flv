@@ -23,9 +23,9 @@ pub use amf0::{parse_amf0_value, AmfValue};
 pub use demuxer::{open as open_demuxer, FlvDemuxer};
 pub use header::{FlvHeader, FLV_SIGNATURE};
 pub use tag::{
-    audio_codec_id_str, video_codec_id_str, AudioTagHeader, TagHeader, TagType, VideoTagHeader,
-    AUDIO_CODEC_AAC, AUDIO_CODEC_MP3, AUDIO_CODEC_MP3_8K, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A,
-    VIDEO_CODEC_VP6F,
+    audio_codec_id_str, video_codec_id_str, AudioTagHeader, EncryptedTagPreamble, FrameType,
+    TagHeader, TagType, VideoInfoCommand, VideoTagHeader, AUDIO_CODEC_AAC, AUDIO_CODEC_MP3,
+    AUDIO_CODEC_MP3_8K, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A, VIDEO_CODEC_VP6F,
 };
 
 /// Register the demuxer, its probe, and the `.flv` extension with a

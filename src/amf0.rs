@@ -2,7 +2,8 @@
 //! tags.
 //!
 //! AMF0 wire format is described in the ActionScript spec; each value
-//! begins with a one-byte type marker:
+//! begins with a one-byte type marker (FLV spec Annex E.4.4.2 enumerates
+//! the FLV-relevant subset):
 //!
 //! * `0x00` Number — 8-byte IEEE-754 big-endian double.
 //! * `0x01` Boolean — one byte (0 = false, nonzero = true).
@@ -11,6 +12,10 @@
 //!   empty key + `0x09` object-end marker.
 //! * `0x05` Null.
 //! * `0x06` Undefined.
+//! * `0x07` Reference — UI16 BE index into a prior-object table (E.4.4.2
+//!   type 7). FLV producers in the wild rarely emit this, and we don't
+//!   maintain a reference table, but the marker is preserved so an
+//!   unexpected occurrence doesn't poison the whole script tag.
 //! * `0x08` ECMA array — u32 BE length (hint, ignored) + same body as
 //!   an Object.
 //! * `0x09` Object end — only valid as a terminator.
@@ -18,10 +23,14 @@
 //! * `0x0B` Date — 8-byte double (ms since epoch) + i16 BE timezone.
 //! * `0x0C` Long string — u32 BE length + UTF-8 bytes.
 //!
-//! Types not listed above (`MovieClip`, `TypedObject`, `XML Document`,
-//! `Reference`, …) are not expected inside `onMetaData` — they surface
-//! as [`Error::InvalidData`] so callers can log the anomaly rather than
-//! silently drop metadata.
+//! Type `0x04` MovieClip is reserved-not-supported per E.4.4.2 and
+//! surfaces as [`Error::InvalidData`] — the spec explicitly bans
+//! producers from emitting it.
+//!
+//! Types not enumerated in E.4.4.2 (`TypedObject`, `XML Document`, the
+//! AMF3-wrapping switch marker, …) are not expected inside an FLV
+//! script tag — they surface as [`Error::InvalidData`] so callers can
+//! log the anomaly rather than silently drop metadata.
 
 use oxideav_core::{Error, Result};
 
@@ -33,9 +42,17 @@ pub enum AmfValue {
     Object(Vec<(String, AmfValue)>),
     Null,
     Undefined,
+    /// AMF0 Reference (marker `0x07`) — UI16 index into the implicit
+    /// per-message reference table. We don't resolve references (FLV
+    /// `onMetaData` payloads rarely re-use objects in practice); the
+    /// index is preserved verbatim so the caller can log it or skip.
+    Reference(u16),
     EcmaArray(Vec<(String, AmfValue)>),
     StrictArray(Vec<AmfValue>),
-    Date { time_ms: f64, tz: i16 },
+    Date {
+        time_ms: f64,
+        tz: i16,
+    },
 }
 
 impl AmfValue {
@@ -107,6 +124,14 @@ pub fn parse_amf0_value(data: &[u8], pos: usize) -> Result<(AmfValue, usize)> {
         }
         0x05 => AmfValue::Null,
         0x06 => AmfValue::Undefined,
+        0x07 => {
+            // Reference — UI16 BE pointing into the implicit object
+            // table. We don't resolve it, just surface the index so
+            // callers can log + skip.
+            let idx = read_u16_be(data, p)?;
+            p += 2;
+            AmfValue::Reference(idx)
+        }
         0x08 => {
             // ECMA array — u32 BE count (hint) + object body.
             p = p
@@ -284,5 +309,46 @@ mod tests {
             parse_amf0_value(&bytes, 0),
             Err(Error::InvalidData(_))
         ));
+    }
+
+    #[test]
+    fn reference_marker() {
+        // Marker 0x07, idx 0x0102.
+        let bytes = [0x07, 0x01, 0x02];
+        let (v, p) = parse_amf0_value(&bytes, 0).unwrap();
+        assert_eq!(v, AmfValue::Reference(0x0102));
+        assert_eq!(p, 3);
+    }
+
+    #[test]
+    fn long_string_via_type_0c() {
+        let s = "hi";
+        let mut b = vec![0x0C];
+        b.extend_from_slice(&(s.len() as u32).to_be_bytes());
+        b.extend_from_slice(s.as_bytes());
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(v, AmfValue::String(s.into()));
+        assert_eq!(p, b.len());
+    }
+
+    #[test]
+    fn strict_array_holds_ordered_values() {
+        // [1.0, "x"]
+        let mut b = vec![0x0A];
+        b.extend_from_slice(&(2u32).to_be_bytes());
+        b.push(0x00);
+        b.extend_from_slice(&1.0_f64.to_be_bytes());
+        b.push(0x02);
+        b.extend_from_slice(&(1u16).to_be_bytes());
+        b.push(b'x');
+        let (v, _) = parse_amf0_value(&b, 0).unwrap();
+        match v {
+            AmfValue::StrictArray(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], AmfValue::Number(1.0));
+                assert_eq!(items[1], AmfValue::String("x".into()));
+            }
+            other => panic!("expected strict array, got {other:?}"),
+        }
     }
 }

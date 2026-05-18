@@ -19,17 +19,50 @@ oxideav-flv = "0.0"
 
 ### Demuxer
 
-- 9-byte `FLV\x01` header (Adobe FLV Spec v10).
+- 9-byte `FLV\x01` header (Adobe FLV Spec v10.1, Annex E.2).
 - Tag stream: 4-byte `PreviousTagSize` prefix + 11-byte tag header +
   payload + close.
-- Script tag (type 0x12, AMF0 `onMetaData`) — parsed for `duration`,
-  `width`, `height`, `videocodecid`, `audiocodecid`, `framerate`,
-  `audiodatarate`, `videodatarate`, `creationdate`, etc. The optional
-  `keyframes` toc (`filepositions[]` / `times[]`) is harvested for
-  O(log n) seeks.
+- Script tags (Annex E.4.4):
+  - `onMetaData` — parsed for `duration`, `width`, `height`,
+    `videocodecid`, `audiocodecid`, `framerate` / `videoframerate`,
+    `audiodatarate`, `videodatarate`, `audiosamplerate`, `stereo`,
+    `creationdate`, etc. NTSC-family `videoframerate` values
+    (29.97/23.976/59.94/47.952/119.88) snap to canonical 1001-denominator
+    `Rational`s; non-canonical rates use a 1/1000 fallback.
+    `videodatarate` / `audiodatarate` (kbps) lift into
+    `CodecParameters::bit_rate`. `audiosamplerate` overrides the
+    `SoundRate` field's 5.5/11/22/44 kHz quantisation. The optional
+    `keyframes` toc (`filepositions[]` / `times[]`) is harvested for
+    O(log n) seeks.
+  - `onXMPData` (Annex E.6) — `liveXML` body surfaced via
+    `metadata["xmp"]`.
+  - `onCuePoint` (Annex A) — payload flattened into
+    `metadata["cuepoint.N.<key>"]` so callers see every field without
+    pulling in a separate cue model.
+  - `|AdditionalHeader` (Annex F.2) — FLV-encryption header.
+    `EncryptionHeader.Version`, `Method`, `EncryptionAlgorithm`,
+    `KeyLength`, and `KeyInfo.SubType` surface as `encryption.*`
+    metadata; `FlvDemuxer::is_encrypted()` returns `true`.
 - `Demuxer::seek_to` — bisects the `keyframes` toc when present,
   otherwise scans tags forward to the first video keyframe (or audio
   packet, for audio-only files) at-or-after the requested pts.
+- AMF0 `Reference` (marker `0x07`, spec E.4.4.2 type 7) preserved as
+  `AmfValue::Reference(u16)`. `MovieClip` (reserved-not-supported) +
+  every unenumerated marker still error out so contamination is loud.
+- FrameType 5 "video info / command" tags (spec E.4.3.1) are surfaced
+  as packets with `flags.header = true` + `flags.discard = true` and a
+  1-byte body carrying the command (0 = start of client-side-seeking
+  sequence, 1 = end). Decoders skip them via the discard flag;
+  callers can react to the seek-sequence boundary.
+- Filter-flag (Annex F.3.1): tags whose tag-type byte has bit `0x20`
+  set carry an `EncryptionTagHeader` (NumFilters + FilterName +
+  Length) + `FilterParams` preamble. Both spec-defined FilterNames
+  (`"Encryption"` v1 = always-on AES-CBC with IV; `"SE"` v2 =
+  per-packet selective encryption with EncryptedAU + optional IV)
+  are parsed; the ciphertext body is forwarded with
+  `flags.discard = true`. No decryption — the demuxer surfaces
+  "this file is DRM-protected, here's the metadata" rather than
+  silently dropping the data.
 - Audio tag (0x08):
   - Codec id 2 = MP3, 14 = MP3 8 kHz.
   - Codec id 10 = AAC. First packet-type byte distinguishes

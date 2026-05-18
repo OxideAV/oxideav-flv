@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- AMF0 `Reference` marker (type 7, UI16 BE) decoded into
+  `AmfValue::Reference(u16)` — FLV `onMetaData` payloads rarely emit
+  it, but unexpected occurrences no longer poison the parse.
+- `onXMPData` (FLV spec Annex E.6) — the `liveXML` body surfaces via
+  `metadata["xmp"]`.
+- `onCuePoint` (Annex A) — payload flattened into
+  `metadata["cuepoint.N.<key>"]` entries so callers see every field.
+- `|AdditionalHeader` (Annex F.2 FLV encryption headline) — parsed
+  into `encryption.version` / `encryption.method` /
+  `encryption.algorithm` / `encryption.key_length` /
+  `encryption.key_subtype` metadata + `FlvDemuxer::is_encrypted()`
+  helper.
+- Filtered tag preamble (`EncryptionTagHeader` + `FilterParams`, spec
+  F.3.1 / F.3.2) parsed for both spec-defined FilterNames
+  (`"Encryption"` v1 and `"SE"` v2 selective); ciphertext bodies are
+  forwarded with `flags.discard = true` so decoders skip past
+  encrypted samples instead of trying to interpret them.
+- FrameType 5 video info / command tags (E.4.3.1) surface as packets
+  with `flags.header = true` + `flags.discard = true` and a 1-byte
+  body carrying the command (0 = start of client-side-seeking
+  sequence, 1 = end), instead of being routed to the decoder.
+- `onMetaData` enrichment: `videoframerate` / `framerate` lift into
+  `CodecParameters::frame_rate` (NTSC values 23.976 / 29.97 / 59.94 /
+  47.952 / 119.88 snap to canonical 1001-denominator `Rational`s).
+  `videodatarate` / `audiodatarate` (kbps) lift into
+  `CodecParameters::bit_rate`. `audiosamplerate` overrides the
+  audio-tag header's 5.5/11/22/44 kHz `SoundRate` quantisation;
+  `stereo` overrides its `SoundType` bit.
+- New public types: `EncryptedTagPreamble`, `FrameType`,
+  `VideoInfoCommand`.
+
+### Added (previously)
+
 - `Demuxer::seek_to` — O(log n) bisect on the `onMetaData.keyframes`
   toc (`filepositions[]` / `times[]`) when present, scan-forward
   fallback otherwise. Audio-only files use the scan path against

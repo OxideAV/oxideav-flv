@@ -25,16 +25,16 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_core::{
-    CodecId, CodecParameters, CodecResolver, Error, Packet, Result, SampleFormat, StreamInfo,
-    TimeBase,
+    CodecId, CodecParameters, CodecResolver, Error, Packet, Rational, Result, SampleFormat,
+    StreamInfo, TimeBase,
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::amf0::{parse_amf0_value, AmfValue};
 use crate::header::FlvHeader;
 use crate::tag::{
-    audio_codec_id_str, video_codec_id_str, AudioTagHeader, TagHeader, TagType, VideoTagHeader,
-    AUDIO_CODEC_AAC, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A,
+    audio_codec_id_str, video_codec_id_str, AudioTagHeader, EncryptedTagPreamble, TagHeader,
+    TagType, VideoTagHeader, AUDIO_CODEC_AAC, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A,
 };
 
 /// Parsed `keyframes` toc from the `onMetaData` script tag — the
@@ -50,6 +50,26 @@ struct KeyframeIndex {
     /// Wall-clock times in **seconds** of each keyframe (`f64` as
     /// stored in AMF0). Same length as `file_positions`.
     times_seconds: Vec<f64>,
+}
+
+/// Encryption headline parsed from a `|AdditionalHeader` script tag
+/// (spec Annex F.2). When present, every media tag whose `Filter` bit
+/// is set carries an `EncryptionTagHeader` + `FilterParams` body.
+/// We don't decrypt — this struct exists so the demuxer can surface
+/// "the file is DRM-protected, here's the metadata" to callers via the
+/// `metadata()` bag and the `is_encrypted()` helper.
+#[derive(Clone, Debug, Default)]
+struct EncryptionHeadline {
+    /// `1` (FMRMS v1) or `2` (Flash Access v2) per F.2.2.
+    version: Option<f64>,
+    /// `"Standard"` per F.2.2.
+    method: Option<String>,
+    /// Per F.2.3 — for `"Standard"`, always `"AES-CBC"`.
+    algorithm: Option<String>,
+    /// Per F.2.4 — for AES-CBC, always 16 bytes (128 bits).
+    key_length: Option<f64>,
+    /// Per F.2.5 — `"APS"` (v1) or `"FlashAccessv2"` (v2).
+    key_subtype: Option<String>,
 }
 
 const STREAM_AUDIO: u32 = 0;
@@ -68,6 +88,8 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
     let mut metadata: Vec<(String, String)> = Vec::new();
     let mut duration_micros: Option<i64> = None;
     let mut keyframe_index: Option<KeyframeIndex> = None;
+    let mut encryption: Option<EncryptionHeadline> = None;
+    let mut xmp_metadata: Option<String> = None;
     // Scan up to a reasonable cap — we only need one audio + one video tag
     // plus the script tag. Keep a hard limit so pathological files can't
     // force us to pre-read the whole input here.
@@ -104,11 +126,13 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
                     &mut metadata,
                     &mut duration_micros,
                     &mut keyframe_index,
+                    &mut encryption,
+                    &mut xmp_metadata,
                 );
             }
             TagType::Audio => {
                 if streams_by_type[STREAM_AUDIO as usize].is_none() && !body.is_empty() {
-                    let info = build_audio_stream(STREAM_AUDIO, &body)?;
+                    let info = build_audio_stream(STREAM_AUDIO, &body, &metadata)?;
                     streams_by_type[STREAM_AUDIO as usize] = Some(info);
                 }
             }
@@ -142,6 +166,32 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
         return Err(Error::invalid("FLV: no audio or video tags discovered"));
     }
 
+    // Flatten the encryption + XMP discoveries into the metadata bag so
+    // callers see "the file is DRM-protected, with such-and-such
+    // algorithm" through the standard `metadata()` accessor.
+    let is_encrypted = encryption.is_some();
+    if let Some(e) = &encryption {
+        metadata.push(("encryption".into(), "true".into()));
+        if let Some(v) = e.version {
+            metadata.push(("encryption.version".into(), format_number(v)));
+        }
+        if let Some(m) = &e.method {
+            metadata.push(("encryption.method".into(), m.clone()));
+        }
+        if let Some(a) = &e.algorithm {
+            metadata.push(("encryption.algorithm".into(), a.clone()));
+        }
+        if let Some(k) = e.key_length {
+            metadata.push(("encryption.key_length".into(), format_number(k)));
+        }
+        if let Some(s) = &e.key_subtype {
+            metadata.push(("encryption.key_subtype".into(), s.clone()));
+        }
+    }
+    if let Some(xmp) = &xmp_metadata {
+        metadata.push(("xmp".into(), xmp.clone()));
+    }
+
     // --- Rewind for packet emission -----------------------------------------
     input.seek(SeekFrom::Start(first_tag_pos))?;
 
@@ -158,6 +208,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
         pending_packet: None,
         first_tag_pos,
         keyframe_index,
+        is_encrypted,
     }))
 }
 
@@ -181,6 +232,20 @@ pub struct FlvDemuxer {
     /// `keyframes` object, or when the arrays were mismatched /
     /// truncated. Callers fall back to scan-forward.
     keyframe_index: Option<KeyframeIndex>,
+    /// `true` when discovery saw a `|AdditionalHeader` script tag (FLV
+    /// encryption, spec Annex F.2). The demuxer still emits packets for
+    /// every tag — encrypted media bodies surface with
+    /// `flags.discard = true` so decoders skip past them rather than
+    /// trying to interpret ciphertext as a frame.
+    is_encrypted: bool,
+}
+
+impl FlvDemuxer {
+    /// `true` when this FLV file declared an [`Annex F`](Adobe FLV
+    /// Spec v10.1) encryption header. Always `false` for plain FLVs.
+    pub fn is_encrypted(&self) -> bool {
+        self.is_encrypted
+    }
 }
 
 impl std::fmt::Debug for FlvDemuxer {
@@ -194,6 +259,7 @@ impl std::fmt::Debug for FlvDemuxer {
                 "keyframe_index_entries",
                 &self.keyframe_index.as_ref().map(|i| i.file_positions.len()),
             )
+            .field("is_encrypted", &self.is_encrypted)
             .finish()
     }
 }
@@ -220,6 +286,26 @@ impl Demuxer for FlvDemuxer {
             let body = read_body(&mut *self.input, header.data_size)?;
             // Trailing PreviousTagSize.
             let _ = read_u32_be(&mut *self.input)?;
+
+            // Filtered (encrypted) tags carry an EncryptionTagHeader +
+            // FilterParams preamble in front of the codec body. Per F.1
+            // "non-compliant players will ignore tags with the filter
+            // flag set". We're a compliant *demuxer* but we don't carry
+            // a DRM client, so the most we can do is route the encrypted
+            // bytes downstream with `flags.discard = true` so decoders
+            // don't try to parse ciphertext.
+            if header.filter {
+                if let Some(pkt) = build_encrypted_packet(
+                    &header,
+                    &body,
+                    self.audio_stream_index,
+                    self.video_stream_index,
+                    &self.streams,
+                )? {
+                    return Ok(pkt);
+                }
+                continue;
+            }
 
             match header.kind {
                 Some(TagType::ScriptData) | None => continue,
@@ -394,7 +480,11 @@ impl Demuxer for FlvDemuxer {
     }
 }
 
-fn build_audio_stream(index: u32, body: &[u8]) -> Result<StreamInfo> {
+fn build_audio_stream(
+    index: u32,
+    body: &[u8],
+    metadata: &[(String, String)],
+) -> Result<StreamInfo> {
     if body.is_empty() {
         return Err(Error::invalid("FLV: empty audio tag"));
     }
@@ -413,6 +503,26 @@ fn build_audio_stream(index: u32, body: &[u8]) -> Result<StreamInfo> {
     // without requiring them to peek at the first packet.
     if ah.codec_id == AUDIO_CODEC_AAC && body.len() >= 2 && body[1] == 0x00 {
         params.extradata = body[2..].to_vec();
+    }
+    // Override sample-rate / channels with the more authoritative
+    // onMetaData values when present (Annex E.5 / Annex B.1).
+    // AudioTagHeader's SoundRate field can only encode 5.5/11/22/44 kHz,
+    // and AAC always reports 44 kHz regardless of the true rate carried
+    // in AudioSpecificConfig — `audiosamplerate` is the producer's
+    // declared truth.
+    if let Some(sr) = metadata_lookup_u32(metadata, "audiosamplerate") {
+        if sr > 0 {
+            params.sample_rate = Some(sr);
+        }
+    }
+    if let Some(b) = metadata_lookup_bool(metadata, "stereo") {
+        params.channels = Some(if b { 2 } else { 1 });
+    }
+    // `audiodatarate` is in kilobits-per-second per E.5.
+    if let Some(kbps) = metadata_lookup_f64(metadata, "audiodatarate") {
+        if kbps.is_finite() && kbps >= 0.0 {
+            params.bit_rate = Some((kbps * 1000.0) as u64);
+        }
     }
     Ok(StreamInfo {
         index,
@@ -443,6 +553,22 @@ fn build_video_stream(
     if let Some(h) = metadata_lookup_u32(metadata, "height") {
         params.height = Some(h);
     }
+    // `videoframerate` (preferred per Annex B.1) or `framerate` per E.5.
+    // Convert to a Rational using a small denominator scale so producers
+    // emitting 29.97 / 23.976 round-trip cleanly.
+    if let Some(fps) = metadata_lookup_f64(metadata, "videoframerate")
+        .or_else(|| metadata_lookup_f64(metadata, "framerate"))
+    {
+        if fps.is_finite() && fps > 0.0 {
+            params.frame_rate = Some(f64_to_rational(fps));
+        }
+    }
+    // `videodatarate` is in kilobits-per-second per E.5.
+    if let Some(kbps) = metadata_lookup_f64(metadata, "videodatarate") {
+        if kbps.is_finite() && kbps >= 0.0 {
+            params.bit_rate = Some((kbps * 1000.0) as u64);
+        }
+    }
     // H.264: body[1] = AVCPacketType, body[2..5] = CompositionTime offset.
     // Type 0 = AVCDecoderConfigurationRecord. Route it to extradata.
     if vh.codec_id == VIDEO_CODEC_H264 && body.len() >= 5 && body[1] == 0x00 {
@@ -459,6 +585,30 @@ fn build_video_stream(
         start_time: Some(0),
         params,
     })
+}
+
+/// Map an AMF Number frame-rate (29.97, 23.976, 60, ...) to a
+/// best-effort Rational. We snap a small set of NTSC-family rates to
+/// their canonical 1001-denominator forms; everything else uses a
+/// 1000-denominator approximation.
+fn f64_to_rational(fps: f64) -> Rational {
+    // Producers typically emit 23.976023..., 29.97002997..., 59.94005994... .
+    // Snap with a 0.005 tolerance.
+    const NTSC: &[(u32, u32, f64)] = &[
+        (24000, 1001, 23.976_023),
+        (30000, 1001, 29.970_03),
+        (60000, 1001, 59.940_06),
+        (48000, 1001, 47.952_05),
+        (120_000, 1001, 119.880_12),
+    ];
+    for (num, den, target) in NTSC {
+        if (fps - target).abs() < 0.005 {
+            return Rational::new(*num as i64, *den as i64).reduced();
+        }
+    }
+    // Otherwise round to milli-fps and reduce trailing-zero noise.
+    let scaled = (fps * 1000.0).round() as i64;
+    Rational::new(scaled.max(1), 1000).reduced()
 }
 
 /// Build a packet from an Audio tag. Returns a `(data_pkt, maybe_header_pkt)`
@@ -520,6 +670,26 @@ fn build_video_packet(
         return None;
     }
     let vh = VideoTagHeader::parse(body[0]);
+
+    // FrameType == 5 (video info / command) — body[1] is a UI8
+    // command, not codec data. Surface it as a packet with `discard`
+    // set so decoders skip it, but `header` set so callers can react
+    // to the client-side-seeking boundary if they want.
+    if vh.is_video_info() {
+        if body.len() < 2 {
+            return None;
+        }
+        let cmd_byte = body[1];
+        let mut pkt = Packet::new(stream.index, stream.time_base, vec![cmd_byte]);
+        pkt.pts = Some(hdr.timestamp_ms as i64);
+        pkt.dts = Some(hdr.timestamp_ms as i64);
+        pkt.flags.header = true;
+        pkt.flags.discard = true;
+        // FrameType=5 is not a random-access point.
+        pkt.flags.keyframe = false;
+        return Some((pkt, None));
+    }
+
     let mut payload_offset: usize = 1;
     let mut pts = hdr.timestamp_ms as i64;
     let dts = hdr.timestamp_ms as i64;
@@ -570,14 +740,71 @@ fn build_video_packet(
     Some((pkt, None))
 }
 
+/// Build a packet from a filtered (encrypted) tag. The encrypted
+/// payload follows the `EncryptionTagHeader` + `FilterParams` preamble
+/// (spec F.3.1 / F.3.2). We don't decrypt — the body is forwarded with
+/// `flags.discard = true` so downstream consumers know not to feed it to
+/// a decoder. Returns `Ok(None)` if the tag is for a stream type we
+/// don't have (e.g. an encrypted video tag in an audio-only file).
+fn build_encrypted_packet(
+    hdr: &TagHeader,
+    body: &[u8],
+    audio_idx: Option<u32>,
+    video_idx: Option<u32>,
+    streams: &[StreamInfo],
+) -> Result<Option<Packet>> {
+    let target_idx = match hdr.kind {
+        Some(TagType::Audio) => audio_idx,
+        Some(TagType::Video) => video_idx,
+        // Script tags are required to be in-clear (F.1 §2.c / F.4) so
+        // an encrypted script tag is itself a spec violation — but we
+        // forward it via the audio stream slot if present, otherwise
+        // skip. This is conservative; the more common interpretation
+        // would be to drop, but losing a "weird" tag silently makes
+        // forensic debugging harder.
+        Some(TagType::ScriptData) | None => return Ok(None),
+    };
+    let Some(idx) = target_idx else {
+        return Ok(None);
+    };
+    let preamble = EncryptedTagPreamble::parse(body)?;
+    if preamble.bytes_consumed > body.len() {
+        return Ok(None);
+    }
+    let cipher = body[preamble.bytes_consumed..].to_vec();
+    let stream = &streams[idx as usize];
+    let mut pkt = Packet::new(stream.index, stream.time_base, cipher);
+    pkt.pts = Some(hdr.timestamp_ms as i64);
+    pkt.dts = Some(hdr.timestamp_ms as i64);
+    pkt.flags.discard = true;
+    // For selective encryption with EncryptedAU=0 the bytes are
+    // actually plaintext — but we still set discard, because the
+    // caller doesn't have a way to differentiate per-packet inside the
+    // current Packet API and the safer default is "don't feed unknown
+    // bytes to a decoder". A future DRM-aware caller can clear the
+    // flag after running its filter chain.
+    let _ = preamble.is_encrypted;
+    Ok(Some(pkt))
+}
+
 fn parse_script_body(
     body: &[u8],
     metadata: &mut Vec<(String, String)>,
     duration_micros: &mut Option<i64>,
     keyframe_index: &mut Option<KeyframeIndex>,
+    encryption: &mut Option<EncryptionHeadline>,
+    xmp_metadata: &mut Option<String>,
 ) {
-    // Script tag body = (AMF0 name, AMF0 value). We only care when the
-    // name is "onMetaData" — other variants are rarer and safely ignored.
+    // Script tag body = (AMF0 name, AMF0 value). FLV producers in the
+    // wild emit several spec-defined names; we recognise:
+    //
+    //   onMetaData         (E.5)  — duration / width / height / codec
+    //                                 ids / `keyframes` toc / ...
+    //   onXMPData          (E.6)  — XMP livexml string
+    //   onCuePoint                 — embedded cue points (Annex A);
+    //                                 preserved verbatim in metadata as
+    //                                 cuepoint.<key> entries
+    //   |AdditionalHeader  (F.2.1) — FLV encryption headline
     let (name, p) = match parse_amf0_value(body, 0) {
         Ok(v) => v,
         Err(_) => return,
@@ -586,17 +813,59 @@ fn parse_script_body(
         Some(s) => s.to_string(),
         None => return,
     };
-    if name_str != "onMetaData" {
-        return;
-    }
     let (value, _np) = match parse_amf0_value(body, p) {
         Ok(v) => v,
         Err(_) => return,
     };
+    match name_str.as_str() {
+        "onMetaData" => parse_on_metadata(&value, metadata, duration_micros, keyframe_index),
+        "onXMPData" => {
+            // Per E.6 the payload is an object with a single "liveXML"
+            // string-or-longstring property.
+            if let Some(s) = xmp_liveXML(&value) {
+                *xmp_metadata = Some(s);
+            }
+        }
+        "onCuePoint" => {
+            // Annex A: per-cue parameter pack. Surface the fields under
+            // a `cuepoint.<n>.<key>` prefix so callers see them without
+            // pulling in a full AMF cue model.
+            let n = metadata
+                .iter()
+                .filter(|(k, _)| k.starts_with("cuepoint."))
+                .map(|(k, _)| {
+                    // extract integer index between the two dots
+                    k.split('.')
+                        .nth(1)
+                        .and_then(|s| s.parse::<u32>().ok())
+                        .unwrap_or(0)
+                })
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(0);
+            flatten_amf_value(&value, &format!("cuepoint.{n}"), metadata);
+        }
+        "|AdditionalHeader" => {
+            *encryption = parse_additional_header(&value);
+        }
+        _ => {
+            // Unknown name — preserve the name itself so callers can see
+            // the file had a non-spec data tag.
+            metadata.push(("scriptdata.name".into(), name_str));
+        }
+    }
+}
+
+fn parse_on_metadata(
+    value: &AmfValue,
+    metadata: &mut Vec<(String, String)>,
+    duration_micros: &mut Option<i64>,
+    keyframe_index: &mut Option<KeyframeIndex>,
+) {
     // Walk top-level object/ecma-array keys and pull them into the
     // metadata bag. Numbers become their displayed form, strings pass
     // through, the `keyframes` object is harvested for the seek toc.
-    let entries = match &value {
+    let entries = match value {
         AmfValue::Object(v) | AmfValue::EcmaArray(v) => v.as_slice(),
         _ => return,
     };
@@ -622,6 +891,80 @@ fn parse_script_body(
                 *keyframe_index = parse_keyframes_object(v);
             }
             _ => {}
+        }
+    }
+}
+
+#[allow(non_snake_case)] // mirrors the spec property name verbatim
+fn xmp_liveXML(value: &AmfValue) -> Option<String> {
+    // Per E.6 the XMP object has exactly one property: liveXML.
+    let entries: &[(String, AmfValue)] = match value {
+        AmfValue::Object(b) | AmfValue::EcmaArray(b) => b,
+        // Some producers nest the string directly.
+        AmfValue::String(s) => return Some(s.clone()),
+        _ => return None,
+    };
+    for (k, v) in entries {
+        if k == "liveXML" {
+            if let AmfValue::String(s) = v {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
+}
+
+fn parse_additional_header(value: &AmfValue) -> Option<EncryptionHeadline> {
+    // AdditionalHeader = {Encryption: {Version, Method, Flags, Params,
+    //                                  ...}}
+    let enc_obj = value.get("Encryption")?;
+    let mut h = EncryptionHeadline::default();
+    if let Some(AmfValue::Number(v)) = enc_obj.get("Version") {
+        h.version = Some(*v);
+    }
+    if let Some(AmfValue::String(s)) = enc_obj.get("Method") {
+        h.method = Some(s.clone());
+    }
+    let params = enc_obj.get("Params");
+    if let Some(p) = params {
+        if let Some(AmfValue::String(s)) = p.get("EncryptionAlgorithm") {
+            h.algorithm = Some(s.clone());
+        }
+        if let Some(AmfValue::Number(n)) =
+            p.get("EncryptionParams").and_then(|q| q.get("KeyLength"))
+        {
+            h.key_length = Some(*n);
+        }
+        if let Some(AmfValue::String(s)) = p.get("KeyInfo").and_then(|q| q.get("SubType")) {
+            h.key_subtype = Some(s.clone());
+        }
+    }
+    Some(h)
+}
+
+/// Flatten an AMF value into a prefix-keyed list of (key, string-form)
+/// pairs and append them to `out`. Used for `onCuePoint` payloads where
+/// the spec doesn't fix the property layout.
+fn flatten_amf_value(value: &AmfValue, prefix: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        AmfValue::Number(n) => out.push((prefix.into(), format_number(*n))),
+        AmfValue::Boolean(b) => out.push((prefix.into(), b.to_string())),
+        AmfValue::String(s) => out.push((prefix.into(), s.clone())),
+        AmfValue::Null => out.push((prefix.into(), "null".into())),
+        AmfValue::Undefined => out.push((prefix.into(), "undefined".into())),
+        AmfValue::Reference(idx) => out.push((prefix.into(), format!("ref:{idx}"))),
+        AmfValue::Date { time_ms, tz } => {
+            out.push((prefix.into(), format!("date:{time_ms}tz:{tz}")));
+        }
+        AmfValue::Object(b) | AmfValue::EcmaArray(b) => {
+            for (k, v) in b {
+                flatten_amf_value(v, &format!("{prefix}.{k}"), out);
+            }
+        }
+        AmfValue::StrictArray(items) => {
+            for (i, v) in items.iter().enumerate() {
+                flatten_amf_value(v, &format!("{prefix}[{i}]"), out);
+            }
         }
     }
 }
@@ -698,6 +1041,32 @@ fn metadata_lookup_u32(metadata: &[(String, String)], key: &str) -> Option<u32> 
                     return Some(n as u32);
                 }
             }
+        }
+    }
+    None
+}
+
+fn metadata_lookup_f64(metadata: &[(String, String)], key: &str) -> Option<f64> {
+    for (k, v) in metadata {
+        if k == key {
+            if let Ok(n) = v.parse::<f64>() {
+                if n.is_finite() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn metadata_lookup_bool(metadata: &[(String, String)], key: &str) -> Option<bool> {
+    for (k, v) in metadata {
+        if k == key {
+            return match v.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            };
         }
     }
     None
@@ -820,6 +1189,236 @@ mod tests {
         assert_eq!(p2.data, vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
 
         assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
+    }
+
+    /// Build an `onMetaData` script-tag body with a single property of
+    /// the given (string-)key and (number-)value. Used by the unit
+    /// tests below to keep the byte-level construction terse.
+    fn on_metadata_with_property(key: &str, value: f64) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&("onMetaData".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"onMetaData");
+        // ECMA array { key: value }
+        body.push(0x08);
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        body.extend_from_slice(key.as_bytes());
+        body.push(0x00);
+        body.extend_from_slice(&value.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        body
+    }
+
+    #[test]
+    fn videodatarate_lifts_into_bit_rate() {
+        // Producer-declared video bit-rate = 768 kbps → 768_000 bit_rate.
+        let script_tag = make_tag(0x12, 0, &on_metadata_with_property("videodatarate", 768.0));
+        let vp6_body = {
+            let flags = (1 << 4) | 4;
+            vec![flags as u8, 0x00, 0x42]
+        };
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        assert_eq!(dmx.streams()[0].params.bit_rate, Some(768_000));
+    }
+
+    #[test]
+    fn videoframerate_snaps_to_ntsc_fraction() {
+        let script_tag = make_tag(0x12, 0, &on_metadata_with_property("videoframerate", 29.97));
+        let vp6_body = {
+            let flags = (1 << 4) | 4;
+            vec![flags as u8, 0x00, 0x42]
+        };
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        let fr = dmx.streams()[0].params.frame_rate.expect("frame_rate set");
+        assert_eq!((fr.num, fr.den), (30_000, 1001));
+    }
+
+    #[test]
+    fn audiosamplerate_overrides_soundrate_field() {
+        // Build an onMetaData with audiosamplerate=48000.
+        let script_tag = make_tag(
+            0x12,
+            0,
+            &on_metadata_with_property("audiosamplerate", 48_000.0),
+        );
+        // AAC tag — would otherwise report 44100. Body: codec=10, rate
+        // idx=3 (44k), 16-bit, stereo + AAC packet type 1 + raw byte.
+        let flags = (10 << 4) | (3 << 2) | 0x02 | 0x01;
+        let audio_body = vec![flags as u8, 0x01, 0xAA];
+        let audio_tag = make_tag(0x08, 0, &audio_body);
+        let flv = make_flv(&[&script_tag, &audio_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        assert_eq!(dmx.streams()[0].params.sample_rate, Some(48_000));
+    }
+
+    #[test]
+    fn video_info_command_packet_is_discardable_header() {
+        // FrameType=5, codec=2; command byte = 0 (start of seek seq).
+        let cmd_body = vec![(5u8 << 4) | 2, 0x00];
+        let video_tag_cmd = make_tag(0x09, 100, &cmd_body);
+        // Follow with a keyframe so discovery still succeeds.
+        let kf_body = vec![(1u8 << 4) | 2, 0xAA, 0xBB];
+        let video_tag_kf = make_tag(0x09, 0, &kf_body);
+        let flv = make_flv(&[&video_tag_kf, &video_tag_cmd]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        let p1 = dmx.next_packet().unwrap();
+        assert!(p1.flags.keyframe, "first packet should be the keyframe");
+        let p2 = dmx.next_packet().unwrap();
+        assert!(p2.flags.header, "video-info command must be header-flagged");
+        assert!(
+            p2.flags.discard,
+            "video-info command must be discard-flagged (not codec data)"
+        );
+        assert_eq!(p2.data, vec![0x00]);
+        assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn additional_header_marks_demuxer_encrypted() {
+        // |AdditionalHeader carrying {Encryption: {Version: 2, Method: "Standard",
+        //   Params: {EncryptionAlgorithm: "AES-CBC",
+        //            EncryptionParams: {KeyLength: 16},
+        //            KeyInfo: {SubType: "FlashAccessv2"}}}}
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&17u16.to_be_bytes());
+        body.extend_from_slice(b"|AdditionalHeader");
+        // Outer object
+        body.push(0x03);
+        body.extend_from_slice(&10u16.to_be_bytes());
+        body.extend_from_slice(b"Encryption");
+        // Inner object
+        body.push(0x03);
+        body.extend_from_slice(&7u16.to_be_bytes());
+        body.extend_from_slice(b"Version");
+        body.push(0x00);
+        body.extend_from_slice(&2.0f64.to_be_bytes());
+        body.extend_from_slice(&6u16.to_be_bytes());
+        body.extend_from_slice(b"Method");
+        body.push(0x02);
+        body.extend_from_slice(&8u16.to_be_bytes());
+        body.extend_from_slice(b"Standard");
+        // Params object
+        body.extend_from_slice(&6u16.to_be_bytes());
+        body.extend_from_slice(b"Params");
+        body.push(0x03);
+        body.extend_from_slice(&19u16.to_be_bytes());
+        body.extend_from_slice(b"EncryptionAlgorithm");
+        body.push(0x02);
+        body.extend_from_slice(&7u16.to_be_bytes());
+        body.extend_from_slice(b"AES-CBC");
+        body.extend_from_slice(&16u16.to_be_bytes());
+        body.extend_from_slice(b"EncryptionParams");
+        body.push(0x03);
+        body.extend_from_slice(&9u16.to_be_bytes());
+        body.extend_from_slice(b"KeyLength");
+        body.push(0x00);
+        body.extend_from_slice(&16.0f64.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        body.extend_from_slice(&7u16.to_be_bytes());
+        body.extend_from_slice(b"KeyInfo");
+        body.push(0x03);
+        body.extend_from_slice(&7u16.to_be_bytes());
+        body.extend_from_slice(b"SubType");
+        body.push(0x02);
+        body.extend_from_slice(&13u16.to_be_bytes());
+        body.extend_from_slice(b"FlashAccessv2");
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+
+        let script_tag = make_tag(0x12, 0, &body);
+        // Plain video tag to satisfy stream discovery.
+        let vp6_body = vec![(1u8 << 4) | 4, 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        // Downcast back to FlvDemuxer so we can call the inherent
+        // `is_encrypted` method.
+        let md = dmx.metadata();
+        assert!(md.iter().any(|(k, v)| k == "encryption" && v == "true"));
+        assert!(md
+            .iter()
+            .any(|(k, v)| k == "encryption.algorithm" && v == "AES-CBC"));
+        assert!(md
+            .iter()
+            .any(|(k, v)| k == "encryption.key_subtype" && v == "FlashAccessv2"));
+        assert!(md
+            .iter()
+            .any(|(k, v)| k == "encryption.version" && v == "2"));
+    }
+
+    #[test]
+    fn filtered_audio_tag_emits_discardable_packet() {
+        // Discovery first sees a normal MP3 audio tag so the audio
+        // stream is built; then a filter-flagged tag with an Encryption
+        // preamble + 16-byte ciphertext body.
+        let mp3_body = {
+            let flags = (2u8 << 4) | (2 << 2) | 0x02 | 0x01;
+            vec![flags, 0xAA, 0xBB, 0xCC]
+        };
+        let plain_audio = make_tag(0x08, 0, &mp3_body);
+
+        // Filter-flagged audio tag: tag-type byte 0x08 | 0x20 = 0x28.
+        let mut filtered_body = vec![1u8];
+        filtered_body.extend_from_slice(b"Encryption\0");
+        filtered_body.push(0);
+        filtered_body.push(0);
+        filtered_body.push(16); // params length = 16 bytes IV
+        filtered_body.extend_from_slice(&[0u8; 16]); // IV
+        filtered_body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // ciphertext
+        let filtered_audio = make_tag(0x28, 100, &filtered_body);
+        let flv = make_flv(&[&plain_audio, &filtered_audio]);
+
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        // First packet — the plain MP3.
+        let p1 = dmx.next_packet().unwrap();
+        assert!(!p1.flags.discard, "plain audio should not be discardable");
+        // Second packet — the encrypted body.
+        let p2 = dmx.next_packet().unwrap();
+        assert!(
+            p2.flags.discard,
+            "filtered audio body must surface with discard=true"
+        );
+        assert_eq!(p2.data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn on_xmp_data_surfaces_xmp_metadata_string() {
+        let live_xml = "<x:xmpmeta>hi</x:xmpmeta>";
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&("onXMPData".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"onXMPData");
+        body.push(0x03); // Object
+        body.extend_from_slice(&("liveXML".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"liveXML");
+        body.push(0x02);
+        body.extend_from_slice(&(live_xml.len() as u16).to_be_bytes());
+        body.extend_from_slice(live_xml.as_bytes());
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        let script_tag = make_tag(0x12, 0, &body);
+        let vp6_body = vec![(1u8 << 4) | 4, 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        assert!(dmx
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "xmp" && v == live_xml));
     }
 
     #[test]
