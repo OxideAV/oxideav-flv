@@ -31,6 +31,7 @@ use oxideav_core::{
 use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::amf0::{parse_amf0_value, AmfValue};
+use crate::ex_video::{fourcc_codec_id_str, ExFrameType, ExPacketType, ExVideoTagHeader};
 use crate::header::FlvHeader;
 use crate::tag::{
     audio_codec_id_str, video_codec_id_str, AudioTagHeader, EncryptedTagPreamble, TagHeader,
@@ -448,18 +449,26 @@ impl Demuxer for FlvDemuxer {
             let want_match = match kind {
                 TagType::Video if seeking_video || self.video_stream_index.is_some() => {
                     // Peek the first byte of the body for the keyframe
-                    // flag without consuming the rest of the tag.
+                    // flag without consuming the rest of the tag. The
+                    // Ex header (IsExHeader=1) reuses bits 6..4 as
+                    // FrameType so the same is_keyframe test works for
+                    // both legacy and enhanced video tags.
                     if header.data_size == 0 {
                         false
                     } else {
                         let mut b = [0u8; 1];
                         self.input.read_exact(&mut b)?;
-                        let vh = VideoTagHeader::parse(b[0]);
+                        let is_kf = if (b[0] & crate::ex_video::EX_HEADER_FLAG) != 0 {
+                            let ft = ExFrameType::from_u8((b[0] >> 4) & 0x07);
+                            ft.is_keyframe()
+                        } else {
+                            VideoTagHeader::parse(b[0]).is_keyframe()
+                        };
                         // Rewind past the byte we just peeked so the
                         // tag is fully unread when we either jump out
                         // or skip past it below.
                         self.input.seek(SeekFrom::Current(-1))?;
-                        vh.is_keyframe() && (header.timestamp_ms as i64) >= target_pts_ms
+                        is_kf && (header.timestamp_ms as i64) >= target_pts_ms
                     }
                 }
                 TagType::Audio if !seeking_video && self.video_stream_index.is_none() => {
@@ -540,6 +549,47 @@ fn build_video_stream(
 ) -> Result<StreamInfo> {
     if body.is_empty() {
         return Err(Error::invalid("FLV: empty video tag"));
+    }
+    // Enhanced RTMP (E-FLV) ExVideoTagHeader path: the high bit
+    // (IsExHeader) of the leading byte means the codec is identified
+    // by FourCC rather than the legacy 4-bit CodecID. Build the stream
+    // descriptor off the FourCC codec id; the config record (when
+    // present) becomes extradata for the decoder.
+    if let Some(ex) = ExVideoTagHeader::parse(body)? {
+        let codec = CodecId::new(fourcc_codec_id_str(ex.fourcc));
+        let mut params = CodecParameters::video(codec);
+        if let Some(w) = metadata_lookup_u32(metadata, "width") {
+            params.width = Some(w);
+        }
+        if let Some(h) = metadata_lookup_u32(metadata, "height") {
+            params.height = Some(h);
+        }
+        if let Some(fps) = metadata_lookup_f64(metadata, "videoframerate")
+            .or_else(|| metadata_lookup_f64(metadata, "framerate"))
+        {
+            if fps.is_finite() && fps > 0.0 {
+                params.frame_rate = Some(f64_to_rational(fps));
+            }
+        }
+        if let Some(kbps) = metadata_lookup_f64(metadata, "videodatarate") {
+            if kbps.is_finite() && kbps >= 0.0 {
+                params.bit_rate = Some((kbps * 1000.0) as u64);
+            }
+        }
+        // SequenceStart's body is the codec's decoder-configuration
+        // record — route to extradata so consumers find it without
+        // peeking at the first packet (consistent with the legacy AVC
+        // path below).
+        if matches!(ex.packet_type, ExPacketType::SequenceStart) && body.len() > ex.bytes_consumed {
+            params.extradata = body[ex.bytes_consumed..].to_vec();
+        }
+        return Ok(StreamInfo {
+            index,
+            time_base: TimeBase::new(1, 1000),
+            duration: None,
+            start_time: Some(0),
+            params,
+        });
     }
     let vh = VideoTagHeader::parse(body[0]);
     let codec = CodecId::new(video_codec_id_str(vh.codec_id));
@@ -668,6 +718,60 @@ fn build_video_packet(
 ) -> Option<(Packet, Option<Packet>)> {
     if body.is_empty() {
         return None;
+    }
+    // Enhanced RTMP / E-FLV ExVideoTagHeader path. The high bit
+    // (IsExHeader) signals the leading byte carries (FrameType,
+    // PacketType) and is followed by a 4-byte FourCC. Map onto the
+    // existing Packet semantics:
+    //   PacketType=0 SequenceStart  → header packet (config record)
+    //   PacketType=1 CodedFrames    → data packet (+ CTO for AVC/HEVC/VVC)
+    //   PacketType=2 SequenceEnd    → skip (no decoder input)
+    //   PacketType=3 CodedFramesX   → data packet, implicit CTO=0
+    //   PacketType=4 Metadata       → header+discard (HDR colorInfo AMF)
+    //   PacketType=5 MPEG2TS start  → header packet
+    //   PacketType=6 Multitrack     → header+discard (we don't track-split)
+    //   PacketType=7 ModEx          → header+discard
+    //   FrameType=Command           → discardable command (legacy parity)
+    if let Ok(Some(ex)) = ExVideoTagHeader::parse(body) {
+        if matches!(ex.packet_type, ExPacketType::SequenceEnd) {
+            return None;
+        }
+        let payload_start = ex.bytes_consumed.min(body.len());
+        let data = body[payload_start..].to_vec();
+        let dts = hdr.timestamp_ms as i64;
+        let pts = dts + ex.composition_time_offset_ms.unwrap_or(0) as i64;
+        let mut pkt = Packet::new(stream.index, stream.time_base, data);
+        pkt.pts = Some(pts);
+        pkt.dts = Some(dts);
+        // Keyframe-ness comes from the FrameType bits in the Ex header,
+        // matching legacy semantics (Key + GeneratedKey both random-
+        // access points).
+        pkt.flags.keyframe = ex.frame_type.is_keyframe();
+        match ex.packet_type {
+            ExPacketType::SequenceStart | ExPacketType::Mpeg2TsSequenceStart => {
+                pkt.flags.header = true;
+            }
+            ExPacketType::Metadata
+            | ExPacketType::Multitrack
+            | ExPacketType::ModEx
+            | ExPacketType::Reserved(_) => {
+                pkt.flags.header = true;
+                pkt.flags.discard = true;
+            }
+            ExPacketType::CodedFrames | ExPacketType::CodedFramesX => {
+                // Data packet — keyframe flag set above.
+            }
+            ExPacketType::SequenceEnd => unreachable!(),
+        }
+        // Command-frame sentinel: video info / command frames still
+        // mean "this isn't a video frame, route accordingly". The Ex
+        // header keeps FrameType=Command (5) for backward compat.
+        if matches!(ex.frame_type, ExFrameType::Command) {
+            pkt.flags.header = true;
+            pkt.flags.discard = true;
+            pkt.flags.keyframe = false;
+        }
+        return Some((pkt, None));
     }
     let vh = VideoTagHeader::parse(body[0]);
 
@@ -1419,6 +1523,132 @@ mod tests {
             .metadata()
             .iter()
             .any(|(k, v)| k == "xmp" && v == live_xml));
+    }
+
+    #[test]
+    fn ex_video_av1_sequence_start_landed_in_extradata() {
+        // E-RTMP enhanced video tag: IsExHeader=1, FrameType=key (1),
+        // PacketType=SequenceStart (0) → 0x90; FourCc = "av01"; config
+        // record body = 6 bytes.
+        let mut tag_body = vec![0x90];
+        tag_body.extend_from_slice(b"av01");
+        let config = [0x81, 0x05, 0x0C, 0x00, 0x0A, 0x0B]; // dummy AV1CC
+        tag_body.extend_from_slice(&config);
+        let video_tag = make_tag(0x09, 0, &tag_body);
+        // Follow with a CodedFrames packet so discovery sees one media
+        // tag and we can exercise the data-packet path.
+        let mut frame_body = vec![0xA1]; // inter + CodedFrames
+        frame_body.extend_from_slice(b"av01");
+        frame_body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let frame_tag = make_tag(0x09, 33, &frame_body);
+        let flv = make_flv(&[&video_tag, &frame_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        // Codec id should be "av1", not the legacy CodecID lookup.
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "av1");
+        assert_eq!(dmx.streams()[0].params.extradata, config.to_vec());
+        // First packet is the SequenceStart config — emitted as a
+        // header packet, not as decoder data.
+        let p1 = dmx.next_packet().unwrap();
+        assert!(p1.flags.header, "SequenceStart must be header-flagged");
+        assert!(p1.flags.keyframe);
+        assert_eq!(p1.data, config.to_vec());
+        // Second packet is the CodedFrames body.
+        let p2 = dmx.next_packet().unwrap();
+        assert!(!p2.flags.header);
+        assert_eq!(p2.data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(p2.pts, Some(33));
+        assert_eq!(p2.dts, Some(33));
+    }
+
+    #[test]
+    fn ex_video_hevc_coded_frames_applies_composition_time_offset() {
+        // Discovery tag (SequenceStart) is required to set the codec
+        // id; then a CodedFrames tag at dts=100 with CTO=+50 → pts=150.
+        let mut seq_body = vec![0x90];
+        seq_body.extend_from_slice(b"hvc1");
+        seq_body.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // dummy hvcC
+        let seq_tag = make_tag(0x09, 0, &seq_body);
+        let mut frame_body = vec![0xA1]; // inter + CodedFrames
+        frame_body.extend_from_slice(b"hvc1");
+        // SI24 CTO = +50.
+        frame_body.extend_from_slice(&[0x00, 0x00, 0x32]);
+        frame_body.extend_from_slice(&[0xCA, 0xFE]);
+        let frame_tag = make_tag(0x09, 100, &frame_body);
+        let flv = make_flv(&[&seq_tag, &frame_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "h265");
+        // Skip the header packet from SequenceStart.
+        let _h = dmx.next_packet().unwrap();
+        let p = dmx.next_packet().unwrap();
+        assert_eq!(p.dts, Some(100));
+        assert_eq!(p.pts, Some(150));
+        assert_eq!(p.data, vec![0xCA, 0xFE]);
+    }
+
+    #[test]
+    fn ex_video_metadata_packet_is_discardable_header() {
+        // HDR colorInfo metadata frame — header + discard so a
+        // standard video decoder skips it.
+        let mut seq_body = vec![0x90];
+        seq_body.extend_from_slice(b"hvc1");
+        seq_body.push(0x00);
+        let seq_tag = make_tag(0x09, 0, &seq_body);
+        let mut meta_body = vec![0x94]; // FrameType=key + PacketType=Metadata
+        meta_body.extend_from_slice(b"hvc1");
+        meta_body.extend_from_slice(b"amf-color-info-blob");
+        let meta_tag = make_tag(0x09, 0, &meta_body);
+        let flv = make_flv(&[&seq_tag, &meta_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        let _seq = dmx.next_packet().unwrap();
+        let m = dmx.next_packet().unwrap();
+        assert!(m.flags.header);
+        assert!(m.flags.discard);
+        assert_eq!(m.data, b"amf-color-info-blob".to_vec());
+    }
+
+    #[test]
+    fn ex_video_sequence_end_yields_no_packet() {
+        // SequenceStart for discovery, then SequenceEnd which should be
+        // swallowed by the demuxer (no decoder input), then EOF.
+        let mut seq_body = vec![0x90];
+        seq_body.extend_from_slice(b"av01");
+        seq_body.push(0x42);
+        let seq_tag = make_tag(0x09, 0, &seq_body);
+        let mut end_body = vec![0x92]; // SequenceEnd
+        end_body.extend_from_slice(b"av01");
+        let end_tag = make_tag(0x09, 200, &end_body);
+        let flv = make_flv(&[&seq_tag, &end_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        let _seq = dmx.next_packet().unwrap();
+        // SequenceEnd should be silently dropped → next call is EOF.
+        assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn ex_video_command_frame_is_discardable() {
+        // FrameType=Command (5) + PacketType=SequenceStart (any) — the
+        // command-frame sentinel keeps the legacy "discardable header"
+        // semantics from FrameType=5 routing.
+        let mut seq_body = vec![0x90];
+        seq_body.extend_from_slice(b"av01");
+        seq_body.push(0x00);
+        let seq_tag = make_tag(0x09, 0, &seq_body);
+        let mut cmd_body = vec![0xD0]; // 0x80 | (5<<4) | 0
+        cmd_body.extend_from_slice(b"av01");
+        cmd_body.push(0x00); // command byte
+        let cmd_tag = make_tag(0x09, 100, &cmd_body);
+        let flv = make_flv(&[&seq_tag, &cmd_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        let _ = dmx.next_packet().unwrap();
+        let cmd = dmx.next_packet().unwrap();
+        assert!(cmd.flags.header);
+        assert!(cmd.flags.discard);
+        assert!(!cmd.flags.keyframe);
     }
 
     #[test]

@@ -81,6 +81,27 @@ oxideav-flv = "0.0"
   - Codec id 7 = AVC / H.264 — AVCPacketType + CompositionTime header
     bytes are parsed; `AVCDecoderConfigurationRecord` lands in
     extradata, subsequent NALU packets carry the 4-byte length prefix.
+- Enhanced RTMP (E-FLV, Veovera `enhanced-rtmp-v1` / `v2`):
+  - IsExHeader-flagged video tags (high bit of the leading byte) are
+    routed through the ExVideoTagHeader path: FourCC codec identifier
+    + PacketType replace the legacy 4-bit CodecID.
+  - FourCCs decoded: `av01` (AV1), `vp09` (VP9), `vp08` (VP8), `hvc1`
+    (HEVC), `avc1` (FourCC-signaled AVC), `vvc1` (VVC). Unknown
+    FourCCs fall through to `flv:exvideo:<ascii>` so producers can be
+    logged rather than silently dropped.
+  - PacketTypes: `SequenceStart` → header packet with the decoder
+    config record (AV1CC / VPCC / HEVCDecoderConfigurationRecord) in
+    extradata; `CodedFrames` → data packet (HEVC / VVC / AVC pull a
+    3-byte SI24 CompositionTimeOffset so pts/dts split correctly);
+    `CodedFramesX` → CodedFrames with implicit CTO=0;
+    `SequenceEnd` → dropped (no decoder input); `Metadata` → header +
+    discard so HDR `colorInfo` AMF blobs reach metadata observers but
+    not video decoders; `Mpeg2TsSequenceStart` → header packet;
+    `Multitrack` / `ModEx` → header + discard (parsed but not
+    track-split). FrameType=Command keeps the legacy "discardable
+    header" semantics.
+  - Seek scan-forward path recognises Ex keyframes via the same
+    FrameType bit field.
 
 ### Muxer
 
@@ -128,6 +149,18 @@ can resolve them through `oxideav-codec`'s registry):
 | 5      | video | `vp6a`     | VP6 + alpha plane            |
 | 6      | video | `flashsv2` | Screen video v2              |
 | 7      | video | `h264`     | AVC: configuration + NALUs   |
+
+When the IsExHeader flag is set the FourCC table below applies instead
+of the FLV id column (legacy ids 0..15 remain reserved on that side):
+
+| FourCC | Media | CodecId | Notes                              |
+| ------ | ----- | ------- | ---------------------------------- |
+| `av01` | video | `av1`   | AV1CodecConfigurationRecord        |
+| `vp09` | video | `vp9`   | VPCodecConfigurationRecord         |
+| `vp08` | video | `vp8`   |                                    |
+| `hvc1` | video | `h265`  | HEVCDecoderConfigurationRecord     |
+| `avc1` | video | `h264`  | FourCC-signaled AVC                |
+| `vvc1` | video | `h266`  | VVCDecoderConfigurationRecord      |
 
 ## License
 

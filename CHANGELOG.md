@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced RTMP / E-FLV `ExVideoTagHeader` parsing (Veovera
+  `enhanced-rtmp-v1` Table 4 + `enhanced-rtmp-v2` "Enhanced Video"):
+  the IsExHeader bit (top bit of the leading VideoTagHeader byte)
+  switches into FourCC + PacketType semantics. FourCCs `av01` / `vp09`
+  / `vp08` / `hvc1` / `avc1` / `vvc1` map onto stable codec ids
+  (`av1` / `vp9` / `vp8` / `h265` / `h264` / `h266`); unknown
+  FourCCs surface as `flv:exvideo:<ascii>`. PacketTypes
+  `SequenceStart` (config record → extradata + header packet),
+  `CodedFrames` (data; HEVC/VVC/AVC parse a 3-byte SI24 CTO so
+  pts/dts split correctly), `CodedFramesX` (data, implicit CTO=0),
+  `SequenceEnd` (dropped), `Metadata` (HDR colorInfo →
+  header+discard), `Mpeg2TsSequenceStart` (header), `Multitrack` /
+  `ModEx` (header+discard) are all routed onto existing Packet
+  semantics. Seek scan-forward recognises Ex keyframes via the same
+  FrameType field. New public types: `ExFrameType`, `ExPacketType`,
+  `ExVideoTagHeader` + the spec-defined `FOURCC_*` constants.
 - AMF0 `Reference` marker (type 7, UI16 BE) decoded into
   `AmfValue::Reference(u16)` — FLV `onMetaData` payloads rarely emit
   it, but unexpected occurrences no longer poison the parse.
