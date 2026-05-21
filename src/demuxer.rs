@@ -31,6 +31,7 @@ use oxideav_core::{
 use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::amf0::{parse_amf0_value, AmfValue};
+use crate::ex_audio::{fourcc_audio_codec_id_str, ExAudioPacketType, ExAudioTagHeader};
 use crate::ex_video::{fourcc_codec_id_str, ExFrameType, ExPacketType, ExVideoTagHeader};
 use crate::header::FlvHeader;
 use crate::tag::{
@@ -497,6 +498,54 @@ fn build_audio_stream(
     if body.is_empty() {
         return Err(Error::invalid("FLV: empty audio tag"));
     }
+    // Enhanced RTMP (E-FLV) ExAudioTagHeader path: SoundFormat=9
+    // (ExHeader) signals the codec is identified by FourCC rather than
+    // the legacy 4-bit SoundFormat. Build the stream descriptor off the
+    // FourCC codec id; the SequenceStart body (Opus ID header / FLAC
+    // STREAMINFO / AAC AudioSpecificConfig) becomes extradata for the
+    // decoder.
+    if let Some(ex) = ExAudioTagHeader::parse(body)? {
+        let codec_name = match ex.fourcc {
+            Some(fcc) => fourcc_audio_codec_id_str(fcc),
+            // ManyTracksManyCodecs case: per-track FourCc is inside the
+            // body. We don't track-split, so surface a sentinel codec
+            // id so the resolver gets a stable name to log.
+            None => "flv:exaudio:multicodec".into(),
+        };
+        let codec = CodecId::new(codec_name);
+        let mut params = CodecParameters::audio(codec);
+        // Pull authoritative rate / channels from onMetaData when
+        // present (the ExHeader body itself carries no SoundRate /
+        // SoundSize / SoundType fields — those bits were repurposed as
+        // AudioPacketType).
+        if let Some(sr) = metadata_lookup_u32(metadata, "audiosamplerate") {
+            if sr > 0 {
+                params.sample_rate = Some(sr);
+            }
+        }
+        if let Some(b) = metadata_lookup_bool(metadata, "stereo") {
+            params.channels = Some(if b { 2 } else { 1 });
+        }
+        if let Some(kbps) = metadata_lookup_f64(metadata, "audiodatarate") {
+            if kbps.is_finite() && kbps >= 0.0 {
+                params.bit_rate = Some((kbps * 1000.0) as u64);
+            }
+        }
+        // SequenceStart's body is the codec's decoder-configuration
+        // record — route to extradata so consumers find it without
+        // peeking at the first packet (consistent with the legacy AAC
+        // path below and the ExVideo path above).
+        if ex.packet_type == ExAudioPacketType::SequenceStart && body.len() > ex.bytes_consumed {
+            params.extradata = body[ex.bytes_consumed..].to_vec();
+        }
+        return Ok(StreamInfo {
+            index,
+            time_base: TimeBase::new(1, 1000),
+            duration: None,
+            start_time: Some(0),
+            params,
+        });
+    }
     let ah = AudioTagHeader::parse(body[0]);
     let codec = CodecId::new(audio_codec_id_str(ah.codec_id));
     let mut params = CodecParameters::audio(codec);
@@ -673,6 +722,46 @@ fn build_audio_packet(
 ) -> Option<(Packet, Option<Packet>)> {
     if body.is_empty() {
         return None;
+    }
+    // Enhanced RTMP / E-FLV ExAudioTagHeader path (SoundFormat=9).
+    // Map onto the existing Packet semantics:
+    //   AudioPacketType=0 SequenceStart        → header packet (config)
+    //   AudioPacketType=1 CodedFrames          → data packet
+    //   AudioPacketType=2 SequenceEnd          → skip (no decoder input)
+    //   AudioPacketType=4 MultichannelConfig   → header+discard
+    //   AudioPacketType=5 Multitrack           → header+discard (we
+    //                                              don't track-split)
+    //   AudioPacketType=7 ModEx + reserved     → header+discard
+    if let Ok(Some(ex)) = ExAudioTagHeader::parse(body) {
+        if ex.packet_type == ExAudioPacketType::SequenceEnd {
+            return None;
+        }
+        let payload_start = ex.bytes_consumed.min(body.len());
+        let data = body[payload_start..].to_vec();
+        let mut pkt = Packet::new(stream.index, stream.time_base, data);
+        pkt.pts = Some(hdr.timestamp_ms as i64);
+        pkt.dts = Some(hdr.timestamp_ms as i64);
+        // Audio: every packet is independently decodable.
+        pkt.flags.keyframe = true;
+        match ex.packet_type {
+            ExAudioPacketType::SequenceStart => {
+                pkt.flags.header = true;
+            }
+            ExAudioPacketType::CodedFrames => {
+                // Data packet — keyframe flag set above.
+            }
+            ExAudioPacketType::MultichannelConfig
+            | ExAudioPacketType::Multitrack
+            | ExAudioPacketType::ModEx
+            | ExAudioPacketType::Reserved3
+            | ExAudioPacketType::Reserved6
+            | ExAudioPacketType::Reserved(_) => {
+                pkt.flags.header = true;
+                pkt.flags.discard = true;
+            }
+            ExAudioPacketType::SequenceEnd => unreachable!(),
+        }
+        return Some((pkt, None));
     }
     let ah = AudioTagHeader::parse(body[0]);
     let payload_offset: usize;
@@ -1649,6 +1738,186 @@ mod tests {
         assert!(cmd.flags.header);
         assert!(cmd.flags.discard);
         assert!(!cmd.flags.keyframe);
+    }
+
+    #[test]
+    fn ex_audio_opus_sequence_start_routes_extradata() {
+        // SoundFormat=9 (ExHeader) + AudioPacketType=0 (SequenceStart)
+        // → 0x90. FourCc = "Opus"; body = dummy OpusHead.
+        let mut tag_body = vec![0x90];
+        tag_body.extend_from_slice(b"Opus");
+        let opus_head = b"OpusHead\x01\x02\x38\x01\x80\xBB\x00\x00\x00\x00\x00";
+        tag_body.extend_from_slice(opus_head);
+        let audio_tag = make_tag(0x08, 0, &tag_body);
+        // Follow with a CodedFrames packet so the data-path runs too.
+        let mut frame_body = vec![0x91];
+        frame_body.extend_from_slice(b"Opus");
+        frame_body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let frame_tag = make_tag(0x08, 20, &frame_body);
+        // Add a video tag so discovery sees both streams.
+        let vp6_body = {
+            let flags = (1u8 << 4) | 4;
+            vec![flags, 0x00, 0x42]
+        };
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&audio_tag, &frame_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        // Stream 0 should be "opus" (FourCC), not the legacy SoundFormat
+        // table lookup.
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "opus");
+        assert_eq!(dmx.streams()[0].params.extradata, opus_head.to_vec());
+        // First packet is the SequenceStart config — emitted as a
+        // header packet, not as decoder data.
+        let p1 = dmx.next_packet().unwrap();
+        assert!(p1.flags.header, "SequenceStart must be header-flagged");
+        assert!(p1.flags.keyframe);
+        assert_eq!(p1.data, opus_head.to_vec());
+        // Second packet is the CodedFrames body.
+        let p2 = dmx.next_packet().unwrap();
+        assert!(!p2.flags.header);
+        assert_eq!(p2.data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(p2.pts, Some(20));
+        assert_eq!(p2.dts, Some(20));
+    }
+
+    #[test]
+    fn ex_audio_flac_fourcc_recognised() {
+        let mut tag_body = vec![0x90];
+        tag_body.extend_from_slice(b"fLaC");
+        tag_body.extend_from_slice(b"fLaC\x80\x00\x00\x22"); // dummy STREAMINFO
+        let audio_tag = make_tag(0x08, 0, &tag_body);
+        let vp6_body = {
+            let flags = (1u8 << 4) | 4;
+            vec![flags, 0x00, 0x42]
+        };
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&audio_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "flac");
+    }
+
+    #[test]
+    fn ex_audio_ac3_coded_frames_passes_payload() {
+        // AC-3 has no SequenceStart (the stream is self-synchronising) —
+        // discovery should land directly on a CodedFrames packet and the
+        // codec id should be "ac3".
+        let mut tag_body = vec![0x91]; // ExHeader + CodedFrames
+        tag_body.extend_from_slice(b"ac-3");
+        // ATSC AC-3 sync word followed by some dummy bytes.
+        let frame = b"\x0B\x77\x00\x00\xDE\xAD\xBE\xEF";
+        tag_body.extend_from_slice(frame);
+        let audio_tag = make_tag(0x08, 40, &tag_body);
+        let vp6_body = {
+            let flags = (1u8 << 4) | 4;
+            vec![flags, 0x00, 0x42]
+        };
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&audio_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "ac3");
+        // No extradata: CodedFrames doesn't carry a config record.
+        assert!(dmx.streams()[0].params.extradata.is_empty());
+        let p = dmx.next_packet().unwrap();
+        assert!(!p.flags.header);
+        assert_eq!(p.data, frame.to_vec());
+        assert_eq!(p.pts, Some(40));
+    }
+
+    #[test]
+    fn ex_audio_sequence_end_yields_no_packet() {
+        let mut seq_body = vec![0x90];
+        seq_body.extend_from_slice(b"Opus");
+        seq_body.extend_from_slice(b"head");
+        let seq_tag = make_tag(0x08, 0, &seq_body);
+        let mut end_body = vec![0x92]; // SequenceEnd
+        end_body.extend_from_slice(b"Opus");
+        let end_tag = make_tag(0x08, 200, &end_body);
+        // Video tag for discovery to succeed (audio-only seek path is
+        // exercised elsewhere; here we just need discovery to land).
+        let vp6_body = {
+            let flags = (1u8 << 4) | 4;
+            vec![flags, 0x00, 0x42]
+        };
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&seq_tag, &end_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        let _seq = dmx.next_packet().unwrap();
+        // SequenceEnd should be silently dropped → next is the video
+        // tag (stream 1), not an audio packet.
+        let next = dmx.next_packet().unwrap();
+        assert_ne!(next.stream_index, 0, "SequenceEnd should not surface");
+    }
+
+    #[test]
+    fn ex_audio_multichannel_config_is_discardable_header() {
+        // Discovery tag (SequenceStart) sets the codec; then a
+        // MultichannelConfig frame surfaces as header + discard so a
+        // standard audio decoder skips the side-channel info.
+        let mut seq_body = vec![0x90];
+        seq_body.extend_from_slice(b"Opus");
+        seq_body.push(0x00);
+        let seq_tag = make_tag(0x08, 0, &seq_body);
+        let mut mcc_body = vec![0x94]; // MultichannelConfig
+        mcc_body.extend_from_slice(b"Opus");
+        mcc_body.extend_from_slice(&[0x01, 0x02, 0x03]); // dummy config
+        let mcc_tag = make_tag(0x08, 10, &mcc_body);
+        let vp6_body = {
+            let flags = (1u8 << 4) | 4;
+            vec![flags, 0x00, 0x42]
+        };
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&seq_tag, &mcc_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        let _seq = dmx.next_packet().unwrap();
+        let m = dmx.next_packet().unwrap();
+        assert!(m.flags.header);
+        assert!(m.flags.discard);
+        assert_eq!(m.data, vec![0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn ex_audio_metadata_overrides_apply_to_ex_stream() {
+        // onMetaData{audiosamplerate=48000, stereo=true,
+        // audiodatarate=128} should land on an ExAudio Opus stream just
+        // like it does on legacy streams.
+        let mut script_body = Vec::new();
+        script_body.push(0x02);
+        script_body.extend_from_slice(&(10u16).to_be_bytes());
+        script_body.extend_from_slice(b"onMetaData");
+        script_body.push(0x08);
+        script_body.extend_from_slice(&0u32.to_be_bytes());
+        script_body.extend_from_slice(&(15u16).to_be_bytes());
+        script_body.extend_from_slice(b"audiosamplerate");
+        script_body.push(0x00);
+        script_body.extend_from_slice(&48000.0_f64.to_be_bytes());
+        script_body.extend_from_slice(&(6u16).to_be_bytes());
+        script_body.extend_from_slice(b"stereo");
+        script_body.push(0x01);
+        script_body.push(0x01);
+        script_body.extend_from_slice(&(13u16).to_be_bytes());
+        script_body.extend_from_slice(b"audiodatarate");
+        script_body.push(0x00);
+        script_body.extend_from_slice(&128.0_f64.to_be_bytes());
+        script_body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        let script_tag = make_tag(0x12, 0, &script_body);
+
+        let mut audio_body = vec![0x90];
+        audio_body.extend_from_slice(b"Opus");
+        audio_body.extend_from_slice(b"OpusHead");
+        let audio_tag = make_tag(0x08, 0, &audio_body);
+        let flv = make_flv(&[&script_tag, &audio_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        let s = &dmx.streams()[0];
+        assert_eq!(s.params.codec_id.as_str(), "opus");
+        assert_eq!(s.params.sample_rate, Some(48000));
+        assert_eq!(s.params.channels, Some(2));
+        assert_eq!(s.params.bit_rate, Some(128_000));
     }
 
     #[test]

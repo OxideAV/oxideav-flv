@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced RTMP / E-FLV `ExAudioTagHeader` parsing (Veovera
+  `enhanced-rtmp-v2` "Enhanced Audio"): SoundFormat=9 (ExHeader)
+  switches the audio tag into FourCC + AudioPacketType semantics
+  (legacy SoundRate / SoundSize / SoundType bits are repurposed
+  as the AudioPacketType UB[4]). FourCCs `Opus` / `fLaC` / `ac-3`
+  / `ec-3` / `.mp3` / `mp4a` map onto stable codec ids
+  (`opus` / `flac` / `ac3` / `eac3` / `mp3` / `aac`); unknown
+  FourCCs surface as `flv:exaudio:<ascii>`. AudioPacketTypes
+  `SequenceStart` (Opus ID header / FLAC `fLaC + STREAMINFO` /
+  AAC `AudioSpecificConfig` → extradata + header packet),
+  `CodedFrames` (data), `SequenceEnd` (dropped),
+  `MultichannelConfig` / `Multitrack` / `ModEx` (header+discard)
+  are routed onto existing Packet semantics. ModEx headers chain
+  off the front of the body; `TimestampOffsetNano` ModEx values
+  accumulate into a single nanosecond offset on the parsed
+  header (the 8-bit / 16-bit size escape is supported).
+  Multitrack outer header parsed for `OneTrack` / `ManyTracks` /
+  `ManyTracksManyCodecs`. `audiosamplerate` / `stereo` /
+  `audiodatarate` from `onMetaData` apply to ExAudio streams the
+  same way they do to legacy ones. New public types:
+  `ExAudioTagHeader`, `ExAudioPacketType`, `AudioPacketModExType`,
+  `AvMultitrackType` + the spec-defined `FOURCC_*` /
+  `SOUND_FORMAT_EX_HEADER` constants.
 - Enhanced RTMP / E-FLV `ExVideoTagHeader` parsing (Veovera
   `enhanced-rtmp-v1` Table 4 + `enhanced-rtmp-v2` "Enhanced Video"):
   the IsExHeader bit (top bit of the leading VideoTagHeader byte)

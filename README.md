@@ -102,6 +102,31 @@ oxideav-flv = "0.0"
     header" semantics.
   - Seek scan-forward path recognises Ex keyframes via the same
     FrameType bit field.
+- Enhanced RTMP audio (E-FLV ExAudioTagHeader, Veovera
+  `enhanced-rtmp-v2` §"Enhanced Audio"):
+  - SoundFormat=9 (ExHeader) flags an audio tag as FourCC-coded. The
+    low 4 bits of the leading byte become `AudioPacketType` (legacy
+    SoundRate/SoundSize/SoundType bits are repurposed).
+  - FourCCs decoded: `Opus` (Opus), `fLaC` (FLAC), `ac-3` (AC-3),
+    `ec-3` (E-AC-3), `.mp3` (MPEG Layer III), `mp4a` (FourCC-signaled
+    AAC). Unknown FourCCs fall through to `flv:exaudio:<ascii>` so
+    producers can be logged rather than silently dropped.
+  - AudioPacketTypes: `SequenceStart` → header packet with the codec's
+    config blob (Opus ID header / FLAC `fLaC + STREAMINFO` / AAC
+    `AudioSpecificConfig`) routed to extradata; `CodedFrames` → data
+    packet; `SequenceEnd` → dropped (no decoder input);
+    `MultichannelConfig` / `Multitrack` / `ModEx` → header + discard
+    (parsed but not consumed). `audiosamplerate` / `stereo` /
+    `audiodatarate` from `onMetaData` apply to ExAudio streams the
+    same way they do to legacy ones.
+  - ModEx headers chain: zero or more length-prefixed modifier blobs
+    are consumed off the front of the body; `TimestampOffsetNano`
+    modifiers accumulate into a single nanosecond offset on the
+    parsed header. The 8-bit / 16-bit size escape (UI8+1 → UI16+1
+    when the first byte is `0xFF`) is supported.
+  - Multitrack outer header parsed: `OneTrack` / `ManyTracks` carry
+    a single FourCc; `ManyTracksManyCodecs` leaves the FourCc empty
+    (per-track FourCc lives in the body — not yet track-split).
 
 ### Muxer
 
@@ -161,6 +186,20 @@ of the FLV id column (legacy ids 0..15 remain reserved on that side):
 | `hvc1` | video | `h265`  | HEVCDecoderConfigurationRecord     |
 | `avc1` | video | `h264`  | FourCC-signaled AVC                |
 | `vvc1` | video | `h266`  | VVCDecoderConfigurationRecord      |
+
+When SoundFormat=9 (ExHeader) is set on an audio tag the FourCC table
+below applies (legacy SoundFormat ids 0..15 remain reserved on that
+side; FourCC mode also disables the SoundRate / SoundSize / SoundType
+header bits, which are reused for `AudioPacketType`):
+
+| FourCC | Media | CodecId | Notes                                       |
+| ------ | ----- | ------- | ------------------------------------------- |
+| `Opus` | audio | `opus`  | RFC 7845 OpusHead on SequenceStart          |
+| `fLaC` | audio | `flac`  | `fLaC` + STREAMINFO on SequenceStart        |
+| `ac-3` | audio | `ac3`   | ATSC AC-3 sync frame on CodedFrames         |
+| `ec-3` | audio | `eac3`  | ATSC E-AC-3 sync frame on CodedFrames       |
+| `.mp3` | audio | `mp3`   | MPEG-1/2 Layer III frame on CodedFrames     |
+| `mp4a` | audio | `aac`   | AudioSpecificConfig on SequenceStart        |
 
 ## License
 
