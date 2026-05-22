@@ -50,6 +50,8 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::mod_ex::{walk as mod_ex_walk, ModExEntry};
+
 /// `SoundFormat` value that signals the ExAudio FourCC path.
 /// Pre-2023 FLV reserved `SoundFormat = 9`; enhanced-rtmp-v2 reuses it.
 pub const SOUND_FORMAT_EX_HEADER: u8 = 9;
@@ -121,23 +123,11 @@ impl ExAudioPacketType {
 }
 
 /// `AudioPacketModExType` (UB[4] following the ModEx blob).
-/// Only `TimestampOffsetNano` is currently defined.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AudioPacketModExType {
-    /// `0` — 3-byte UI24 nanosecond offset (0..999_999) that refines
-    /// the millisecond RTMP timestamp on this packet.
-    TimestampOffsetNano,
-    Reserved(u8),
-}
-
-impl AudioPacketModExType {
-    pub fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Self::TimestampOffsetNano,
-            other => Self::Reserved(other),
-        }
-    }
-}
+///
+/// Re-exported from [`crate::mod_ex`] so the audio-side public API
+/// keeps its historical name while the actual enum lives next to the
+/// shared ModEx walker.
+pub use crate::mod_ex::AudioPacketModExType;
 
 /// `AvMultitrackType` (UB[4]). Shared with ExVideo (same enum on the
 /// wire) — kept distinct here to keep the audio path self-contained.
@@ -202,6 +192,11 @@ pub struct ExAudioTagHeader {
     /// nanoseconds so the caller can decide whether to round to the
     /// millisecond timestamp or expose it verbatim.
     pub timestamp_offset_nano: u32,
+    /// All ModEx entries parsed off the front of the body, in wire
+    /// order. Each entry carries the typed subtype + payload (see
+    /// [`crate::mod_ex::ModExEntry`]) so reserved subtypes survive the
+    /// header walk with their raw bytes attached.
+    pub mod_ex_entries: Vec<ModExEntry>,
     /// Number of bytes consumed at the front of the tag body. The
     /// caller slices `body[bytes_consumed..]` to recover the payload.
     pub bytes_consumed: usize,
@@ -219,64 +214,17 @@ impl ExAudioTagHeader {
         if (lead >> 4) != SOUND_FORMAT_EX_HEADER {
             return Ok(None);
         }
-        let mut cursor = 1usize;
-        let mut packet_type_raw = lead & 0x0F;
-        let mut timestamp_offset_nano: u32 = 0;
+        let cursor = 1usize;
+        let packet_type_raw = lead & 0x0F;
 
-        // Loop through ModEx headers. Per spec, each ModEx carries a
-        // size-prefixed payload and is followed by `AudioPacketModExType
-        // UB[4]` + a fresh `AudioPacketType UB[4]` (packed into one byte).
-        while ExAudioPacketType::from_u8(packet_type_raw) == ExAudioPacketType::ModEx {
-            if cursor >= body.len() {
-                return Err(Error::invalid("FLV Ex audio tag: truncated ModEx size"));
-            }
-            let mut mod_ex_size: usize = (body[cursor] as usize) + 1;
-            cursor += 1;
-            if mod_ex_size == 256 {
-                // The 8-bit size hit its 256 escape — switch to UI16+1.
-                if cursor + 2 > body.len() {
-                    return Err(Error::invalid(
-                        "FLV Ex audio tag: truncated ModEx UI16 size",
-                    ));
-                }
-                mod_ex_size = (((body[cursor] as usize) << 8) | (body[cursor + 1] as usize)) + 1;
-                cursor += 2;
-            }
-            if cursor + mod_ex_size > body.len() {
-                return Err(Error::invalid("FLV Ex audio tag: truncated ModEx data"));
-            }
-            let mod_ex_data = &body[cursor..cursor + mod_ex_size];
-            cursor += mod_ex_size;
-
-            if cursor >= body.len() {
-                return Err(Error::invalid(
-                    "FLV Ex audio tag: truncated ModEx trailer byte",
-                ));
-            }
-            let trailer = body[cursor];
-            cursor += 1;
-            let mod_ex_type = AudioPacketModExType::from_u8((trailer >> 4) & 0x0F);
-            packet_type_raw = trailer & 0x0F;
-
-            // Currently only `TimestampOffsetNano` is defined — it
-            // carries a UI24 (3-byte) nanosecond offset in the
-            // ModEx blob. Other modifier types are tolerated (their
-            // payload is opaque), but their semantics are unknown.
-            if mod_ex_type == AudioPacketModExType::TimestampOffsetNano {
-                if mod_ex_data.len() < 3 {
-                    return Err(Error::invalid(
-                        "FLV Ex audio tag: TimestampOffsetNano needs >= 3 bytes",
-                    ));
-                }
-                let ns = ((mod_ex_data[0] as u32) << 16)
-                    | ((mod_ex_data[1] as u32) << 8)
-                    | (mod_ex_data[2] as u32);
-                // Spec caps the value at 999_999 (one millisecond - 1
-                // expressed in nanoseconds). Saturating-add so a
-                // chain of two ModEx packets can't overflow the u32.
-                timestamp_offset_nano = timestamp_offset_nano.saturating_add(ns);
-            }
-        }
+        // Walk all ModEx (AudioPacketType = 7) entries off the front of
+        // the body. Shared with the video path via `crate::mod_ex`.
+        // Returns the new cursor, the post-ModEx AudioPacketType byte,
+        // every parsed entry (typed subtype + raw payload), and the
+        // total `TimestampOffsetNano` accumulator.
+        let (cursor, packet_type_raw, mod_ex_entries, timestamp_offset_nano) =
+            mod_ex_walk::<7>(body, cursor, packet_type_raw)?;
+        let mut cursor = cursor;
 
         let packet_type = ExAudioPacketType::from_u8(packet_type_raw);
 
@@ -341,6 +289,7 @@ impl ExAudioTagHeader {
             fourcc,
             multitrack,
             timestamp_offset_nano,
+            mod_ex_entries,
             bytes_consumed: cursor,
         }))
     }
@@ -543,6 +492,40 @@ mod tests {
         assert_eq!(h.timestamp_offset_nano, 300);
         assert_eq!(h.packet_type, ExAudioPacketType::CodedFrames);
         assert_eq!(h.fourcc, Some(FOURCC_OPUS));
+    }
+
+    #[test]
+    fn modex_entries_field_exposes_typed_payloads() {
+        // Two ModEx entries: first a TimestampOffsetNano (subtype 0,
+        // 500 ns), second a reserved subtype 0x3 with a 2-byte opaque
+        // payload, then inner packet type=CodedFrames=1.
+        let mut body = vec![0x97]; // ExHeader + ModEx
+        body.push(0x02); // size-1=2 → 3-byte payload
+        body.extend_from_slice(&[0x00, 0x01, 0xF4]); // 500 ns
+        body.push(0x07); // trailer: (TSNano << 4) | ModEx (chain)
+        body.push(0x01); // size-1=1 → 2-byte payload
+        body.extend_from_slice(&[0xAA, 0xBB]);
+        body.push(0x31); // trailer: (reserved 0x3 << 4) | CodedFrames
+        body.extend_from_slice(b"Opus");
+        let h = ExAudioTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.packet_type, ExAudioPacketType::CodedFrames);
+        assert_eq!(h.timestamp_offset_nano, 500);
+        assert_eq!(h.mod_ex_entries.len(), 2);
+
+        let first = &h.mod_ex_entries[0];
+        assert_eq!(first.subtype_raw, 0);
+        assert_eq!(first.timestamp_offset_nano(), Some(500));
+        assert_eq!(
+            first.audio_subtype(),
+            AudioPacketModExType::TimestampOffsetNano
+        );
+        assert_eq!(first.raw, vec![0x00, 0x01, 0xF4]);
+
+        let second = &h.mod_ex_entries[1];
+        assert_eq!(second.subtype_raw, 3);
+        assert_eq!(second.audio_subtype(), AudioPacketModExType::Reserved(3));
+        assert_eq!(second.timestamp_offset_nano(), None);
+        assert_eq!(second.raw, vec![0xAA, 0xBB]);
     }
 
     #[test]

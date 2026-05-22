@@ -17,6 +17,7 @@ pub mod demuxer;
 pub mod ex_audio;
 pub mod ex_video;
 pub mod header;
+pub mod mod_ex;
 pub mod tag;
 
 use oxideav_core::ContainerRegistry;
@@ -29,10 +30,11 @@ pub use ex_audio::{
     FOURCC_MP3 as FOURCC_AUDIO_MP3, FOURCC_OPUS, SOUND_FORMAT_EX_HEADER,
 };
 pub use ex_video::{
-    fourcc_codec_id_str, ExFrameType, ExPacketType, ExVideoTagHeader, EX_HEADER_FLAG, FOURCC_AV01,
-    FOURCC_AVC1, FOURCC_HVC1, FOURCC_VP08, FOURCC_VP09, FOURCC_VVC1,
+    fourcc_codec_id_str, ExFrameType, ExPacketType, ExVideoTagHeader, VideoPacketModExType,
+    EX_HEADER_FLAG, FOURCC_AV01, FOURCC_AVC1, FOURCC_HVC1, FOURCC_VP08, FOURCC_VP09, FOURCC_VVC1,
 };
 pub use header::{FlvHeader, FLV_SIGNATURE};
+pub use mod_ex::{ModExEntry, ModExPayload};
 pub use tag::{
     audio_codec_id_str, video_codec_id_str, AudioTagHeader, EncryptedTagPreamble, FrameType,
     TagHeader, TagType, VideoInfoCommand, VideoTagHeader, AUDIO_CODEC_AAC, AUDIO_CODEC_MP3,

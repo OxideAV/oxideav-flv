@@ -53,6 +53,8 @@
 
 use oxideav_core::{Error, Result};
 
+use crate::mod_ex::{walk as mod_ex_walk, ModExEntry};
+
 /// Mask of the IsExHeader bit in the VideoTagHeader's first byte.
 pub const EX_HEADER_FLAG: u8 = 0x80;
 
@@ -146,6 +148,13 @@ impl ExPacketType {
     }
 }
 
+/// `VideoPacketModExType` (UB[4] following the ModEx blob).
+///
+/// Re-exported from [`crate::mod_ex`] so the video-side public API
+/// keeps a name local to ex_video while sharing the actual enum with
+/// the shared ModEx walker.
+pub use crate::mod_ex::VideoPacketModExType;
+
 /// Result of parsing an Enhanced RTMP ExVideoTagHeader off the start of
 /// a filter-clear video tag body.
 ///
@@ -153,8 +162,14 @@ impl ExPacketType {
 ///
 /// ```text
 ///   0   1   IsExHeader|FrameType|PacketType   UI8
-///   1   4   VideoFourCc                       UI32 BE
-///   5   ?   PacketType-specific payload (e.g. SI24 composition-time
+///   ┌── loop while PacketType == ModEx (= 7):
+///   │  1   1   modExDataSize = UI8 + 1                 (UI8)
+///   │  ?   ?   if modExDataSize == 256, UI16 + 1       (escape)
+///   │  ?   N   modExData[modExDataSize]                (opaque)
+///   │  ?   1   VideoPacketModExType(UB[4]) | next PacketType(UB[4])
+///   └──
+///   ?   4   VideoFourCc                       UI32 BE
+///   ?   ?   PacketType-specific payload (e.g. SI24 composition-time
 ///           offset for HEVC CodedFrames, AV1CodecConfigurationRecord
 ///           for SequenceStart on FourCC=av01, …)
 /// ```
@@ -170,6 +185,15 @@ pub struct ExVideoTagHeader {
     /// HEVC / VVC / AVC `CodedFrames`. `None` otherwise (the spec
     /// implies a zero offset).
     pub composition_time_offset_ms: Option<i32>,
+    /// Sum of TimestampOffsetNano ModEx offsets read from the header
+    /// stack, in nanoseconds (0..999_999 per ModEx). The spec defines
+    /// only this ModEx subtype today (`VideoPacketModExType` = 0).
+    pub timestamp_offset_nano: u32,
+    /// All ModEx entries parsed off the front of the body, in wire
+    /// order. Each entry carries the typed subtype + payload (see
+    /// [`crate::mod_ex::ModExEntry`]) so reserved subtypes survive the
+    /// header walk with their raw bytes attached.
+    pub mod_ex_entries: Vec<ModExEntry>,
 }
 
 impl ExVideoTagHeader {
@@ -189,14 +213,29 @@ impl ExVideoTagHeader {
         //   bits 6..4 = FrameType, bits 3..0 = PacketType.
         let frame_type = ExFrameType::from_u8((lead >> 4) & 0x07);
         let packet_type_raw = lead & 0x0F;
+
+        // Walk all ModEx (VideoPacketType = 7) entries off the front of
+        // the body. Shared with the audio path via `crate::mod_ex`.
+        // Returns the cursor past the ModEx run, the post-ModEx
+        // VideoPacketType byte, every parsed entry (typed subtype +
+        // raw payload), and the total `TimestampOffsetNano` sum (ns).
+        let (cursor, packet_type_raw, mod_ex_entries, timestamp_offset_nano) =
+            mod_ex_walk::<7>(body, 1, packet_type_raw)?;
         let packet_type = ExPacketType::from_u8(packet_type_raw);
 
-        // FourCc — 4 bytes immediately after the leading byte.
-        if body.len() < 5 {
+        // FourCc — 4 bytes immediately after the leading byte (or
+        // immediately after the last ModEx trailer byte when a ModEx
+        // run was consumed).
+        if cursor + 4 > body.len() {
             return Err(Error::invalid("FLV Ex video tag: truncated FourCc"));
         }
-        let fourcc = u32::from_be_bytes([body[1], body[2], body[3], body[4]]);
-        let mut bytes_consumed = 5usize;
+        let fourcc = u32::from_be_bytes([
+            body[cursor],
+            body[cursor + 1],
+            body[cursor + 2],
+            body[cursor + 3],
+        ]);
+        let mut bytes_consumed = cursor + 4;
         let mut composition_time_offset_ms = None;
 
         // SI24 CompositionTimeOffset is present only for HEVC / VVC /
@@ -206,12 +245,14 @@ impl ExVideoTagHeader {
         if matches!(packet_type, ExPacketType::CodedFrames)
             && matches!(fourcc, FOURCC_HVC1 | FOURCC_VVC1 | FOURCC_AVC1)
         {
-            if body.len() < 8 {
+            if body.len() < bytes_consumed + 3 {
                 return Err(Error::invalid(
                     "FLV Ex video tag: truncated CompositionTimeOffset",
                 ));
             }
-            let raw = ((body[5] as u32) << 16) | ((body[6] as u32) << 8) | (body[7] as u32);
+            let raw = ((body[bytes_consumed] as u32) << 16)
+                | ((body[bytes_consumed + 1] as u32) << 8)
+                | (body[bytes_consumed + 2] as u32);
             // Sign-extend 24 bits.
             let sext = if raw & 0x0080_0000 != 0 {
                 raw | 0xFF00_0000
@@ -219,7 +260,7 @@ impl ExVideoTagHeader {
                 raw
             };
             composition_time_offset_ms = Some(sext as i32);
-            bytes_consumed = 8;
+            bytes_consumed += 3;
         }
 
         Ok(Some(Self {
@@ -228,6 +269,8 @@ impl ExVideoTagHeader {
             fourcc,
             bytes_consumed,
             composition_time_offset_ms,
+            timestamp_offset_nano,
+            mod_ex_entries,
         }))
     }
 }
@@ -419,5 +462,140 @@ mod tests {
         let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
         assert_eq!(h.frame_type, ExFrameType::Command);
         assert!(!h.frame_type.is_keyframe());
+    }
+
+    // ----- ModEx walk on the video path (Enhanced RTMP v2 §
+    // ExVideoTagHeader, while VideoPacketType == ModEx) -----
+
+    #[test]
+    fn modex_timestamp_offset_nano_decoded_on_video() {
+        // 0x97 = IsExHeader (0x80) | FrameType=1 (0x10) | PacketType=7
+        // (ModEx). ModEx data: size-1=2, UI24 BE = 1500 ns, trailer
+        // (TSNano << 4) | inner CodedFrames=1 = 0x01. Then FourCc av01
+        // (AV1 → no CTO) and 2 payload bytes.
+        let mut body = vec![0x97];
+        body.push(0x02); // size-1 = 2 → 3-byte payload
+        body.extend_from_slice(&[0x00, 0x05, 0xDC]); // 1500 ns
+        body.push(0x01); // trailer: TSNano (0) << 4 | CodedFrames
+        body.extend_from_slice(b"av01");
+        body.extend_from_slice(&[0xDE, 0xAD]);
+        let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.frame_type, ExFrameType::KeyFrame);
+        assert_eq!(h.packet_type, ExPacketType::CodedFrames);
+        assert_eq!(h.fourcc, FOURCC_AV01);
+        assert_eq!(h.timestamp_offset_nano, 1500);
+        assert_eq!(h.mod_ex_entries.len(), 1);
+        assert_eq!(h.mod_ex_entries[0].timestamp_offset_nano(), Some(1500));
+        assert_eq!(
+            h.mod_ex_entries[0].video_subtype(),
+            VideoPacketModExType::TimestampOffsetNano
+        );
+        // bytes_consumed = 1 (lead) + 1 (size) + 3 (UI24) + 1 (trailer)
+        //                + 4 (FourCc) = 10. AV1 CodedFrames has no CTO.
+        assert_eq!(h.bytes_consumed, 10);
+        assert_eq!(&body[h.bytes_consumed..], &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn modex_chains_then_resolves_to_hevc_coded_frames_with_cto() {
+        // Two TSNano ModEx packets (100 + 250 ns) then HEVC CodedFrames
+        // with CTO = 33 ms. Validates that the CTO parser anchors off
+        // the cursor advanced by the ModEx walk, not a hardcoded 5.
+        let mut body = vec![0xA7]; // 0x80 | FrameType=2 (Inter) | ModEx
+        body.push(0x02);
+        body.extend_from_slice(&[0x00, 0x00, 0x64]); // 100 ns
+        body.push(0x07); // trailer: TSNano | ModEx (chain)
+        body.push(0x02);
+        body.extend_from_slice(&[0x00, 0x00, 0xFA]); // 250 ns
+        body.push(0x01); // trailer: TSNano | CodedFrames
+        body.extend_from_slice(b"hvc1");
+        body.extend_from_slice(&[0x00, 0x00, 0x21]); // CTO = 33 ms (SI24)
+        body.extend_from_slice(&[0xCA, 0xFE]);
+        let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.frame_type, ExFrameType::InterFrame);
+        assert_eq!(h.packet_type, ExPacketType::CodedFrames);
+        assert_eq!(h.fourcc, FOURCC_HVC1);
+        assert_eq!(h.timestamp_offset_nano, 350);
+        assert_eq!(h.mod_ex_entries.len(), 2);
+        assert_eq!(h.composition_time_offset_ms, Some(33));
+        assert_eq!(&body[h.bytes_consumed..], &[0xCA, 0xFE]);
+    }
+
+    #[test]
+    fn modex_reserved_subtype_tolerated_on_video() {
+        // Reserved subtype 0x5 carrying a 4-byte opaque blob, then
+        // resolves to SequenceStart on av01.
+        let mut body = vec![0x97];
+        body.push(0x03); // size-1=3 → 4-byte payload
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        body.push(0x50); // trailer: (0x5 << 4) | SequenceStart(0)
+        body.extend_from_slice(b"av01");
+        body.extend_from_slice(&[0x42]);
+        let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.packet_type, ExPacketType::SequenceStart);
+        assert_eq!(h.fourcc, FOURCC_AV01);
+        assert_eq!(h.timestamp_offset_nano, 0); // reserved subtype: no TS sum
+        assert_eq!(h.mod_ex_entries.len(), 1);
+        let entry = &h.mod_ex_entries[0];
+        assert_eq!(entry.subtype_raw, 5);
+        assert_eq!(entry.video_subtype(), VideoPacketModExType::Reserved(5));
+        assert_eq!(entry.timestamp_offset_nano(), None);
+        assert_eq!(entry.raw, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert_eq!(&body[h.bytes_consumed..], &[0x42]);
+    }
+
+    #[test]
+    fn modex_size_escape_handles_257_byte_payload_on_video() {
+        // 0xFF size byte → escape; UI16 BE = 256 → +1 = 257. Inner
+        // packet type = SequenceStart on av01.
+        let mut body = vec![0x97];
+        body.push(0xFF);
+        body.extend_from_slice(&[0x01, 0x00]); // 257
+        body.extend(std::iter::repeat(0xAB).take(257));
+        body.push(0xF0); // trailer: reserved 0xF | SequenceStart
+        body.extend_from_slice(b"av01");
+        let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.packet_type, ExPacketType::SequenceStart);
+        assert_eq!(h.fourcc, FOURCC_AV01);
+        assert_eq!(h.mod_ex_entries.len(), 1);
+        assert_eq!(h.mod_ex_entries[0].raw.len(), 257);
+    }
+
+    #[test]
+    fn modex_truncated_size_errors_on_video() {
+        // PacketType=ModEx but no size byte.
+        let body = [0x97];
+        assert!(matches!(
+            ExVideoTagHeader::parse(&body),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn modex_short_timestamp_offset_nano_errors_on_video() {
+        // Subtype 0 (TSNano) but payload is only 2 bytes → reject.
+        let mut body = vec![0x97];
+        body.push(0x01); // size-1=1 → 2-byte payload
+        body.extend_from_slice(&[0xAA, 0xBB]);
+        body.push(0x01); // trailer: TSNano | CodedFrames
+        body.extend_from_slice(b"av01");
+        assert!(matches!(
+            ExVideoTagHeader::parse(&body),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn video_packet_modex_type_round_trips() {
+        assert_eq!(
+            VideoPacketModExType::from_u8(0),
+            VideoPacketModExType::TimestampOffsetNano
+        );
+        for v in 1u8..=15 {
+            assert_eq!(
+                VideoPacketModExType::from_u8(v),
+                VideoPacketModExType::Reserved(v)
+            );
+        }
     }
 }

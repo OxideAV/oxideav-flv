@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced RTMP / E-FLV `ModEx` (Modifier Extension) tag bodies
+  (Veovera `enhanced-rtmp-v2` §`ExAudioTagHeader` / §`ExVideoTagHeader`,
+  while packet_type == ModEx = 7). The audio and video Ex headers
+  now share a `crate::mod_ex` walker that:
+  - Decodes the size prefix (UI8 + 1, with `0xFF → UI16 + 1` escape
+    for payloads ≥ 257 bytes, max 65_536 bytes).
+  - Emits one `ModExEntry { subtype_raw, payload, raw }` per loop
+    iteration, with a typed `ModExPayload::TimestampOffsetNano
+    { offset_ns }` for subtype 0 (UI24 BE nanosecond refinement
+    0..999_999 ns) and a `Reserved { subtype_raw }` placeholder for
+    every other UB[4] code (1..15) that keeps the opaque payload on
+    `ModExEntry::raw` so future-defined subtypes don't need parser
+    changes.
+  - Re-reads the next AudioPacketType / VideoPacketType from the low
+    nibble of the trailer byte, chaining ModEx packets transparently.
+  - Sums all TimestampOffsetNano values into a per-tag
+    `timestamp_offset_nano: u32` (already in place on
+    `ExAudioTagHeader`; **new** on `ExVideoTagHeader` — round 87/89
+    surfaced video ModEx as routed-but-opaque).
+  - Rejects malformed inputs (truncated size prefix / data / trailer,
+    TimestampOffsetNano payload shorter than 3 bytes).
+
+  New public types: `mod_ex::{ModExEntry, ModExPayload,
+  AudioPacketModExType, VideoPacketModExType}` (the
+  `AudioPacketModExType` name is now re-exported from `mod_ex` —
+  consumers who imported it via `oxideav_flv::AudioPacketModExType`
+  see no surface change). `ExAudioTagHeader` gains
+  `mod_ex_entries: Vec<ModExEntry>`; `ExVideoTagHeader` gains
+  `mod_ex_entries: Vec<ModExEntry>` + `timestamp_offset_nano: u32`.
+
 - Enhanced RTMP / E-FLV `ExAudioTagHeader` parsing (Veovera
   `enhanced-rtmp-v2` "Enhanced Audio"): SoundFormat=9 (ExHeader)
   switches the audio tag into FourCC + AudioPacketType semantics

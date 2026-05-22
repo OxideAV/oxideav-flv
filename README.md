@@ -97,9 +97,11 @@ oxideav-flv = "0.0"
     `SequenceEnd` → dropped (no decoder input); `Metadata` → header +
     discard so HDR `colorInfo` AMF blobs reach metadata observers but
     not video decoders; `Mpeg2TsSequenceStart` → header packet;
-    `Multitrack` / `ModEx` → header + discard (parsed but not
-    track-split). FrameType=Command keeps the legacy "discardable
-    header" semantics.
+    `Multitrack` → header + discard (parsed but not track-split);
+    `ModEx` → ModEx-loop walked off the front (TimestampOffsetNano
+    decoded; reserved subtypes preserved opaquely) so the resolved
+    inner packet type drives the routing. FrameType=Command keeps
+    the legacy "discardable header" semantics.
   - Seek scan-forward path recognises Ex keyframes via the same
     FrameType bit field.
 - Enhanced RTMP audio (E-FLV ExAudioTagHeader, Veovera
@@ -119,11 +121,20 @@ oxideav-flv = "0.0"
     (parsed but not consumed). `audiosamplerate` / `stereo` /
     `audiodatarate` from `onMetaData` apply to ExAudio streams the
     same way they do to legacy ones.
-  - ModEx headers chain: zero or more length-prefixed modifier blobs
-    are consumed off the front of the body; `TimestampOffsetNano`
-    modifiers accumulate into a single nanosecond offset on the
-    parsed header. The 8-bit / 16-bit size escape (UI8+1 → UI16+1
-    when the first byte is `0xFF`) is supported.
+  - ModEx headers chain on both the audio AND video sides (the v2
+    spec defines the same loop shape for both): zero or more
+    length-prefixed modifier blobs are consumed off the front of the
+    body, each emitted as a `ModExEntry { subtype_raw, payload, raw }`
+    on the parsed header. The 8-bit / 16-bit size escape (UI8+1 →
+    UI16+1 when the first byte is `0xFF`) covers payloads of 1..65_536
+    bytes. The only currently-defined subtype is
+    `TimestampOffsetNano` (subtype 0 — UI24 BE nanosecond refinement
+    0..999_999 ns); spec-reserved subtypes (1..15) are surfaced via
+    `ModExPayload::Reserved { subtype_raw }` with the opaque payload
+    on `ModExEntry::raw` so future spec additions land without parser
+    changes. The per-tag accumulator (`timestamp_offset_nano` on
+    `ExAudioTagHeader` / `ExVideoTagHeader`) sums every
+    TimestampOffsetNano in the chain.
   - Multitrack outer header parsed: `OneTrack` / `ManyTracks` carry
     a single FourCc; `ManyTracksManyCodecs` leaves the FourCc empty
     (per-track FourCc lives in the body — not yet track-split).
