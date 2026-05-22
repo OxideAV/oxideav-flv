@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced RTMP / E-FLV `VideoCommand` plumbing on `ExVideoTagHeader`
+  (Veovera `enhanced-rtmp-v2` §`Extended VideoTagHeader`). When the
+  Ex video tag carries `videoFrameType == VideoFrameType.Command` and
+  `videoPacketType != VideoPacketType.Metadata`, the spec mandates a
+  UI8 `VideoCommand` byte after the FourCc (and after the
+  CompositionTimeOffset on AVC / HEVC / VVC `CodedFrames`) with
+  `processVideoBody = false` afterwards. Previously the demuxer
+  dropped the byte entirely on the Ex path; the legacy FrameType=5
+  routing surfaced it as a 1-byte discard packet. Both paths now
+  agree:
+
+  - New `VideoCommand` enum (`StartSeek = 0`, `EndSeek = 1`,
+    `Reserved(u8)` for `2..=0xFF`) with `from_u8` / `as_u8`
+    round-trip helpers. Reserved codes are preserved verbatim so
+    future spec extensions land without parser changes.
+  - `ExVideoTagHeader::video_command: Option<VideoCommand>` carries
+    the decoded command; `None` for every non-command tag (and for
+    `Metadata` command tags where the spec says `frameType` is
+    ignored). `bytes_consumed` advances past the command byte so the
+    body tail is empty per spec.
+  - The demuxer's Ex video path emits a header+discard packet whose
+    1-byte body is the command byte — parity with the legacy
+    FrameType=5 routing so downstream callers can resolve the
+    seek-sequence boundary via
+    `oxideav_flv::VideoCommand::from_u8(pkt.data[0])`.
+  - Truncated-command-byte body errors out (spec violation) rather
+    than emitting a malformed packet.
+
 - Enhanced RTMP / E-FLV `ModEx` (Modifier Extension) tag bodies
   (Veovera `enhanced-rtmp-v2` §`ExAudioTagHeader` / §`ExVideoTagHeader`,
   while packet_type == ModEx = 7). The audio and video Ex headers

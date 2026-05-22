@@ -100,8 +100,20 @@ oxideav-flv = "0.0"
     `Multitrack` → header + discard (parsed but not track-split);
     `ModEx` → ModEx-loop walked off the front (TimestampOffsetNano
     decoded; reserved subtypes preserved opaquely) so the resolved
-    inner packet type drives the routing. FrameType=Command keeps
-    the legacy "discardable header" semantics.
+    inner packet type drives the routing.
+  - `FrameType=Command` (5): per enhanced-rtmp-v2 §`Extended
+    VideoTagHeader`, when `videoFrameType == Command` and
+    `videoPacketType != Metadata` the body carries a single UI8
+    `VideoCommand` (0 = `StartSeek`, 1 = `EndSeek`, 2..=0xFF reserved)
+    and no further codec payload. The Ex header parser advances
+    `bytes_consumed` past the command byte and surfaces it on
+    `ExVideoTagHeader::video_command`; the demuxer emits a
+    header+discard packet whose 1-byte body is the decoded command,
+    matching the legacy FrameType=5 routing. Reserved command codes
+    are preserved verbatim via `VideoCommand::Reserved(u8)` so future
+    spec additions don't need parser changes. When `packet_type ==
+    Metadata` the spec says `frameType` is ignored — no command byte
+    is read and the trailing bytes remain the AMF metadata payload.
   - Seek scan-forward path recognises Ex keyframes via the same
     FrameType bit field.
 - Enhanced RTMP audio (E-FLV ExAudioTagHeader, Veovera

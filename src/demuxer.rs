@@ -826,7 +826,19 @@ fn build_video_packet(
             return None;
         }
         let payload_start = ex.bytes_consumed.min(body.len());
-        let data = body[payload_start..].to_vec();
+        // Command-frame sentinel: when frame_type == Command the body
+        // contains exactly one UI8 (VideoCommand) and no codec payload
+        // (enhanced-rtmp-v2 §`Extended VideoTagHeader` / §`ExVideoTagBody`).
+        // The Ex header parser already consumed the command byte, so
+        // surface it as the packet payload to keep parity with the
+        // legacy FrameType=5 path below. Down-stream callers can match
+        // on `VideoCommand::from_u8(pkt.data[0])` if they want to react
+        // to the seek-sequence boundary.
+        let data = if let Some(cmd) = ex.video_command {
+            vec![cmd.as_u8()]
+        } else {
+            body[payload_start..].to_vec()
+        };
         let dts = hdr.timestamp_ms as i64;
         let pts = dts + ex.composition_time_offset_ms.unwrap_or(0) as i64;
         let mut pkt = Packet::new(stream.index, stream.time_base, data);
@@ -1718,17 +1730,21 @@ mod tests {
     }
 
     #[test]
-    fn ex_video_command_frame_is_discardable() {
-        // FrameType=Command (5) + PacketType=SequenceStart (any) — the
-        // command-frame sentinel keeps the legacy "discardable header"
-        // semantics from FrameType=5 routing.
+    fn ex_video_command_frame_is_discardable_and_carries_command_byte() {
+        // FrameType=Command (5) + PacketType=SequenceStart (any
+        // non-Metadata, per enhanced-rtmp-v2 §`Extended VideoTagHeader`):
+        // the spec mandates a UI8 VideoCommand after the FourCc, and
+        // `processVideoBody = false` after that. The demuxer surfaces
+        // the command byte as the packet payload so callers can react
+        // to the client-side-seek boundary (parity with the legacy
+        // FrameType=5 routing).
         let mut seq_body = vec![0x90];
         seq_body.extend_from_slice(b"av01");
         seq_body.push(0x00);
         let seq_tag = make_tag(0x09, 0, &seq_body);
         let mut cmd_body = vec![0xD0]; // 0x80 | (5<<4) | 0
         cmd_body.extend_from_slice(b"av01");
-        cmd_body.push(0x00); // command byte
+        cmd_body.push(0x01); // command byte = EndSeek
         let cmd_tag = make_tag(0x09, 100, &cmd_body);
         let flv = make_flv(&[&seq_tag, &cmd_tag]);
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
@@ -1738,6 +1754,14 @@ mod tests {
         assert!(cmd.flags.header);
         assert!(cmd.flags.discard);
         assert!(!cmd.flags.keyframe);
+        // The command byte (EndSeek = 1) is the entire packet body.
+        // Down-stream callers can resolve it via
+        // `oxideav_flv::VideoCommand::from_u8(pkt.data[0])`.
+        assert_eq!(cmd.data, vec![0x01]);
+        assert_eq!(
+            crate::VideoCommand::from_u8(cmd.data[0]),
+            crate::VideoCommand::EndSeek
+        );
     }
 
     #[test]

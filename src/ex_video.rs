@@ -148,6 +148,47 @@ impl ExPacketType {
     }
 }
 
+/// `VideoCommand` UI8 read off the body when
+/// `videoFrameType == VideoFrameType.Command` and
+/// `videoPacketType != VideoPacketType.Metadata` (Veovera
+/// enhanced-rtmp-v2 §`Extended VideoTagHeader`).
+///
+/// The spec assigns `0 = StartSeek` (start of client-side seeking video
+/// sequence) and `1 = EndSeek` (end of the same), reserving `2..=0xFF`
+/// for future use. Unknown values are preserved verbatim so a future
+/// command extension lands without parser changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoCommand {
+    /// `0` — start of client-side seeking video frame sequence.
+    StartSeek,
+    /// `1` — end of client-side seeking video frame sequence.
+    EndSeek,
+    /// Any other UI8 — spec-reserved but preserved opaquely so callers
+    /// can log future extensions.
+    Reserved(u8),
+}
+
+impl VideoCommand {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::StartSeek,
+            1 => Self::EndSeek,
+            other => Self::Reserved(other),
+        }
+    }
+
+    /// The wire-level UI8 this command was decoded from. Round-trips
+    /// the [`Self::Reserved`] payload byte; for `StartSeek` / `EndSeek`
+    /// the canonical 0 / 1 are returned.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::StartSeek => 0,
+            Self::EndSeek => 1,
+            Self::Reserved(v) => v,
+        }
+    }
+}
+
 /// `VideoPacketModExType` (UB[4] following the ModEx blob).
 ///
 /// Re-exported from [`crate::mod_ex`] so the video-side public API
@@ -194,6 +235,13 @@ pub struct ExVideoTagHeader {
     /// [`crate::mod_ex::ModExEntry`]) so reserved subtypes survive the
     /// header walk with their raw bytes attached.
     pub mod_ex_entries: Vec<ModExEntry>,
+    /// Decoded `VideoCommand` (UI8) read off the body when
+    /// `frame_type == Command && packet_type != Metadata`. Per
+    /// enhanced-rtmp-v2 §`Extended VideoTagHeader` the body carries
+    /// exactly one UI8 in that case and no further codec payload —
+    /// [`bytes_consumed`] is advanced past it so callers see an empty
+    /// `body[bytes_consumed..]`. `None` for every non-command tag.
+    pub video_command: Option<VideoCommand>,
 }
 
 impl ExVideoTagHeader {
@@ -263,6 +311,27 @@ impl ExVideoTagHeader {
             bytes_consumed += 3;
         }
 
+        // VideoCommand UI8 — present when frame_type == Command and the
+        // packet_type isn't Metadata (enhanced-rtmp-v2 §`Extended
+        // VideoTagHeader`, lines "if (videoPacketType !=
+        // VideoPacketType.Metadata && videoFrameType ==
+        // VideoFrameType.Command) videoCommand = UI8 as VideoCommand").
+        // The spec then sets `processVideoBody = false` so no further
+        // payload bytes follow — bytes_consumed is advanced past the
+        // command byte so callers see an empty `body[bytes_consumed..]`.
+        let video_command = if matches!(frame_type, ExFrameType::Command)
+            && !matches!(packet_type, ExPacketType::Metadata)
+        {
+            if body.len() < bytes_consumed + 1 {
+                return Err(Error::invalid("FLV Ex video tag: truncated VideoCommand"));
+            }
+            let cmd = VideoCommand::from_u8(body[bytes_consumed]);
+            bytes_consumed += 1;
+            Some(cmd)
+        } else {
+            None
+        };
+
         Ok(Some(Self {
             frame_type,
             packet_type,
@@ -271,6 +340,7 @@ impl ExVideoTagHeader {
             composition_time_offset_ms,
             timestamp_offset_nano,
             mod_ex_entries,
+            video_command,
         }))
     }
 }
@@ -454,14 +524,108 @@ mod tests {
     }
 
     #[test]
-    fn command_frame_type_recognised() {
-        // FrameType=5 with IsExHeader=1 — enhanced-rtmp keeps the
-        // command sentinel.
-        let mut body = vec![0xD0]; // 0x80 | 0x50 | 0x00 → key=5 + SeqStart
+    fn command_frame_type_recognised_and_command_byte_decoded() {
+        // FrameType=5 (Command) with IsExHeader=1, PacketType=0
+        // (SequenceStart, non-Metadata so spec mandates a UI8
+        // VideoCommand follows the FourCc).
+        // 0xD0 = 0x80 | 0x50 | 0x00.
+        let mut body = vec![0xD0];
         body.extend_from_slice(b"av01");
+        body.push(0x00); // VideoCommand::StartSeek
         let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
         assert_eq!(h.frame_type, ExFrameType::Command);
         assert!(!h.frame_type.is_keyframe());
+        assert_eq!(h.video_command, Some(VideoCommand::StartSeek));
+        // bytes_consumed must point past the command byte so the body
+        // tail is empty (spec: ExVideoTagBody has no payload when
+        // videoCommand has been set).
+        assert_eq!(h.bytes_consumed, body.len());
+        assert!(body[h.bytes_consumed..].is_empty());
+    }
+
+    #[test]
+    fn command_end_seek_decoded() {
+        // Command=1 → EndSeek.
+        let mut body = vec![0xD0];
+        body.extend_from_slice(b"av01");
+        body.push(0x01);
+        let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.video_command, Some(VideoCommand::EndSeek));
+    }
+
+    #[test]
+    fn command_reserved_value_preserved() {
+        // Command=0x07 → Reserved(7) so future spec extensions land
+        // without parser changes.
+        let mut body = vec![0xD0];
+        body.extend_from_slice(b"av01");
+        body.push(0x07);
+        let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.video_command, Some(VideoCommand::Reserved(7)));
+        assert_eq!(h.video_command.unwrap().as_u8(), 7);
+    }
+
+    #[test]
+    fn command_with_metadata_packet_type_has_no_command_byte() {
+        // FrameType=Command + PacketType=Metadata → spec says
+        // `if (videoPacketType != VideoPacketType.Metadata &&
+        //     videoFrameType == VideoFrameType.Command)` so the
+        // command byte is NOT read; the trailing bytes are the AMF
+        // metadata payload. Also: "frameType is ignored if
+        // videoPacketType is VideoPacketType.MetaData".
+        let mut body = vec![0xD4]; // 0x80 | 0x50 | 0x04
+        body.extend_from_slice(b"hvc1");
+        body.extend_from_slice(b"colorInfo-amf");
+        let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.frame_type, ExFrameType::Command);
+        assert_eq!(h.packet_type, ExPacketType::Metadata);
+        assert_eq!(h.video_command, None);
+        // bytes_consumed must stop at the AMF payload boundary (FourCc
+        // end), not eat into the Metadata body.
+        assert_eq!(h.bytes_consumed, 5);
+        assert_eq!(&body[h.bytes_consumed..], b"colorInfo-amf");
+    }
+
+    #[test]
+    fn command_byte_truncated_errors() {
+        // FrameType=Command + non-Metadata packet_type but no trailing
+        // command byte → spec violation.
+        let mut body = vec![0xD0]; // 0x80 | 0x50 | 0x00 (SeqStart, not Metadata)
+        body.extend_from_slice(b"av01");
+        // (no command byte)
+        assert!(matches!(
+            ExVideoTagHeader::parse(&body),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn command_after_hevc_cto_when_packet_type_is_coded_frames() {
+        // Pathological-but-spec-legal: frame_type=Command (5) with
+        // packet_type=CodedFrames (1) on hvc1. CodedFrames+HEVC still
+        // requires SI24 CompositionTimeOffset; the command byte follows
+        // it (per spec the videoCommand UI8 is read after the rest of
+        // the ExVideoTagHeader has been parsed).
+        let mut body = vec![0xD1]; // 0x80 | 0x50 | 0x01
+        body.extend_from_slice(b"hvc1");
+        body.extend_from_slice(&[0x00, 0x00, 0x21]); // CTO = 33 (SI24)
+        body.push(0x00); // VideoCommand::StartSeek
+        let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.frame_type, ExFrameType::Command);
+        assert_eq!(h.packet_type, ExPacketType::CodedFrames);
+        assert_eq!(h.composition_time_offset_ms, Some(33));
+        assert_eq!(h.video_command, Some(VideoCommand::StartSeek));
+        assert_eq!(h.bytes_consumed, body.len());
+    }
+
+    #[test]
+    fn video_command_roundtrips_as_u8() {
+        assert_eq!(VideoCommand::from_u8(0), VideoCommand::StartSeek);
+        assert_eq!(VideoCommand::from_u8(1), VideoCommand::EndSeek);
+        assert_eq!(VideoCommand::from_u8(42), VideoCommand::Reserved(42));
+        assert_eq!(VideoCommand::StartSeek.as_u8(), 0);
+        assert_eq!(VideoCommand::EndSeek.as_u8(), 1);
+        assert_eq!(VideoCommand::Reserved(255).as_u8(), 255);
     }
 
     // ----- ModEx walk on the video path (Enhanced RTMP v2 §
