@@ -97,7 +97,12 @@ oxideav-flv = "0.0"
     `SequenceEnd` → dropped (no decoder input); `Metadata` → header +
     discard so HDR `colorInfo` AMF blobs reach metadata observers but
     not video decoders; `Mpeg2TsSequenceStart` → header packet;
-    `Multitrack` → header + discard (parsed but not track-split);
+    `Multitrack` → outer header parsed (`AvMultitrackType` +
+    shared/per-track FourCc), body split per-track via `split_tracks`,
+    and the default track (trackId 0, or first in wire order) emitted as
+    the packet — its inner packet type drives routing and, for
+    AVC/HEVC/VVC `CodedFrames`, the per-track SI24 CTO is read inside the
+    track payload;
     `ModEx` → ModEx-loop walked off the front (TimestampOffsetNano
     decoded; reserved subtypes preserved opaquely) so the resolved
     inner packet type drives the routing.
@@ -129,10 +134,13 @@ oxideav-flv = "0.0"
     config blob (Opus ID header / FLAC `fLaC + STREAMINFO` / AAC
     `AudioSpecificConfig`) routed to extradata; `CodedFrames` → data
     packet; `SequenceEnd` → dropped (no decoder input);
-    `MultichannelConfig` / `Multitrack` / `ModEx` → header + discard
-    (parsed but not consumed). `audiosamplerate` / `stereo` /
-    `audiodatarate` from `onMetaData` apply to ExAudio streams the
-    same way they do to legacy ones.
+    `MultichannelConfig` / `ModEx` → header + discard
+    (parsed but not consumed); `Multitrack` → outer header parsed, body
+    split per-track via `split_tracks`, default track (trackId 0, or
+    first) emitted via its inner packet type (extradata lifted from the
+    default track's `SequenceStart` payload). `audiosamplerate` /
+    `stereo` / `audiodatarate` from `onMetaData` apply to ExAudio
+    streams the same way they do to legacy ones.
   - ModEx headers chain on both the audio AND video sides (the v2
     spec defines the same loop shape for both): zero or more
     length-prefixed modifier blobs are consumed off the front of the
@@ -147,9 +155,15 @@ oxideav-flv = "0.0"
     changes. The per-tag accumulator (`timestamp_offset_nano` on
     `ExAudioTagHeader` / `ExVideoTagHeader`) sums every
     TimestampOffsetNano in the chain.
-  - Multitrack outer header parsed: `OneTrack` / `ManyTracks` carry
-    a single FourCc; `ManyTracksManyCodecs` leaves the FourCc empty
-    (per-track FourCc lives in the body — not yet track-split).
+  - Multitrack body splitter (`split_tracks`, shared audio/video, per
+    enhanced-rtmp-v2 §`ExAudioTagBody` / §`ExVideoTagBody`): `OneTrack`
+    runs the single track's payload to the end of the body; `ManyTracks`
+    / `ManyTracksManyCodecs` walk a loop of `[FourCc?] trackId UI8
+    [sizeOfTrack UI24] payload` records into a `Vec<MultitrackTrack>`
+    (`track_id` / `fourcc` / payload byte-range). The stream model stays
+    single-stream; the demuxer surfaces the default track per tag.
+    `ManyTracksManyCodecs` (no shared FourCc) maps the stream to the
+    `flv:exaudio:multicodec` / `flv:exvideo:multicodec` sentinel.
 
 ### Muxer
 

@@ -32,7 +32,10 @@
 //!   Object]` HDR metadata.
 //! * `PacketType=5 MPEG2TSSequenceStart` — bitstream wrapped in MPEG-2
 //!   TS (for AV1; mutually exclusive with PacketType=0 per spec).
-//! * `PacketType=6` ModEx (v2 extension; parsed but TimestampOffsetNano
+//! * `PacketType=6 Multitrack` (v2) — the body is a loop of per-track
+//!   records (`crate::multitrack::split_tracks`); the inner per-track
+//!   packet type is re-read off the multitrack outer header.
+//! * `PacketType=7 ModEx` (v2 extension; parsed but TimestampOffsetNano
 //!   is the only currently-defined kind).
 //!
 //! FourCc values currently spec-defined (enhanced-rtmp-v2 §
@@ -54,6 +57,7 @@
 use oxideav_core::{Error, Result};
 
 use crate::mod_ex::{walk as mod_ex_walk, ModExEntry};
+use crate::multitrack::AvMultitrackType;
 
 /// Mask of the IsExHeader bit in the VideoTagHeader's first byte.
 pub const EX_HEADER_FLAG: u8 = 0x80;
@@ -218,7 +222,16 @@ pub use crate::mod_ex::VideoPacketModExType;
 pub struct ExVideoTagHeader {
     pub frame_type: ExFrameType,
     pub packet_type: ExPacketType,
-    pub fourcc: u32,
+    /// FourCc identifying the codec. `None` only when the spec's
+    /// multitrack `ManyTracksManyCodecs` mode is in effect; in that case
+    /// the per-track FourCc is carried inside the body and must be parsed
+    /// via [`crate::multitrack::split_tracks`].
+    pub fourcc: Option<u32>,
+    /// Multitrack outer descriptor when `videoPacketType == Multitrack`
+    /// (`6`), `None` for the common single-track case. The per-track body
+    /// loop is walked with [`crate::multitrack::split_tracks`] given this
+    /// type and (for `OneTrack` / `ManyTracks`) the shared [`Self::fourcc`].
+    pub multitrack: Option<AvMultitrackType>,
     /// Number of bytes consumed at the front of the tag body. Callers
     /// slice `body[bytes_consumed..]` to recover the payload.
     pub bytes_consumed: usize,
@@ -271,36 +284,80 @@ impl ExVideoTagHeader {
             mod_ex_walk::<7>(body, 1, packet_type_raw)?;
         let packet_type = ExPacketType::from_u8(packet_type_raw);
 
-        // FourCc — 4 bytes immediately after the leading byte (or
-        // immediately after the last ModEx trailer byte when a ModEx
-        // run was consumed).
-        if cursor + 4 > body.len() {
-            return Err(Error::invalid("FLV Ex video tag: truncated FourCc"));
-        }
-        let fourcc = u32::from_be_bytes([
-            body[cursor],
-            body[cursor + 1],
-            body[cursor + 2],
-            body[cursor + 3],
-        ]);
-        let mut bytes_consumed = cursor + 4;
+        // Multitrack outer header (enhanced-rtmp-v2 §`ExVideoTagHeader`,
+        // `videoPacketType == VideoPacketType.Multitrack` branch). When
+        // present, the next byte packs `videoMultitrackType (UB[4]) |
+        // inner videoPacketType (UB[4])`; the inner type must NOT itself
+        // be Multitrack. For OneTrack / ManyTracks a single shared
+        // `videoFourCc` follows; ManyTracksManyCodecs carries the FourCc
+        // per-track inside the body (recovered via
+        // `crate::multitrack::split_tracks`), so the shared FourCc is
+        // absent here.
+        let (multitrack, packet_type, fourcc, mut cursor) =
+            if matches!(packet_type, ExPacketType::Multitrack) {
+                if cursor >= body.len() {
+                    return Err(Error::invalid(
+                        "FLV Ex video tag: truncated multitrack header byte",
+                    ));
+                }
+                let mt_byte = body[cursor];
+                let mut c = cursor + 1;
+                let mt_type = AvMultitrackType::from_u8((mt_byte >> 4) & 0x0F);
+                let inner_pt = ExPacketType::from_u8(mt_byte & 0x0F);
+                if matches!(inner_pt, ExPacketType::Multitrack) {
+                    return Err(Error::invalid(
+                        "FLV Ex video tag: nested Multitrack packet type",
+                    ));
+                }
+                let fourcc = if matches!(mt_type, AvMultitrackType::ManyTracksManyCodecs) {
+                    None
+                } else {
+                    if c + 4 > body.len() {
+                        return Err(Error::invalid(
+                            "FLV Ex video tag: truncated multitrack FourCc",
+                        ));
+                    }
+                    let fcc = u32::from_be_bytes([body[c], body[c + 1], body[c + 2], body[c + 3]]);
+                    c += 4;
+                    Some(fcc)
+                };
+                (Some(mt_type), inner_pt, fourcc, c)
+            } else {
+                // Single-track: FourCc — 4 bytes immediately after the
+                // leading byte (or immediately after the last ModEx
+                // trailer byte when a ModEx run was consumed).
+                if cursor + 4 > body.len() {
+                    return Err(Error::invalid("FLV Ex video tag: truncated FourCc"));
+                }
+                let fcc = u32::from_be_bytes([
+                    body[cursor],
+                    body[cursor + 1],
+                    body[cursor + 2],
+                    body[cursor + 3],
+                ]);
+                (None, packet_type, Some(fcc), cursor + 4)
+            };
         let mut composition_time_offset_ms = None;
 
         // SI24 CompositionTimeOffset is present only for HEVC / VVC /
-        // AVC `CodedFrames` (PacketType=1). PacketType=3 (CodedFramesX)
-        // explicitly drops it; PacketType=0 (SequenceStart) and
-        // PacketType=2 (SequenceEnd) don't carry one either.
-        if matches!(packet_type, ExPacketType::CodedFrames)
-            && matches!(fourcc, FOURCC_HVC1 | FOURCC_VVC1 | FOURCC_AVC1)
+        // AVC `CodedFrames` (PacketType=1) in the *single-track* case.
+        // PacketType=3 (CodedFramesX) explicitly drops it; PacketType=0
+        // (SequenceStart) and PacketType=2 (SequenceEnd) don't carry one
+        // either. In multitrack mode the per-track CTO lives inside each
+        // track payload (after `split_tracks` slicing), so it is not read
+        // here.
+        if multitrack.is_none()
+            && matches!(packet_type, ExPacketType::CodedFrames)
+            && matches!(fourcc, Some(FOURCC_HVC1 | FOURCC_VVC1 | FOURCC_AVC1))
         {
-            if body.len() < bytes_consumed + 3 {
+            if body.len() < cursor + 3 {
                 return Err(Error::invalid(
                     "FLV Ex video tag: truncated CompositionTimeOffset",
                 ));
             }
-            let raw = ((body[bytes_consumed] as u32) << 16)
-                | ((body[bytes_consumed + 1] as u32) << 8)
-                | (body[bytes_consumed + 2] as u32);
+            let raw = ((body[cursor] as u32) << 16)
+                | ((body[cursor + 1] as u32) << 8)
+                | (body[cursor + 2] as u32);
             // Sign-extend 24 bits.
             let sext = if raw & 0x0080_0000 != 0 {
                 raw | 0xFF00_0000
@@ -308,7 +365,7 @@ impl ExVideoTagHeader {
                 raw
             };
             composition_time_offset_ms = Some(sext as i32);
-            bytes_consumed += 3;
+            cursor += 3;
         }
 
         // VideoCommand UI8 — present when frame_type == Command and the
@@ -322,11 +379,11 @@ impl ExVideoTagHeader {
         let video_command = if matches!(frame_type, ExFrameType::Command)
             && !matches!(packet_type, ExPacketType::Metadata)
         {
-            if body.len() < bytes_consumed + 1 {
+            if body.len() < cursor + 1 {
                 return Err(Error::invalid("FLV Ex video tag: truncated VideoCommand"));
             }
-            let cmd = VideoCommand::from_u8(body[bytes_consumed]);
-            bytes_consumed += 1;
+            let cmd = VideoCommand::from_u8(body[cursor]);
+            cursor += 1;
             Some(cmd)
         } else {
             None
@@ -336,7 +393,8 @@ impl ExVideoTagHeader {
             frame_type,
             packet_type,
             fourcc,
-            bytes_consumed,
+            multitrack,
+            bytes_consumed: cursor,
             composition_time_offset_ms,
             timestamp_offset_nano,
             mod_ex_entries,
@@ -399,10 +457,10 @@ mod tests {
         assert_eq!(h.frame_type, ExFrameType::KeyFrame);
         assert!(h.frame_type.is_keyframe());
         assert_eq!(h.packet_type, ExPacketType::SequenceStart);
-        assert_eq!(h.fourcc, FOURCC_AV01);
+        assert_eq!(h.fourcc, Some(FOURCC_AV01));
         assert_eq!(h.bytes_consumed, 5);
         assert_eq!(h.composition_time_offset_ms, None);
-        assert_eq!(fourcc_codec_id_str(h.fourcc), "av1");
+        assert_eq!(fourcc_codec_id_str(h.fourcc.unwrap()), "av1");
         assert_eq!(&body[h.bytes_consumed..], &[0xDE, 0xAD]);
     }
 
@@ -419,10 +477,10 @@ mod tests {
         assert_eq!(h.frame_type, ExFrameType::InterFrame);
         assert!(!h.frame_type.is_keyframe());
         assert_eq!(h.packet_type, ExPacketType::CodedFrames);
-        assert_eq!(h.fourcc, FOURCC_HVC1);
+        assert_eq!(h.fourcc, Some(FOURCC_HVC1));
         assert_eq!(h.bytes_consumed, 8);
         assert_eq!(h.composition_time_offset_ms, Some(33));
-        assert_eq!(fourcc_codec_id_str(h.fourcc), "h265");
+        assert_eq!(fourcc_codec_id_str(h.fourcc.unwrap()), "h265");
         assert_eq!(&body[h.bytes_consumed..], &[0xCA, 0xFE]);
     }
 
@@ -445,7 +503,7 @@ mod tests {
         body.extend_from_slice(&[0xFE, 0xED]);
         let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
         assert_eq!(h.packet_type, ExPacketType::CodedFrames);
-        assert_eq!(h.fourcc, FOURCC_AV01);
+        assert_eq!(h.fourcc, Some(FOURCC_AV01));
         assert_eq!(h.bytes_consumed, 5);
         assert_eq!(h.composition_time_offset_ms, None);
         assert_eq!(&body[h.bytes_consumed..], &[0xFE, 0xED]);
@@ -485,6 +543,86 @@ mod tests {
     }
 
     #[test]
+    fn multitrack_one_track_with_fourcc() {
+        // 0x96 = IsExHeader | FrameType=1 (key) | PacketType=6 (Multitrack).
+        // Inner byte 0x01 = OneTrack (0) << 4 | inner CodedFrames (1).
+        let mut body = vec![0x96];
+        body.push(0x01);
+        body.extend_from_slice(b"av01");
+        body.extend_from_slice(&[0x00, 0xDE, 0xAD]); // trackId + payload (caller splits)
+        let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.frame_type, ExFrameType::KeyFrame);
+        assert_eq!(h.multitrack, Some(AvMultitrackType::OneTrack));
+        // Inner packet type is what the header now reports.
+        assert_eq!(h.packet_type, ExPacketType::CodedFrames);
+        assert_eq!(h.fourcc, Some(FOURCC_AV01));
+        // No single-track CTO read in multitrack mode (it lives per-track).
+        assert_eq!(h.composition_time_offset_ms, None);
+        assert_eq!(h.bytes_consumed, 6); // lead + mt-byte + 4 FourCc
+        assert_eq!(&body[h.bytes_consumed..], &[0x00, 0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn multitrack_many_tracks_many_codecs_omits_fourcc() {
+        // 0x96 + (0x21 = ManyTracksManyCodecs (2) << 4 | CodedFrames (1)).
+        let mut body = vec![0x96];
+        body.push(0x21);
+        body.extend_from_slice(&[0xCA, 0xFE]); // per-track structure (caller splits)
+        let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.multitrack, Some(AvMultitrackType::ManyTracksManyCodecs));
+        assert_eq!(h.packet_type, ExPacketType::CodedFrames);
+        assert_eq!(h.fourcc, None);
+        // No shared FourCc consumed: lead (1) + mt-byte (1) = 2.
+        assert_eq!(h.bytes_consumed, 2);
+        assert_eq!(&body[h.bytes_consumed..], &[0xCA, 0xFE]);
+    }
+
+    #[test]
+    fn multitrack_does_not_read_single_track_cto() {
+        // hvc1 ManyTracks CodedFrames: the SI24 CTO lives inside each
+        // track payload, so the header parser must NOT consume one here.
+        let mut body = vec![0x96]; // key + Multitrack
+        body.push(0x11); // ManyTracks (1) << 4 | CodedFrames (1)
+        body.extend_from_slice(b"hvc1");
+        body.extend_from_slice(&[0x00, 0x00, 0x00, 0x21]); // trackId + (CTO bytes belong to track payload)
+        let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.multitrack, Some(AvMultitrackType::ManyTracks));
+        assert_eq!(h.composition_time_offset_ms, None);
+        assert_eq!(h.bytes_consumed, 6); // lead + mt-byte + 4 FourCc
+    }
+
+    #[test]
+    fn truncated_multitrack_header_byte_errors() {
+        // PacketType=Multitrack but no following AvMultitrackType byte.
+        let body = [0x96];
+        assert!(matches!(
+            ExVideoTagHeader::parse(&body),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn nested_multitrack_rejected() {
+        // 0x96 = Multitrack. Inner byte 0x06 = OneTrack | inner
+        // PacketType=6 (Multitrack again — illegal).
+        let body = [0x96, 0x06];
+        assert!(matches!(
+            ExVideoTagHeader::parse(&body),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn truncated_multitrack_fourcc_errors() {
+        // OneTrack but only 2 of 4 shared-FourCc bytes.
+        let body = [0x96, 0x01, b'a', b'v'];
+        assert!(matches!(
+            ExVideoTagHeader::parse(&body),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
     fn truncated_fourcc_errors() {
         let body = [0x90, b'a', b'v']; // only 2 of 4 FourCc bytes
         assert!(matches!(
@@ -510,8 +648,8 @@ mod tests {
         body.extend_from_slice(b"zzzz");
         body.push(0x00);
         let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
-        assert_eq!(h.fourcc, u32::from_be_bytes(*b"zzzz"));
-        assert_eq!(fourcc_codec_id_str(h.fourcc), "flv:exvideo:zzzz");
+        assert_eq!(h.fourcc, Some(u32::from_be_bytes(*b"zzzz")));
+        assert_eq!(fourcc_codec_id_str(h.fourcc.unwrap()), "flv:exvideo:zzzz");
     }
 
     #[test]
@@ -520,7 +658,10 @@ mod tests {
         body.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
         body.push(0x00);
         let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
-        assert_eq!(fourcc_codec_id_str(h.fourcc), "flv:exvideo:0x01020304");
+        assert_eq!(
+            fourcc_codec_id_str(h.fourcc.unwrap()),
+            "flv:exvideo:0x01020304"
+        );
     }
 
     #[test]
@@ -646,7 +787,7 @@ mod tests {
         let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
         assert_eq!(h.frame_type, ExFrameType::KeyFrame);
         assert_eq!(h.packet_type, ExPacketType::CodedFrames);
-        assert_eq!(h.fourcc, FOURCC_AV01);
+        assert_eq!(h.fourcc, Some(FOURCC_AV01));
         assert_eq!(h.timestamp_offset_nano, 1500);
         assert_eq!(h.mod_ex_entries.len(), 1);
         assert_eq!(h.mod_ex_entries[0].timestamp_offset_nano(), Some(1500));
@@ -678,7 +819,7 @@ mod tests {
         let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
         assert_eq!(h.frame_type, ExFrameType::InterFrame);
         assert_eq!(h.packet_type, ExPacketType::CodedFrames);
-        assert_eq!(h.fourcc, FOURCC_HVC1);
+        assert_eq!(h.fourcc, Some(FOURCC_HVC1));
         assert_eq!(h.timestamp_offset_nano, 350);
         assert_eq!(h.mod_ex_entries.len(), 2);
         assert_eq!(h.composition_time_offset_ms, Some(33));
@@ -697,7 +838,7 @@ mod tests {
         body.extend_from_slice(&[0x42]);
         let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
         assert_eq!(h.packet_type, ExPacketType::SequenceStart);
-        assert_eq!(h.fourcc, FOURCC_AV01);
+        assert_eq!(h.fourcc, Some(FOURCC_AV01));
         assert_eq!(h.timestamp_offset_nano, 0); // reserved subtype: no TS sum
         assert_eq!(h.mod_ex_entries.len(), 1);
         let entry = &h.mod_ex_entries[0];
@@ -720,7 +861,7 @@ mod tests {
         body.extend_from_slice(b"av01");
         let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();
         assert_eq!(h.packet_type, ExPacketType::SequenceStart);
-        assert_eq!(h.fourcc, FOURCC_AV01);
+        assert_eq!(h.fourcc, Some(FOURCC_AV01));
         assert_eq!(h.mod_ex_entries.len(), 1);
         assert_eq!(h.mod_ex_entries[0].raw.len(), 257);
     }

@@ -32,8 +32,12 @@ use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::amf0::{parse_amf0_value, AmfValue};
 use crate::ex_audio::{fourcc_audio_codec_id_str, ExAudioPacketType, ExAudioTagHeader};
-use crate::ex_video::{fourcc_codec_id_str, ExFrameType, ExPacketType, ExVideoTagHeader};
+use crate::ex_video::{
+    fourcc_codec_id_str, ExFrameType, ExPacketType, ExVideoTagHeader, FOURCC_AVC1, FOURCC_HVC1,
+    FOURCC_VVC1,
+};
 use crate::header::FlvHeader;
+use crate::multitrack::split_tracks;
 use crate::tag::{
     audio_codec_id_str, video_codec_id_str, AudioTagHeader, EncryptedTagPreamble, TagHeader,
     TagType, VideoTagHeader, AUDIO_CODEC_AAC, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A,
@@ -490,6 +494,29 @@ impl Demuxer for FlvDemuxer {
     }
 }
 
+/// Recover the default track's payload (trackId 0, or the first track in
+/// wire order) from a multitrack Ex tag body tail. Returns the whole
+/// tail unchanged if the split fails or yields no tracks, so a malformed
+/// multitrack record degrades to "treat the body as opaque extradata"
+/// rather than panicking.
+fn default_track_payload(
+    mt_type: crate::multitrack::AvMultitrackType,
+    default_fourcc: Option<u32>,
+    tail: &[u8],
+) -> Vec<u8> {
+    match split_tracks(mt_type, default_fourcc.unwrap_or(0), tail) {
+        Ok(tracks) => match tracks
+            .iter()
+            .find(|t| t.track_id == 0)
+            .or_else(|| tracks.first())
+        {
+            Some(track) => tail[track.payload.clone()].to_vec(),
+            None => tail.to_vec(),
+        },
+        Err(_) => tail.to_vec(),
+    }
+}
+
 fn build_audio_stream(
     index: u32,
     body: &[u8],
@@ -534,9 +561,15 @@ fn build_audio_stream(
         // SequenceStart's body is the codec's decoder-configuration
         // record — route to extradata so consumers find it without
         // peeking at the first packet (consistent with the legacy AAC
-        // path below and the ExVideo path above).
+        // path below and the ExVideo path above). In multitrack mode the
+        // config record lives inside the default track's payload, so we
+        // split first and lift trackId 0's bytes.
         if ex.packet_type == ExAudioPacketType::SequenceStart && body.len() > ex.bytes_consumed {
-            params.extradata = body[ex.bytes_consumed..].to_vec();
+            let tail = &body[ex.bytes_consumed..];
+            params.extradata = match ex.multitrack {
+                Some(mt_type) => default_track_payload(mt_type, ex.fourcc, tail),
+                None => tail.to_vec(),
+            };
         }
         return Ok(StreamInfo {
             index,
@@ -605,7 +638,15 @@ fn build_video_stream(
     // descriptor off the FourCC codec id; the config record (when
     // present) becomes extradata for the decoder.
     if let Some(ex) = ExVideoTagHeader::parse(body)? {
-        let codec = CodecId::new(fourcc_codec_id_str(ex.fourcc));
+        let codec_name = match ex.fourcc {
+            Some(fcc) => fourcc_codec_id_str(fcc),
+            // ManyTracksManyCodecs case: per-track FourCc is inside the
+            // body. We don't split the stream model per track, so surface
+            // a sentinel codec id so the resolver gets a stable name to
+            // log (mirrors the ExAudio multicodec sentinel).
+            None => "flv:exvideo:multicodec".into(),
+        };
+        let codec = CodecId::new(codec_name);
         let mut params = CodecParameters::video(codec);
         if let Some(w) = metadata_lookup_u32(metadata, "width") {
             params.width = Some(w);
@@ -628,9 +669,15 @@ fn build_video_stream(
         // SequenceStart's body is the codec's decoder-configuration
         // record — route to extradata so consumers find it without
         // peeking at the first packet (consistent with the legacy AVC
-        // path below).
+        // path below). In multitrack mode the config record lives inside
+        // the default track's payload, so we split first and lift
+        // trackId 0's bytes.
         if matches!(ex.packet_type, ExPacketType::SequenceStart) && body.len() > ex.bytes_consumed {
-            params.extradata = body[ex.bytes_consumed..].to_vec();
+            let tail = &body[ex.bytes_consumed..];
+            params.extradata = match ex.multitrack {
+                Some(mt_type) => default_track_payload(mt_type, ex.fourcc, tail),
+                None => tail.to_vec(),
+            };
         }
         return Ok(StreamInfo {
             index,
@@ -737,7 +784,22 @@ fn build_audio_packet(
             return None;
         }
         let payload_start = ex.bytes_consumed.min(body.len());
-        let data = body[payload_start..].to_vec();
+        // Multitrack (enhanced-rtmp-v2 §`ExAudioTagBody`): surface the
+        // default track (trackId 0, or the first track) so a multitrack
+        // audio file stays decodable through its primary variant instead
+        // of being dropped wholesale. `ex.packet_type` already holds the
+        // inner per-track packet type (post-Multitrack unwrap).
+        let data = if let Some(mt_type) = ex.multitrack {
+            let tail = &body[payload_start..];
+            let tracks = split_tracks(mt_type, ex.fourcc.unwrap_or(0), tail).ok()?;
+            let track = tracks
+                .iter()
+                .find(|t| t.track_id == 0)
+                .or_else(|| tracks.first())?;
+            tail[track.payload.clone()].to_vec()
+        } else {
+            body[payload_start..].to_vec()
+        };
         let mut pkt = Packet::new(stream.index, stream.time_base, data);
         pkt.pts = Some(hdr.timestamp_ms as i64);
         pkt.dts = Some(hdr.timestamp_ms as i64);
@@ -826,21 +888,54 @@ fn build_video_packet(
             return None;
         }
         let payload_start = ex.bytes_consumed.min(body.len());
-        // Command-frame sentinel: when frame_type == Command the body
-        // contains exactly one UI8 (VideoCommand) and no codec payload
-        // (enhanced-rtmp-v2 §`Extended VideoTagHeader` / §`ExVideoTagBody`).
-        // The Ex header parser already consumed the command byte, so
-        // surface it as the packet payload to keep parity with the
-        // legacy FrameType=5 path below. Down-stream callers can match
-        // on `VideoCommand::from_u8(pkt.data[0])` if they want to react
-        // to the seek-sequence boundary.
+        // Multitrack (enhanced-rtmp-v2 §`ExVideoTagBody`): the body after
+        // the Ex header is a loop of per-track records. We don't expand
+        // the stream model one-per-track; instead we surface the *default
+        // track* (trackId 0, or the first track in wire order) so a
+        // multitrack file stays decodable through its primary variant
+        // rather than being dropped wholesale. `ex.packet_type` already
+        // holds the inner per-track packet type (post-Multitrack unwrap).
+        let mut mt_cto = ex.composition_time_offset_ms;
         let data = if let Some(cmd) = ex.video_command {
             vec![cmd.as_u8()]
+        } else if let Some(mt_type) = ex.multitrack {
+            let tail = &body[payload_start..];
+            let tracks = split_tracks(mt_type, ex.fourcc.unwrap_or(0), tail).ok()?;
+            let track = tracks
+                .iter()
+                .find(|t| t.track_id == 0)
+                .or_else(|| tracks.first())?;
+            let mut track_payload = &tail[track.payload.clone()];
+            // For AVC/HEVC/VVC CodedFrames the per-track payload is
+            // prefixed with the SI24 CompositionTimeOffset (the same
+            // framing a single-track CodedFrames body carries).
+            if matches!(ex.packet_type, ExPacketType::CodedFrames)
+                && matches!(track.fourcc, FOURCC_HVC1 | FOURCC_VVC1 | FOURCC_AVC1)
+                && track_payload.len() >= 3
+            {
+                let raw = ((track_payload[0] as u32) << 16)
+                    | ((track_payload[1] as u32) << 8)
+                    | (track_payload[2] as u32);
+                let sext = if raw & 0x0080_0000 != 0 {
+                    raw | 0xFF00_0000
+                } else {
+                    raw
+                };
+                mt_cto = Some(sext as i32);
+                track_payload = &track_payload[3..];
+            }
+            track_payload.to_vec()
         } else {
+            // Command-frame sentinel: when frame_type == Command the body
+            // contains exactly one UI8 (VideoCommand) and no codec payload
+            // (handled above). Otherwise the body tail is the codec
+            // payload. Down-stream callers can match on
+            // `VideoCommand::from_u8(pkt.data[0])` if they want to react
+            // to the seek-sequence boundary.
             body[payload_start..].to_vec()
         };
         let dts = hdr.timestamp_ms as i64;
-        let pts = dts + ex.composition_time_offset_ms.unwrap_or(0) as i64;
+        let pts = dts + mt_cto.unwrap_or(0) as i64;
         let mut pkt = Packet::new(stream.index, stream.time_base, data);
         pkt.pts = Some(pts);
         pkt.dts = Some(dts);
@@ -1982,5 +2077,84 @@ mod tests {
         assert!(md.iter().any(|(k, v)| k == "width" && v == "640"));
         // The video stream should have picked up width=640 from metadata.
         assert_eq!(dmx.streams()[0].params.width, Some(640));
+    }
+
+    #[test]
+    fn multitrack_video_emits_default_track_payload() {
+        // ExVideo Multitrack ManyTracks with two av01 tracks. The demuxer
+        // must surface the trackId-0 default track's coded data as the
+        // packet payload, not the whole multitrack body.
+        // Lead 0x96 = IsExHeader | FrameType=1 (key) | PacketType=6.
+        // mt-byte 0x11 = ManyTracks (1) | inner CodedFrames (1).
+        let mut vbody = vec![0x96, 0x11];
+        vbody.extend_from_slice(b"av01"); // shared FourCc
+                                          // Track 0: id=0, size=3, payload [0xDE,0xAD,0xBE].
+        vbody.push(0x00);
+        vbody.extend_from_slice(&[0x00, 0x00, 0x03]);
+        vbody.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
+        // Track 1: id=1, size=2, payload [0x11,0x22].
+        vbody.push(0x01);
+        vbody.extend_from_slice(&[0x00, 0x00, 0x02]);
+        vbody.extend_from_slice(&[0x11, 0x22]);
+
+        // Audio tag so discovery completes (audio stream 0, video 1).
+        let mp3_body = {
+            let flags = (2 << 4) | (2 << 2) | 0x02 | 0x01;
+            vec![flags as u8, 0xAA]
+        };
+        let audio_tag = make_tag(0x08, 0, &mp3_body);
+        let video_tag = make_tag(0x09, 40, &vbody);
+        let flv = make_flv(&[&audio_tag, &video_tag]);
+
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        // AV1 multitrack with a shared FourCc resolves to the av1 codec id.
+        assert_eq!(dmx.streams()[1].params.codec_id.as_str(), "av1");
+
+        let _audio = dmx.next_packet().unwrap();
+        let vpkt = dmx.next_packet().unwrap();
+        assert_eq!(vpkt.stream_index, 1);
+        assert!(vpkt.flags.keyframe);
+        assert!(!vpkt.flags.discard);
+        // Only the default (trackId 0) track's payload, not track 1's.
+        assert_eq!(vpkt.data, vec![0xDE, 0xAD, 0xBE]);
+    }
+
+    #[test]
+    fn multitrack_audio_emits_default_track_payload() {
+        // ExAudio Multitrack ManyTracksManyCodecs: per-track FourCc. The
+        // default track is Opus CodedFrames; track 1 is a different codec.
+        // Lead 0x95 = ExHeader(9) | AudioPacketType=5 (Multitrack).
+        // mt-byte 0x21 = ManyTracksManyCodecs (2) | inner CodedFrames (1).
+        let mut abody = vec![0x95, 0x21];
+        // Track 0: FourCc "Opus", id=0, size=2, payload [0x4F,0x67].
+        abody.extend_from_slice(b"Opus");
+        abody.push(0x00);
+        abody.extend_from_slice(&[0x00, 0x00, 0x02]);
+        abody.extend_from_slice(&[0x4F, 0x67]);
+        // Track 1: FourCc "mp4a", id=1, size=1, payload [0x99].
+        abody.extend_from_slice(b"mp4a");
+        abody.push(0x01);
+        abody.extend_from_slice(&[0x00, 0x00, 0x01]);
+        abody.push(0x99);
+
+        let audio_tag = make_tag(0x08, 0, &abody);
+        // A legacy video tag so discovery completes.
+        let vp6_body = vec![((1 << 4) | 4) as u8, 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&audio_tag, &video_tag]);
+
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        // ManyTracksManyCodecs has no shared FourCc → multicodec sentinel.
+        assert_eq!(
+            dmx.streams()[0].params.codec_id.as_str(),
+            "flv:exaudio:multicodec"
+        );
+
+        let apkt = dmx.next_packet().unwrap();
+        assert_eq!(apkt.stream_index, 0);
+        // Default (trackId 0) Opus payload only.
+        assert_eq!(apkt.data, vec![0x4F, 0x67]);
     }
 }

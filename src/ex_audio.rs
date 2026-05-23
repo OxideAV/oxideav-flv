@@ -130,29 +130,10 @@ impl ExAudioPacketType {
 pub use crate::mod_ex::AudioPacketModExType;
 
 /// `AvMultitrackType` (UB[4]). Shared with ExVideo (same enum on the
-/// wire) — kept distinct here to keep the audio path self-contained.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AvMultitrackType {
-    /// `0` — one track (the default; really a no-op flag).
-    OneTrack,
-    /// `1` — many tracks, same codec FourCc on all of them.
-    ManyTracks,
-    /// `2` — many tracks, each with its own FourCc carried inside the
-    /// body loop.
-    ManyTracksManyCodecs,
-    Reserved(u8),
-}
-
-impl AvMultitrackType {
-    pub fn from_u8(v: u8) -> Self {
-        match v {
-            0 => Self::OneTrack,
-            1 => Self::ManyTracks,
-            2 => Self::ManyTracksManyCodecs,
-            other => Self::Reserved(other),
-        }
-    }
-}
+/// wire); the canonical definition + per-track body splitter live in
+/// [`crate::multitrack`]. Re-exported here so the audio-side public API
+/// keeps its historical path.
+pub use crate::multitrack::AvMultitrackType;
 
 /// Result of parsing an Enhanced RTMP ExAudioTagHeader off the start of
 /// a filter-clear audio tag body.

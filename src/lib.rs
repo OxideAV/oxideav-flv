@@ -18,6 +18,7 @@ pub mod ex_audio;
 pub mod ex_video;
 pub mod header;
 pub mod mod_ex;
+pub mod multitrack;
 pub mod tag;
 
 use oxideav_core::ContainerRegistry;
@@ -36,6 +37,7 @@ pub use ex_video::{
 };
 pub use header::{FlvHeader, FLV_SIGNATURE};
 pub use mod_ex::{ModExEntry, ModExPayload};
+pub use multitrack::{split_tracks, MultitrackTrack};
 pub use tag::{
     audio_codec_id_str, video_codec_id_str, AudioTagHeader, EncryptedTagPreamble, FrameType,
     TagHeader, TagType, VideoInfoCommand, VideoTagHeader, AUDIO_CODEC_AAC, AUDIO_CODEC_MP3,

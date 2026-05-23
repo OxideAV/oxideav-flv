@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced RTMP / E-FLV multitrack body splitter (Veovera
+  `enhanced-rtmp-v2` §`ExAudioTagBody` / §`ExVideoTagBody`). The
+  `Multitrack` packet type (audio `5` / video `6`) batches several
+  tracks into one tag; previously the demuxer parsed the outer header
+  (audio side only) and discarded the whole body. Now:
+
+  - New `multitrack` module: `AvMultitrackType` (moved here from
+    `ex_audio`; re-exported for back-compat), `MultitrackTrack`
+    (`track_id` / `fourcc` / payload byte-range), and `split_tracks`
+    walking the per-track loop `[FourCc?] trackId UI8 [sizeOfTrack
+    UI24] payload`. `OneTrack` runs the single track to the end of the
+    body; `ManyTracks` / `ManyTracksManyCodecs` slice each track by its
+    `sizeOfTrack` UI24.
+  - `ExVideoTagHeader` reaches parity with `ExAudioTagHeader`: a new
+    `multitrack: Option<AvMultitrackType>` field plus outer-header parse
+    (`videoMultitrackType` UB[4] + inner `videoPacketType` + shared
+    FourCc, rejecting nested Multitrack). `ExVideoTagHeader::fourcc` is
+    now `Option<u32>` (`None` for `ManyTracksManyCodecs`, matching the
+    audio side); the single-track CTO is no longer read in multitrack
+    mode (it lives inside each track payload).
+  - The demuxer surfaces the **default track** (trackId 0, or first in
+    wire order) per multitrack tag: its inner packet type drives
+    routing, AVC/HEVC/VVC `CodedFrames` read the per-track SI24 CTO from
+    inside the track payload, and `SequenceStart` extradata is lifted
+    from the default track's payload. `ManyTracksManyCodecs` (no shared
+    FourCc) maps to a `flv:exaudio:multicodec` / `flv:exvideo:multicodec`
+    sentinel codec id.
+
 - Enhanced RTMP / E-FLV `VideoCommand` plumbing on `ExVideoTagHeader`
   (Veovera `enhanced-rtmp-v2` §`Extended VideoTagHeader`). When the
   Ex video tag carries `videoFrameType == VideoFrameType.Command` and
