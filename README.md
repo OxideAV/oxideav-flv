@@ -95,8 +95,15 @@ oxideav-flv = "0.0"
     3-byte SI24 CompositionTimeOffset so pts/dts split correctly);
     `CodedFramesX` → CodedFrames with implicit CTO=0;
     `SequenceEnd` → dropped (no decoder input); `Metadata` → header +
-    discard so HDR `colorInfo` AMF blobs reach metadata observers but
-    not video decoders; `Mpeg2TsSequenceStart` → header packet;
+    discard so HDR `colorInfo` AMF blobs do not reach video decoders,
+    **and** the AMF body is parsed: each `[name, value]` pair is
+    flattened under a lowercased prefix (`colorInfo` →
+    `metadata["colorinfo.colorConfig.bitDepth"]`,
+    `["colorinfo.hdrCll.maxCLL"]`, `["colorinfo.hdrMdcv.redX"]`, …) so
+    callers see the BT.2020 HDR parameters without an AMF model. A new
+    `colorInfo` replaces the prior one (spec: "invalidates and replaces");
+    a `colorInfo = Undefined` reset clears the nested keys and leaves a
+    `colorinfo = undefined` sentinel; `Mpeg2TsSequenceStart` → header packet;
     `Multitrack` → outer header parsed (`AvMultitrackType` +
     shared/per-track FourCc), body split per-track via `split_tracks`,
     and the default track (trackId 0, or first in wire order) emitted as

@@ -335,6 +335,18 @@ impl Demuxer for FlvDemuxer {
                         Some(i) => i,
                         None => continue,
                     };
+                    // Enhanced-RTMP `VideoPacketType.Metadata` frames carry
+                    // AMF-encoded HDR `colorInfo` (no video data). Harvest it
+                    // into the metadata bag here — the spec mandates it is
+                    // sent before the video section it affects, and a new
+                    // colorInfo replaces the prior one. The packet itself is
+                    // still emitted as header+discard for parity.
+                    if let Ok(Some(ex)) = ExVideoTagHeader::parse(&body) {
+                        if matches!(ex.packet_type, ExPacketType::Metadata) {
+                            let start = ex.bytes_consumed.min(body.len());
+                            harvest_video_metadata_frame(&body[start..], &mut self.metadata);
+                        }
+                    }
                     if let Some((pkt, pending)) =
                         build_video_packet(&self.streams[idx as usize], &header, &body)
                     {
@@ -1269,6 +1281,67 @@ fn flatten_amf_value(value: &AmfValue, prefix: &str, out: &mut Vec<(String, Stri
     }
 }
 
+/// Harvest an Enhanced-RTMP `VideoPacketType.Metadata` body into the
+/// metadata bag, per Veovera `enhanced-rtmp-v2` §"Metadata Frame".
+///
+/// The body that follows the Ex video tag header (when
+/// `videoPacketType == VideoPacketType.Metadata`) carries **no video
+/// data**: instead it is a series of AMF0 `[name, value]` pairs, encoded
+/// exactly like a `SCRIPTDATA` payload (the spec defers to the FLV
+/// `SCRIPTDATAVALUE` description for the wire layout). The only pair
+/// currently defined is `["colorInfo", Object]`, whose nested
+/// `colorConfig` / `hdrCll` / `hdrMdcv` sub-objects describe BT.2020 HDR
+/// metadata.
+///
+/// Each pair is flattened under a `<name-lowercased>.…` prefix using the
+/// shared [`flatten_amf_value`] walker — so `colorInfo.colorConfig.
+/// transferCharacteristics` lands as `colorinfo.colorConfig.
+/// transferCharacteristics`. Per spec each new `colorInfo` "invalidates
+/// and replaces the current one", and a value of `Undefined` (or an
+/// empty object) resets to the original color state; we model that by
+/// dropping every prior entry under the same prefix before flattening the
+/// new value. A reset therefore clears the bag (an `Undefined` value
+/// flattens to a single `colorinfo = undefined` sentinel; an empty object
+/// flattens to nothing).
+///
+/// Unknown pair names (none are spec-defined yet) are flattened verbatim
+/// under their own lowercased prefix so a future-defined metadata name
+/// surfaces rather than being silently dropped.
+fn harvest_video_metadata_frame(body: &[u8], out: &mut Vec<(String, String)>) {
+    let mut pos = 0usize;
+    while pos < body.len() {
+        // name = AMF0 value (always a String in practice, but parse it as
+        // a value so a malformed name aborts the walk cleanly rather than
+        // mis-slicing the body).
+        let (name, np) = match parse_amf0_value(body, pos) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let name = match name.as_str() {
+            Some(s) => s.to_string(),
+            None => return,
+        };
+        let (value, vp) = match parse_amf0_value(body, np) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        // Forward progress guard — a zero-advance parse would loop forever.
+        if vp <= pos {
+            return;
+        }
+        pos = vp;
+
+        // `colorInfo` (the only spec-defined name) lands under a stable
+        // lowercase `colorinfo` prefix; every other name keeps its own
+        // lowercased prefix so future metadata names are visible.
+        let prefix = name.to_ascii_lowercase();
+        // A new value replaces the prior one for this name (spec:
+        // "invalidates and replaces the current one"; Undefined / {} reset).
+        out.retain(|(k, _)| k != &prefix && !k.starts_with(&format!("{prefix}.")));
+        flatten_amf_value(&value, &prefix, out);
+    }
+}
+
 /// Pull the parallel `filepositions[]` / `times[]` arrays out of a
 /// `keyframes` AMF0 object. Returns `None` when either array is
 /// missing, of the wrong type, or has a mismatched length — callers
@@ -1803,6 +1876,212 @@ mod tests {
         assert!(m.flags.header);
         assert!(m.flags.discard);
         assert_eq!(m.data, b"amf-color-info-blob".to_vec());
+    }
+
+    // --- AMF0 encode helpers for the colorInfo metadata-frame tests ----------
+
+    fn amf_string(s: &str) -> Vec<u8> {
+        let mut v = vec![0x02];
+        v.extend_from_slice(&(s.len() as u16).to_be_bytes());
+        v.extend_from_slice(s.as_bytes());
+        v
+    }
+
+    fn amf_number(n: f64) -> Vec<u8> {
+        let mut v = vec![0x00];
+        v.extend_from_slice(&n.to_be_bytes());
+        v
+    }
+
+    /// AMF0 object: `(u16-len key, value)* 0x00 0x00 0x09`.
+    fn amf_object(fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut v = vec![0x03];
+        for (k, val) in fields {
+            v.extend_from_slice(&(k.len() as u16).to_be_bytes());
+            v.extend_from_slice(k.as_bytes());
+            v.extend_from_slice(val);
+        }
+        v.extend_from_slice(&[0x00, 0x00, 0x09]);
+        v
+    }
+
+    fn meta_lookup<'a>(md: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        md.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn ex_video_metadata_colorinfo_flattens_into_metadata() {
+        // Real AMF colorInfo metadata frame per enhanced-rtmp-v2
+        // §"Metadata Frame": a [name, value] pair ["colorInfo", Object]
+        // with nested colorConfig / hdrCll / hdrMdcv sub-objects.
+        let color_config = amf_object(&[
+            ("bitDepth", amf_number(10.0)),
+            ("colorPrimaries", amf_number(9.0)),
+            ("transferCharacteristics", amf_number(16.0)),
+            ("matrixCoefficients", amf_number(9.0)),
+        ]);
+        let hdr_cll = amf_object(&[
+            ("maxFall", amf_number(400.0)),
+            ("maxCLL", amf_number(1000.0)),
+        ]);
+        let color_info = amf_object(&[("colorConfig", color_config), ("hdrCll", hdr_cll)]);
+        let mut amf = amf_string("colorInfo");
+        amf.extend_from_slice(&color_info);
+
+        let mut seq_body = vec![0x90];
+        seq_body.extend_from_slice(b"hvc1");
+        seq_body.push(0x00);
+        let seq_tag = make_tag(0x09, 0, &seq_body);
+
+        let mut meta_body = vec![0x94]; // FrameType=key + PacketType=Metadata
+        meta_body.extend_from_slice(b"hvc1");
+        meta_body.extend_from_slice(&amf);
+        let meta_tag = make_tag(0x09, 0, &meta_body);
+
+        let flv = make_flv(&[&seq_tag, &meta_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        let _seq = dmx.next_packet().unwrap();
+        // The Metadata frame is still surfaced as a header+discard packet.
+        let m = dmx.next_packet().unwrap();
+        assert!(m.flags.header && m.flags.discard);
+
+        let md = dmx.metadata();
+        assert_eq!(
+            meta_lookup(md, "colorinfo.colorConfig.bitDepth"),
+            Some("10")
+        );
+        assert_eq!(
+            meta_lookup(md, "colorinfo.colorConfig.transferCharacteristics"),
+            Some("16")
+        );
+        assert_eq!(
+            meta_lookup(md, "colorinfo.colorConfig.matrixCoefficients"),
+            Some("9")
+        );
+        assert_eq!(meta_lookup(md, "colorinfo.hdrCll.maxFall"), Some("400"));
+        assert_eq!(meta_lookup(md, "colorinfo.hdrCll.maxCLL"), Some("1000"));
+    }
+
+    #[test]
+    fn ex_video_metadata_colorinfo_replaces_prior_value() {
+        // Two colorInfo frames: the second must replace the first per spec
+        // ("each new colorInfo invalidates and replaces the current one").
+        let info1 = {
+            let mut a = amf_string("colorInfo");
+            a.extend_from_slice(&amf_object(&[(
+                "colorConfig",
+                amf_object(&[("bitDepth", amf_number(8.0))]),
+            )]));
+            a
+        };
+        let info2 = {
+            let mut a = amf_string("colorInfo");
+            a.extend_from_slice(&amf_object(&[(
+                "colorConfig",
+                amf_object(&[("bitDepth", amf_number(12.0))]),
+            )]));
+            a
+        };
+
+        let mut seq_body = vec![0x90];
+        seq_body.extend_from_slice(b"av01");
+        seq_body.push(0x00);
+        let seq_tag = make_tag(0x09, 0, &seq_body);
+
+        let mut m1 = vec![0x94];
+        m1.extend_from_slice(b"av01");
+        m1.extend_from_slice(&info1);
+        let m1_tag = make_tag(0x09, 0, &m1);
+
+        let mut m2 = vec![0x94];
+        m2.extend_from_slice(b"av01");
+        m2.extend_from_slice(&info2);
+        let m2_tag = make_tag(0x09, 40, &m2);
+
+        let flv = make_flv(&[&seq_tag, &m1_tag, &m2_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        while dmx.next_packet().is_ok() {}
+
+        let md = dmx.metadata();
+        // Only one entry for bitDepth, and it carries the second value.
+        let hits: Vec<&str> = md
+            .iter()
+            .filter(|(k, _)| k == "colorinfo.colorConfig.bitDepth")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(hits, vec!["12"]);
+    }
+
+    #[test]
+    fn ex_video_metadata_colorinfo_undefined_resets() {
+        // colorInfo set, then reset to Undefined (the RECOMMENDED reset
+        // per spec). After the reset the nested entries are gone and only
+        // the sentinel remains.
+        let set = {
+            let mut a = amf_string("colorInfo");
+            a.extend_from_slice(&amf_object(&[(
+                "colorConfig",
+                amf_object(&[("bitDepth", amf_number(10.0))]),
+            )]));
+            a
+        };
+        let reset = {
+            let mut a = amf_string("colorInfo");
+            a.push(0x06); // AMF0 Undefined
+            a
+        };
+
+        let mut seq_body = vec![0x90];
+        seq_body.extend_from_slice(b"av01");
+        seq_body.push(0x00);
+        let seq_tag = make_tag(0x09, 0, &seq_body);
+
+        let mut m1 = vec![0x94];
+        m1.extend_from_slice(b"av01");
+        m1.extend_from_slice(&set);
+        let m1_tag = make_tag(0x09, 0, &m1);
+
+        let mut m2 = vec![0x94];
+        m2.extend_from_slice(b"av01");
+        m2.extend_from_slice(&reset);
+        let m2_tag = make_tag(0x09, 40, &m2);
+
+        let flv = make_flv(&[&seq_tag, &m1_tag, &m2_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        while dmx.next_packet().is_ok() {}
+
+        let md = dmx.metadata();
+        assert!(meta_lookup(md, "colorinfo.colorConfig.bitDepth").is_none());
+        assert_eq!(meta_lookup(md, "colorinfo"), Some("undefined"));
+    }
+
+    #[test]
+    fn ex_video_metadata_malformed_amf_is_ignored() {
+        // A non-AMF blob in a Metadata frame must not poison the parse —
+        // no colorinfo.* metadata, and the packet is still surfaced.
+        let mut seq_body = vec![0x90];
+        seq_body.extend_from_slice(b"hvc1");
+        seq_body.push(0x00);
+        let seq_tag = make_tag(0x09, 0, &seq_body);
+
+        let mut meta_body = vec![0x94];
+        meta_body.extend_from_slice(b"hvc1");
+        meta_body.extend_from_slice(b"not-amf");
+        let meta_tag = make_tag(0x09, 0, &meta_body);
+
+        let flv = make_flv(&[&seq_tag, &meta_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        let _seq = dmx.next_packet().unwrap();
+        let m = dmx.next_packet().unwrap();
+        assert!(m.flags.header && m.flags.discard);
+        assert!(dmx
+            .metadata()
+            .iter()
+            .all(|(k, _)| !k.starts_with("colorinfo")));
     }
 
     #[test]

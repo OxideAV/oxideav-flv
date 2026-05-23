@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced RTMP / E-FLV `VideoPacketType.Metadata` HDR `colorInfo`
+  parsing (Veovera `enhanced-rtmp-v2` §"Metadata Frame"). The Metadata
+  frame's body carries no video data — it is a series of AMF0
+  `[name, value]` pairs (encoded like `SCRIPTDATA`), the only defined
+  pair being `["colorInfo", Object]` with nested `colorConfig` /
+  `hdrCll` / `hdrMdcv` BT.2020 HDR sub-objects. Previously the demuxer
+  forwarded the AMF blob as a header+discard packet without parsing it.
+  Now the demuxer also harvests it into the `metadata()` bag:
+  - New `harvest_video_metadata_frame` walks the AMF0 `[name, value]`
+    pairs at `next_packet` time and flattens each value under a
+    lowercased prefix via the existing `flatten_amf_value` helper —
+    `colorInfo.colorConfig.transferCharacteristics` →
+    `metadata["colorinfo.colorConfig.transferCharacteristics"]`,
+    `colorInfo.hdrMdcv.redX` → `metadata["colorinfo.hdrMdcv.redX"]`, etc.
+  - Per spec each new `colorInfo` "invalidates and replaces the current
+    one": before flattening a new value the prior `colorinfo.*` entries
+    are dropped. A reset (`colorInfo = Undefined`, the RECOMMENDED form,
+    or an empty object) clears the nested keys — `Undefined` leaves a
+    single `colorinfo = undefined` sentinel; `{}` leaves nothing.
+  - Malformed / non-AMF Metadata bodies are ignored (no `colorinfo.*`
+    entries) rather than poisoning the parse; the discard packet is
+    still surfaced unchanged, so existing routing is untouched.
+
 - Enhanced RTMP / E-FLV multitrack body splitter (Veovera
   `enhanced-rtmp-v2` §`ExAudioTagBody` / §`ExVideoTagBody`). The
   `Multitrack` packet type (audio `5` / video `6`) batches several
