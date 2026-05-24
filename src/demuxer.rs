@@ -1202,6 +1202,24 @@ fn parse_on_metadata(
             {
                 *keyframe_index = parse_keyframes_object(v);
             }
+            // Enhanced-RTMP-v2 §"Enhancing onMetaData": the new
+            // `audioTrackIdInfoMap` / `videoTrackIdInfoMap` properties carry
+            // per-track metadata for additional (non-default) tracks in a
+            // multitrack stream. Each is an object keyed by trackId (1, 2,
+            // …; trackId 0 is the default track described by the top-level
+            // onMetaData fields) whose value is a per-track property object
+            // (width / height / videodatarate / channels / samplerate /
+            // codec id / …). Flatten the whole map into the metadata bag
+            // under a stable lowercased prefix so callers can read e.g.
+            // `videotrackidinfomap.1.width` without an AMF model. The exact
+            // per-track field set is producer-defined (delta-style or full),
+            // so a structural flatten — rather than a fixed schema — is the
+            // right model.
+            AmfValue::Object(_) | AmfValue::EcmaArray(_)
+                if k == "audioTrackIdInfoMap" || k == "videoTrackIdInfoMap" =>
+            {
+                flatten_amf_value(v, &k.to_ascii_lowercase(), metadata);
+            }
             _ => {}
         }
     }
@@ -2082,6 +2100,130 @@ mod tests {
             .metadata()
             .iter()
             .all(|(k, _)| !k.starts_with("colorinfo")));
+    }
+
+    /// Build an `onMetaData` script-tag body whose single ECMA-array
+    /// argument carries the supplied top-level `(key, amf-value-bytes)`
+    /// fields verbatim. Lets the track-map tests embed nested objects
+    /// without the rigid single-number shape of `on_metadata_with_property`.
+    fn on_metadata_with_fields(fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&("onMetaData".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"onMetaData");
+        // ECMA array argument.
+        body.push(0x08);
+        body.extend_from_slice(&(fields.len() as u32).to_be_bytes());
+        for (k, val) in fields {
+            body.extend_from_slice(&(k.len() as u16).to_be_bytes());
+            body.extend_from_slice(k.as_bytes());
+            body.extend_from_slice(val);
+        }
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        body
+    }
+
+    #[test]
+    fn on_metadata_video_track_id_info_map_flattens() {
+        // Enhanced-RTMP-v2 §"Enhancing onMetaData": the new
+        // `videoTrackIdInfoMap` carries per-track metadata for non-default
+        // tracks, keyed by trackId (1, 2, …). Each value is a per-track
+        // property object. The whole map flattens under a lowercased prefix.
+        let track1 = amf_object(&[
+            ("width", amf_number(1024.0)),
+            ("height", amf_number(768.0)),
+            ("videodatarate", amf_number(2000.0)),
+            ("videocodecid", amf_number(1635135537.0)), // makeFourCc("av01")
+        ]);
+        let track2 = amf_object(&[
+            ("width", amf_number(3840.0)),
+            ("height", amf_number(2160.0)),
+        ]);
+        let map = amf_object(&[("1", track1), ("2", track2)]);
+        let body = on_metadata_with_fields(&[("videoTrackIdInfoMap", map)]);
+        let script_tag = make_tag(0x12, 0, &body);
+        // A video keyframe so stream discovery still succeeds.
+        let kf_body = vec![(1u8 << 4) | 2, 0xAA, 0xBB];
+        let video_tag = make_tag(0x09, 0, &kf_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        let md = dmx.metadata();
+        assert_eq!(meta_lookup(md, "videotrackidinfomap.1.width"), Some("1024"));
+        assert_eq!(meta_lookup(md, "videotrackidinfomap.1.height"), Some("768"));
+        assert_eq!(
+            meta_lookup(md, "videotrackidinfomap.1.videodatarate"),
+            Some("2000")
+        );
+        assert_eq!(
+            meta_lookup(md, "videotrackidinfomap.1.videocodecid"),
+            Some("1635135537")
+        );
+        assert_eq!(meta_lookup(md, "videotrackidinfomap.2.width"), Some("3840"));
+        assert_eq!(
+            meta_lookup(md, "videotrackidinfomap.2.height"),
+            Some("2160")
+        );
+    }
+
+    #[test]
+    fn on_metadata_audio_track_id_info_map_flattens() {
+        // The audio-side twin of the video map. Delta-style entries (only
+        // the fields that differ from the default track) are valid per spec;
+        // we flatten exactly what the producer sent.
+        let track1 = amf_object(&[
+            ("audiodatarate", amf_number(256.0)),
+            ("channels", amf_number(2.0)),
+            ("samplerate", amf_number(44100.0)),
+        ]);
+        let track2 = amf_object(&[
+            ("audiodatarate", amf_number(320.0)),
+            ("samplerate", amf_number(48000.0)),
+        ]);
+        let map = amf_object(&[("1", track1), ("2", track2)]);
+        let body = on_metadata_with_fields(&[("audioTrackIdInfoMap", map)]);
+        let script_tag = make_tag(0x12, 0, &body);
+        let kf_body = vec![(1u8 << 4) | 2, 0xAA, 0xBB];
+        let video_tag = make_tag(0x09, 0, &kf_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        let md = dmx.metadata();
+        assert_eq!(
+            meta_lookup(md, "audiotrackidinfomap.1.audiodatarate"),
+            Some("256")
+        );
+        assert_eq!(meta_lookup(md, "audiotrackidinfomap.1.channels"), Some("2"));
+        assert_eq!(
+            meta_lookup(md, "audiotrackidinfomap.1.samplerate"),
+            Some("44100")
+        );
+        assert_eq!(
+            meta_lookup(md, "audiotrackidinfomap.2.audiodatarate"),
+            Some("320")
+        );
+        assert_eq!(
+            meta_lookup(md, "audiotrackidinfomap.2.samplerate"),
+            Some("48000")
+        );
+        // track 2 sent no `channels` (delta-style) — must not appear.
+        assert!(meta_lookup(md, "audiotrackidinfomap.2.channels").is_none());
+    }
+
+    #[test]
+    fn on_metadata_without_track_maps_emits_no_map_keys() {
+        // A plain onMetaData (no track maps) must not synthesise any
+        // *trackidinfomap.* entries — the maps are opt-in per producer.
+        let body = on_metadata_with_property("width", 640.0);
+        let script_tag = make_tag(0x12, 0, &body);
+        let kf_body = vec![(1u8 << 4) | 2, 0xAA, 0xBB];
+        let video_tag = make_tag(0x09, 0, &kf_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        let md = dmx.metadata();
+        assert_eq!(meta_lookup(md, "width"), Some("640"));
+        assert!(md.iter().all(|(k, _)| !k.contains("trackidinfomap")));
     }
 
     #[test]

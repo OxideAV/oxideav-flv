@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced RTMP / E-FLV `onMetaData` per-track metadata maps
+  (`audioTrackIdInfoMap` / `videoTrackIdInfoMap`, Veovera
+  `enhanced-rtmp-v2` §"Enhancing onMetaData"). These NEW properties
+  describe additional (non-default) tracks in a multitrack stream: each
+  is an object keyed by trackId (`1`, `2`, … — trackId `0` is the
+  default track, described by the top-level `onMetaData` fields), whose
+  value is a per-track property object (width / height / videodatarate /
+  channels / samplerate / codec id / …). Producers may send delta-style
+  entries (only the fields that differ from the default) or full
+  descriptors — both are valid. Previously the demuxer dropped both maps
+  silently (they fell into the catch-all arm of `parse_on_metadata`).
+  Now each map is flattened into the `metadata()` bag under a lowercased
+  prefix via the existing `flatten_amf_value` walker —
+  `videoTrackIdInfoMap[1].width` → `metadata["videotrackidinfomap.1.width"]`,
+  `audioTrackIdInfoMap[2].samplerate` →
+  `metadata["audiotrackidinfomap.2.samplerate"]`, etc. — so callers can
+  read per-track bitrate / resolution / codec without an AMF model. A
+  structural flatten (rather than a fixed schema) is used because the
+  spec leaves the per-track field set producer-defined. A plain
+  `onMetaData` with no track maps synthesises no `*trackidinfomap.*`
+  keys.
+
 - Enhanced RTMP / E-FLV `VideoPacketType.Metadata` HDR `colorInfo`
   parsing (Veovera `enhanced-rtmp-v2` §"Metadata Frame"). The Metadata
   frame's body carries no video data — it is a series of AMF0

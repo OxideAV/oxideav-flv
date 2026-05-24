@@ -33,7 +33,13 @@ oxideav-flv = "0.0"
     `CodecParameters::bit_rate`. `audiosamplerate` overrides the
     `SoundRate` field's 5.5/11/22/44 kHz quantisation. The optional
     `keyframes` toc (`filepositions[]` / `times[]`) is harvested for
-    O(log n) seeks.
+    O(log n) seeks. Enhanced-RTMP-v2's new `audioTrackIdInfoMap` /
+    `videoTrackIdInfoMap` per-track metadata maps (keyed by trackId
+    1, 2, … for non-default multitrack variants; trackId 0 is the
+    top-level fields) flatten under
+    `metadata["videotrackidinfomap.1.width"]`,
+    `metadata["audiotrackidinfomap.2.samplerate"]`, … so callers read
+    per-track bitrate / resolution / codec without an AMF model.
   - `onXMPData` (Annex E.6) — `liveXML` body surfaced via
     `metadata["xmp"]`.
   - `onCuePoint` (Annex A) — payload flattened into
