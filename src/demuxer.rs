@@ -570,6 +570,13 @@ fn build_audio_stream(
                 params.bit_rate = Some((kbps * 1000.0) as u64);
             }
         }
+        // `audiosamplesize` (E.5) is the only spec-defined source of
+        // per-sample resolution on the ExAudio side — the ExHeader byte
+        // repurposes the legacy SoundSize bit as AudioPacketType, so
+        // there is no header field to fall back on.
+        if let Some(fmt) = metadata_audio_sample_format(metadata) {
+            params.sample_format = Some(fmt);
+        }
         // SequenceStart's body is the codec's decoder-configuration
         // record — route to extradata so consumers find it without
         // peeking at the first packet (consistent with the legacy AAC
@@ -626,6 +633,14 @@ fn build_audio_stream(
         if kbps.is_finite() && kbps >= 0.0 {
             params.bit_rate = Some((kbps * 1000.0) as u64);
         }
+    }
+    // `audiosamplesize` (E.5) overrides the SoundSize-derived resolution
+    // the same way `audiosamplerate` overrides the SoundRate field: the
+    // 1-bit SoundSize "only pertains to uncompressed formats" (E.4.2.1),
+    // so for AAC / MP3 / Speex the onMetaData value is the producer's
+    // declared truth.
+    if let Some(fmt) = metadata_audio_sample_format(metadata) {
+        params.sample_format = Some(fmt);
     }
     Ok(StreamInfo {
         index,
@@ -1463,6 +1478,21 @@ fn metadata_lookup_bool(metadata: &[(String, String)], key: &str) -> Option<bool
     None
 }
 
+/// Map the spec E.5 `audiosamplesize` onMetaData field ("Resolution of a
+/// single audio sample", in bits) to a [`SampleFormat`]. Adobe's encoders
+/// only ever emit 8 or 16 here — the legacy `SoundSize` field can encode
+/// only those two values (E.4.2.1) and `audiosamplesize` is its
+/// onMetaData mirror — so we recognise exactly 8 (→ `U8`) and 16 (→
+/// `S16`). Any other value is unrecognised and returns `None` rather than
+/// inventing a format. Returns `None` for absent / non-numeric entries.
+fn metadata_audio_sample_format(metadata: &[(String, String)]) -> Option<SampleFormat> {
+    match metadata_lookup_u32(metadata, "audiosamplesize")? {
+        8 => Some(SampleFormat::U8),
+        16 => Some(SampleFormat::S16),
+        _ => None,
+    }
+}
+
 fn format_number(n: f64) -> String {
     // Integral-valued floats become "42"; everything else uses the
     // default rust formatter. Avoids "42.0" noise in common cases.
@@ -1648,6 +1678,79 @@ mod tests {
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
         let dmx = open(input, &NullCodecResolver).unwrap();
         assert_eq!(dmx.streams()[0].params.sample_rate, Some(48_000));
+    }
+
+    #[test]
+    fn audiosamplesize_sets_sample_format_on_legacy_aac() {
+        // AAC carries no usable SoundSize (the field "only pertains to
+        // uncompressed formats"); audiosamplesize=16 (E.5) is the
+        // producer's declared resolution → S16.
+        let script_tag = make_tag(0x12, 0, &on_metadata_with_property("audiosamplesize", 16.0));
+        // AAC tag: codec=10, rate idx=3, SoundSize bit=0 (8-bit) — the
+        // metadata override must win over the header bit. Mono (Type=1
+        // bit kept; SoundSize bit elided as it is 0).
+        let flags = (10 << 4) | (3 << 2) | 0x01;
+        let audio_body = vec![flags as u8, 0x01, 0xAA];
+        let audio_tag = make_tag(0x08, 0, &audio_body);
+        let flv = make_flv(&[&script_tag, &audio_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        assert_eq!(
+            dmx.streams()[0].params.sample_format,
+            Some(SampleFormat::S16)
+        );
+    }
+
+    #[test]
+    fn audiosamplesize_8_overrides_soundsize_to_u8() {
+        // MP3 tag with SoundSize=1 (16-bit) but onMetaData
+        // audiosamplesize=8 → the declared 8-bit resolution wins (U8).
+        let script_tag = make_tag(0x12, 0, &on_metadata_with_property("audiosamplesize", 8.0));
+        let flags = (2 << 4) | (2 << 2) | 0x02 | 0x01;
+        let audio_body = vec![flags as u8, 0xAA, 0xBB];
+        let audio_tag = make_tag(0x08, 0, &audio_body);
+        let flv = make_flv(&[&script_tag, &audio_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        assert_eq!(
+            dmx.streams()[0].params.sample_format,
+            Some(SampleFormat::U8)
+        );
+    }
+
+    #[test]
+    fn audiosamplesize_unrecognised_leaves_header_format_intact() {
+        // audiosamplesize=24 is not a value Adobe's SoundSize bit can
+        // represent — the override is declined and the SoundSize-derived
+        // S16 (16-bit bit set) is preserved rather than invented away.
+        let script_tag = make_tag(0x12, 0, &on_metadata_with_property("audiosamplesize", 24.0));
+        let flags = (2 << 4) | (2 << 2) | 0x02 | 0x01; // SoundSize bit = 16-bit
+        let audio_body = vec![flags as u8, 0xAA, 0xBB];
+        let audio_tag = make_tag(0x08, 0, &audio_body);
+        let flv = make_flv(&[&script_tag, &audio_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        assert_eq!(
+            dmx.streams()[0].params.sample_format,
+            Some(SampleFormat::S16)
+        );
+    }
+
+    #[test]
+    fn audiosamplesize_sets_sample_format_on_ex_stream() {
+        // ExAudio repurposes the SoundSize bit as AudioPacketType, so
+        // audiosamplesize is the only resolution source; 16 → S16.
+        let script_tag = make_tag(0x12, 0, &on_metadata_with_property("audiosamplesize", 16.0));
+        let mut audio_body = vec![0x90]; // SoundFormat=9 (ExHeader), SequenceStart
+        audio_body.extend_from_slice(b"Opus");
+        audio_body.extend_from_slice(b"OpusHead");
+        let audio_tag = make_tag(0x08, 0, &audio_body);
+        let flv = make_flv(&[&script_tag, &audio_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        let s = &dmx.streams()[0];
+        assert_eq!(s.params.codec_id.as_str(), "opus");
+        assert_eq!(s.params.sample_format, Some(SampleFormat::S16));
     }
 
     #[test]

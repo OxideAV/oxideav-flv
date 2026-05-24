@@ -25,13 +25,19 @@ oxideav-flv = "0.0"
 - Script tags (Annex E.4.4):
   - `onMetaData` — parsed for `duration`, `width`, `height`,
     `videocodecid`, `audiocodecid`, `framerate` / `videoframerate`,
-    `audiodatarate`, `videodatarate`, `audiosamplerate`, `stereo`,
-    `creationdate`, etc. NTSC-family `videoframerate` values
+    `audiodatarate`, `videodatarate`, `audiosamplerate`,
+    `audiosamplesize`, `stereo`, `creationdate`, etc. NTSC-family
+    `videoframerate` values
     (29.97/23.976/59.94/47.952/119.88) snap to canonical 1001-denominator
     `Rational`s; non-canonical rates use a 1/1000 fallback.
     `videodatarate` / `audiodatarate` (kbps) lift into
     `CodecParameters::bit_rate`. `audiosamplerate` overrides the
-    `SoundRate` field's 5.5/11/22/44 kHz quantisation. The optional
+    `SoundRate` field's 5.5/11/22/44 kHz quantisation.
+    `audiosamplesize` (8 / 16) sets `CodecParameters::sample_format`
+    (U8 / S16) — the only resolution source on ExAudio (where the
+    SoundSize bit was repurposed as AudioPacketType) and the
+    spec-defined override for legacy compressed formats whose 1-bit
+    SoundSize "only pertains to uncompressed formats" (E.4.2.1). The optional
     `keyframes` toc (`filepositions[]` / `times[]`) is harvested for
     O(log n) seeks. Enhanced-RTMP-v2's new `audioTrackIdInfoMap` /
     `videoTrackIdInfoMap` per-track metadata maps (keyed by trackId

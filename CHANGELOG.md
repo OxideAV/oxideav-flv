@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `audiosamplesize` onMetaData field (Adobe FLV Spec v10.1, Annex E.5 —
+  "Resolution of a single audio sample", in bits) lifts into
+  `CodecParameters::sample_format`. A value of `8` maps to `U8`, `16`
+  maps to `S16`; any other value is unrecognised and leaves the
+  header-derived format intact rather than inventing one. On the
+  ExAudio (FourCC) path this is the *only* spec-defined resolution
+  source — the leading byte of the ExHeader audio tag repurposes the
+  legacy `SoundSize` bit as `AudioPacketType` (Veovera
+  `enhanced-rtmp-v2`), so previously no `sample_format` was set at all.
+  On the legacy path it overrides the 1-bit `SoundSize`-derived format,
+  consistent with how `audiosamplerate` already overrides the 2-bit
+  `SoundRate` field; per E.4.2.1 the SoundSize bit "only pertains to
+  uncompressed formats" so for AAC / MP3 / Speex the onMetaData value
+  is the producer's declared truth.
 - Enhanced RTMP / E-FLV `onMetaData` per-track metadata maps
   (`audioTrackIdInfoMap` / `videoTrackIdInfoMap`, Veovera
   `enhanced-rtmp-v2` §"Enhancing onMetaData"). These NEW properties
