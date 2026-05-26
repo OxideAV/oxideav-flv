@@ -22,15 +22,33 @@
 //! * `0x0A` Strict array — u32 BE length + that many values.
 //! * `0x0B` Date — 8-byte double (ms since epoch) + i16 BE timezone.
 //! * `0x0C` Long string — u32 BE length + UTF-8 bytes.
+//! * `0x0D` Unsupported — no payload. The spec (§2.15) lets a producer
+//!   emit this marker for a value it cannot serialise; some endpoints
+//!   raise an error on encountering it, others treat it as
+//!   `Undefined`. We surface it as a distinct variant so callers can
+//!   tell which behaviour they're seeing.
+//! * `0x0F` XML Document — encoded "always" as a long UTF-8 string
+//!   (u32 BE length + UTF-8 bytes per §2.17). Carries the serialised
+//!   DOM body of an `XMLDocument`; we keep the raw payload so callers
+//!   can pipe it into their own XML parser if they need one.
+//! * `0x10` Typed Object — `class-name (UTF-8) + object-property*`
+//!   per §2.18. Producers that register a class alias on a typed
+//!   object emit this in place of the anonymous `0x03` object; FMS /
+//!   Wowza relays do pass these through in `onMetaData` payloads. The
+//!   class name is preserved alongside the property body.
 //!
 //! Type `0x04` MovieClip is reserved-not-supported per E.4.4.2 and
 //! surfaces as [`Error::InvalidData`] — the spec explicitly bans
 //! producers from emitting it.
 //!
-//! Types not enumerated in E.4.4.2 (`TypedObject`, `XML Document`, the
-//! AMF3-wrapping switch marker, …) are not expected inside an FLV
-//! script tag — they surface as [`Error::InvalidData`] so callers can
-//! log the anomaly rather than silently drop metadata.
+//! Type `0x0E` RecordSet is reserved-not-supported per AMF0 §2.16 (the
+//! spec mirrors the MovieClip status); it surfaces as
+//! [`Error::InvalidData`].
+//!
+//! The `0x11` AVM+ object marker (AMF3 switch, §3.1) is treated as an
+//! error because the FLV crate has no AMF3 decoder yet. A future round
+//! that adds AMF3 support can lift this into a structured variant
+//! without disturbing the AMF0-only callers.
 
 use oxideav_core::{Error, Result};
 
@@ -52,6 +70,23 @@ pub enum AmfValue {
     Date {
         time_ms: f64,
         tz: i16,
+    },
+    /// AMF0 Unsupported (marker `0x0D`, spec §2.15). The producer used
+    /// this sentinel for a value its serializer could not encode. No
+    /// payload — the marker stands on its own.
+    Unsupported,
+    /// AMF0 XMLDocument (marker `0x0F`, spec §2.17). Carries the
+    /// serialized form of an `XMLDocument` as a long UTF-8 string. The
+    /// raw body is preserved so callers can feed it into their own XML
+    /// parser if they need to.
+    Xml(String),
+    /// AMF0 Typed Object (marker `0x10`, spec §2.18). A complex value
+    /// with a registered class alias. `class_name` is the alias the
+    /// producer attached; `body` is the same `(key, value)*` sequence
+    /// as for an anonymous Object.
+    TypedObject {
+        class_name: String,
+        body: Vec<(String, AmfValue)>,
     },
 }
 
@@ -78,14 +113,24 @@ impl AmfValue {
         }
     }
 
-    /// Look up a field by name from an Object or EcmaArray value;
-    /// returns `None` for every other variant.
+    /// Look up a field by name from an Object, EcmaArray, or
+    /// TypedObject value; returns `None` for every other variant.
     pub fn get(&self, key: &str) -> Option<&AmfValue> {
         let body = match self {
             Self::Object(v) | Self::EcmaArray(v) => v,
+            Self::TypedObject { body, .. } => body,
             _ => return None,
         };
         body.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// For a `TypedObject`, the producer-registered class alias.
+    /// `None` for every other variant (including anonymous `Object`).
+    pub fn class_name(&self) -> Option<&str> {
+        match self {
+            Self::TypedObject { class_name, .. } => Some(class_name.as_str()),
+            _ => None,
+        }
     }
 }
 
@@ -166,6 +211,35 @@ pub fn parse_amf0_value(data: &[u8], pos: usize) -> Result<(AmfValue, usize)> {
             let s = read_utf8(data, p, len)?;
             p += len;
             AmfValue::String(s)
+        }
+        0x0D => {
+            // Unsupported — no payload, the marker stands on its own
+            // (spec §2.15).
+            AmfValue::Unsupported
+        }
+        0x0F => {
+            // XMLDocument — encoded as a long UTF-8 string (u32 BE
+            // length + UTF-8 bytes, spec §2.17 references the long
+            // string form).
+            let len = read_u32_be(data, p)? as usize;
+            p += 4;
+            let s = read_utf8(data, p, len)?;
+            p += len;
+            AmfValue::Xml(s)
+        }
+        0x10 => {
+            // Typed Object — `UTF-8 class-name + *(object-property)`
+            // (spec §2.18). The class-name is a plain u16-length-prefixed
+            // UTF-8 string (the leading byte of an anonymous-object body
+            // terminator does NOT apply here — that terminator only
+            // belongs to the property body).
+            let class_name_len = read_u16_be(data, p)? as usize;
+            p += 2;
+            let class_name = read_utf8(data, p, class_name_len)?;
+            p += class_name_len;
+            let (body, np) = parse_object_body(data, p)?;
+            p = np;
+            AmfValue::TypedObject { class_name, body }
         }
         other => {
             return Err(Error::invalid(format!(
@@ -329,6 +403,87 @@ mod tests {
         let (v, p) = parse_amf0_value(&b, 0).unwrap();
         assert_eq!(v, AmfValue::String(s.into()));
         assert_eq!(p, b.len());
+    }
+
+    #[test]
+    fn unsupported_marker_stands_alone() {
+        // §2.15: marker 0x0D, no payload.
+        let bytes = [0x0D];
+        let (v, p) = parse_amf0_value(&bytes, 0).unwrap();
+        assert_eq!(v, AmfValue::Unsupported);
+        assert_eq!(p, 1);
+    }
+
+    #[test]
+    fn xml_document_round_trips_as_long_utf8() {
+        // §2.17: marker 0x0F + u32 BE length + UTF-8 bytes.
+        let xml = "<x>hi</x>";
+        let mut b = vec![0x0F];
+        b.extend_from_slice(&(xml.len() as u32).to_be_bytes());
+        b.extend_from_slice(xml.as_bytes());
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(v, AmfValue::Xml(xml.into()));
+        assert_eq!(p, b.len());
+    }
+
+    #[test]
+    fn typed_object_carries_class_name_and_body() {
+        // §2.18: marker 0x10 + UTF-8 class name + (UTF-8 key, value)*
+        // + terminator 0x00 0x00 0x09.
+        // Build: TypedObject("Foo", { "a": 1.0 })
+        let class = "Foo";
+        let mut b = vec![0x10];
+        b.extend_from_slice(&(class.len() as u16).to_be_bytes());
+        b.extend_from_slice(class.as_bytes());
+        // property "a" -> Number(1.0)
+        b.extend_from_slice(&[0x00, 0x01, b'a']);
+        b.push(0x00);
+        b.extend_from_slice(&1.0_f64.to_be_bytes());
+        // terminator
+        b.extend_from_slice(&[0x00, 0x00, 0x09]);
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(p, b.len());
+        match &v {
+            AmfValue::TypedObject { class_name, body } => {
+                assert_eq!(class_name, "Foo");
+                assert_eq!(body.len(), 1);
+                assert_eq!(body[0].0, "a");
+                assert_eq!(body[0].1, AmfValue::Number(1.0));
+            }
+            other => panic!("expected typed object, got {other:?}"),
+        }
+        // `get` looks into TypedObject bodies, and `class_name` exposes
+        // the alias — both are part of the lookup contract.
+        assert_eq!(v.get("a"), Some(&AmfValue::Number(1.0)));
+        assert_eq!(v.class_name(), Some("Foo"));
+    }
+
+    #[test]
+    fn typed_object_with_empty_class_name() {
+        // §2.18 allows a zero-length class name (anonymous typed
+        // object — degenerates to an object whose alias is "").
+        let mut b = vec![0x10, 0x00, 0x00];
+        b.extend_from_slice(&[0x00, 0x00, 0x09]);
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(p, b.len());
+        match v {
+            AmfValue::TypedObject { class_name, body } => {
+                assert_eq!(class_name, "");
+                assert!(body.is_empty());
+            }
+            other => panic!("expected typed object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn amf3_switch_marker_still_errors() {
+        // §3.1 AVM+ object marker 0x11 — no AMF3 decoder yet, so we
+        // reject it loudly rather than fall through silently.
+        let bytes = [0x11];
+        assert!(matches!(
+            parse_amf0_value(&bytes, 0),
+            Err(Error::InvalidData(_))
+        ));
     }
 
     #[test]

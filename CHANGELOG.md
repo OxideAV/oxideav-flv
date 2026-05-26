@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- AMF0 Typed Object (marker `0x10`, AMF0 spec §2.18), XML Document
+  (marker `0x0F`, §2.17), and Unsupported (marker `0x0D`, §2.15)
+  parsing. The three markers used to hard-error inside `parse_amf0_value`,
+  which would silently drop the entire `onMetaData` payload whenever a
+  producer chose any of them. `AmfValue` grows three variants:
+  `TypedObject { class_name, body }` carries both the registered class
+  alias and the same property body shape as anonymous `Object`;
+  `Xml(String)` preserves the raw XMLDocument bytes; `Unsupported`
+  records the spec sentinel for "I cannot serialise this value." The
+  `AmfValue::get` lookup now also looks into `TypedObject` bodies, and
+  the new `AmfValue::class_name` accessor exposes the alias when
+  present. `parse_on_metadata` and `xmp_liveXML` accept `TypedObject`
+  in the same role as `Object` / `EcmaArray`, so an FMS / Wowza relay
+  that wraps `onMetaData` in a class-aliased object no longer hides
+  `videodatarate` / `width` / `keyframes` from the demuxer; the alias
+  itself surfaces under `metadata["scriptdata.class"]`. `xmp_liveXML`
+  also accepts the `Xml` marker form of `liveXML`. The flatten path
+  used by `onCuePoint` / `colorInfo` learned to format all three new
+  variants (`unsupported`, the raw XML body, and a `.class` sentinel
+  followed by the typed body). AMF3 (marker `0x11`, §3.1) still
+  errors loudly — no AMF3 decoder yet, see followups.
 - `audiosamplesize` onMetaData field (Adobe FLV Spec v10.1, Annex E.5 —
   "Resolution of a single audio sample", in bits) lifts into
   `CodecParameters::sample_format`. A value of `8` maps to `U8`, `16`

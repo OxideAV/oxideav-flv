@@ -1192,8 +1192,19 @@ fn parse_on_metadata(
     // Walk top-level object/ecma-array keys and pull them into the
     // metadata bag. Numbers become their displayed form, strings pass
     // through, the `keyframes` object is harvested for the seek toc.
+    //
+    // TypedObject (AMF0 §2.18) is also accepted because some servers
+    // (FMS / Wowza relays) wrap the whole `onMetaData` payload in a
+    // class-aliased object before forwarding; the property body is the
+    // same as for an anonymous Object. The class alias itself is
+    // surfaced under `scriptdata.class` so callers can see which
+    // producer-registered type emitted the metadata.
     let entries = match value {
         AmfValue::Object(v) | AmfValue::EcmaArray(v) => v.as_slice(),
+        AmfValue::TypedObject { class_name, body } => {
+            metadata.push(("scriptdata.class".into(), class_name.clone()));
+            body.as_slice()
+        }
         _ => return,
     };
     for (k, v) in entries {
@@ -1212,7 +1223,7 @@ fn parse_on_metadata(
             }
             AmfValue::Boolean(b) => metadata.push((k.clone(), b.to_string())),
             AmfValue::String(s) => metadata.push((k.clone(), s.clone())),
-            AmfValue::Object(_) | AmfValue::EcmaArray(_)
+            AmfValue::Object(_) | AmfValue::EcmaArray(_) | AmfValue::TypedObject { .. }
                 if k == "keyframes" && keyframe_index.is_none() =>
             {
                 *keyframe_index = parse_keyframes_object(v);
@@ -1230,7 +1241,7 @@ fn parse_on_metadata(
             // per-track field set is producer-defined (delta-style or full),
             // so a structural flatten — rather than a fixed schema — is the
             // right model.
-            AmfValue::Object(_) | AmfValue::EcmaArray(_)
+            AmfValue::Object(_) | AmfValue::EcmaArray(_) | AmfValue::TypedObject { .. }
                 if k == "audioTrackIdInfoMap" || k == "videoTrackIdInfoMap" =>
             {
                 flatten_amf_value(v, &k.to_ascii_lowercase(), metadata);
@@ -1245,13 +1256,17 @@ fn xmp_liveXML(value: &AmfValue) -> Option<String> {
     // Per E.6 the XMP object has exactly one property: liveXML.
     let entries: &[(String, AmfValue)] = match value {
         AmfValue::Object(b) | AmfValue::EcmaArray(b) => b,
-        // Some producers nest the string directly.
-        AmfValue::String(s) => return Some(s.clone()),
+        AmfValue::TypedObject { body, .. } => body,
+        // Some producers nest the string directly (legitimate per E.6
+        // because `liveXML` is "an XML string"); an AMF0 `XMLDocument`
+        // marker (§2.17) is the same payload shape with a typed wire
+        // marker — accept both.
+        AmfValue::String(s) | AmfValue::Xml(s) => return Some(s.clone()),
         _ => return None,
     };
     for (k, v) in entries {
         if k == "liveXML" {
-            if let AmfValue::String(s) = v {
+            if let AmfValue::String(s) | AmfValue::Xml(s) = v {
                 return Some(s.clone());
             }
         }
@@ -1297,12 +1312,23 @@ fn flatten_amf_value(value: &AmfValue, prefix: &str, out: &mut Vec<(String, Stri
         AmfValue::String(s) => out.push((prefix.into(), s.clone())),
         AmfValue::Null => out.push((prefix.into(), "null".into())),
         AmfValue::Undefined => out.push((prefix.into(), "undefined".into())),
+        AmfValue::Unsupported => out.push((prefix.into(), "unsupported".into())),
         AmfValue::Reference(idx) => out.push((prefix.into(), format!("ref:{idx}"))),
+        AmfValue::Xml(s) => out.push((prefix.into(), s.clone())),
         AmfValue::Date { time_ms, tz } => {
             out.push((prefix.into(), format!("date:{time_ms}tz:{tz}")));
         }
         AmfValue::Object(b) | AmfValue::EcmaArray(b) => {
             for (k, v) in b {
+                flatten_amf_value(v, &format!("{prefix}.{k}"), out);
+            }
+        }
+        AmfValue::TypedObject { class_name, body } => {
+            // Surface the class alias under a `.class` sentinel so a
+            // caller can identify the producer-registered type, then
+            // flatten the property body like any other object.
+            out.push((format!("{prefix}.class"), class_name.clone()));
+            for (k, v) in body {
                 flatten_amf_value(v, &format!("{prefix}.{k}"), out);
             }
         }
@@ -1913,6 +1939,101 @@ mod tests {
             .metadata()
             .iter()
             .any(|(k, v)| k == "xmp" && v == live_xml));
+    }
+
+    #[test]
+    fn on_metadata_typed_object_wraps_payload_with_class_alias() {
+        // Some servers (FMS / Wowza relays) re-encode `onMetaData` as a
+        // TypedObject (AMF0 marker 0x10) carrying the producer's
+        // registered class alias. The property body shape is identical
+        // to an anonymous Object — the parser must look through the
+        // alias and still extract `videodatarate`, etc., AND surface
+        // the alias under `scriptdata.class` so callers can see it.
+        let class = "flex.messaging.io.ArrayCollection";
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&("onMetaData".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"onMetaData");
+        // TypedObject(class, { videodatarate: 768.0 })
+        body.push(0x10);
+        body.extend_from_slice(&(class.len() as u16).to_be_bytes());
+        body.extend_from_slice(class.as_bytes());
+        body.extend_from_slice(&("videodatarate".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"videodatarate");
+        body.push(0x00);
+        body.extend_from_slice(&768.0_f64.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        let script_tag = make_tag(0x12, 0, &body);
+        let vp6_body = vec![(1u8 << 4) | 4, 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        // bit_rate lifted out of the typed-object body.
+        assert_eq!(dmx.streams()[0].params.bit_rate, Some(768_000));
+        // Class alias surfaced for the caller.
+        assert!(dmx
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "scriptdata.class" && v == class));
+    }
+
+    #[test]
+    fn on_xmp_data_accepts_xmldocument_marker_payload() {
+        // §2.17: a producer is free to encode the `liveXML` value as an
+        // AMF0 XMLDocument (marker 0x0F + u32 length + UTF-8 bytes)
+        // instead of an ordinary String. We accept both.
+        let live_xml = "<x:xmpmeta>hello</x:xmpmeta>";
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&("onXMPData".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"onXMPData");
+        body.push(0x03); // Object
+        body.extend_from_slice(&("liveXML".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"liveXML");
+        body.push(0x0F); // XMLDocument
+        body.extend_from_slice(&(live_xml.len() as u32).to_be_bytes());
+        body.extend_from_slice(live_xml.as_bytes());
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        let script_tag = make_tag(0x12, 0, &body);
+        let vp6_body = vec![(1u8 << 4) | 4, 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        assert!(dmx
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "xmp" && v == live_xml));
+    }
+
+    #[test]
+    fn on_metadata_unsupported_value_does_not_drop_neighbouring_fields() {
+        // A property whose value the producer marked AMF0 Unsupported
+        // (marker 0x0D, §2.15) must not poison the rest of the
+        // metadata object. Build {a: <Unsupported>, videodatarate: 256.0}
+        // and confirm `videodatarate` still lifts into `bit_rate`.
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&("onMetaData".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"onMetaData");
+        body.push(0x08); // ECMA array
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&("a".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"a");
+        body.push(0x0D); // Unsupported
+        body.extend_from_slice(&("videodatarate".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"videodatarate");
+        body.push(0x00);
+        body.extend_from_slice(&256.0_f64.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        let script_tag = make_tag(0x12, 0, &body);
+        let vp6_body = vec![(1u8 << 4) | 4, 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        assert_eq!(dmx.streams()[0].params.bit_rate, Some(256_000));
     }
 
     #[test]

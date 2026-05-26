@@ -59,8 +59,15 @@ oxideav-flv = "0.0"
   otherwise scans tags forward to the first video keyframe (or audio
   packet, for audio-only files) at-or-after the requested pts.
 - AMF0 `Reference` (marker `0x07`, spec E.4.4.2 type 7) preserved as
-  `AmfValue::Reference(u16)`. `MovieClip` (reserved-not-supported) +
-  every unenumerated marker still error out so contamination is loud.
+  `AmfValue::Reference(u16)`. AMF0 `Unsupported` (`0x0D`, spec §2.15) /
+  `XMLDocument` (`0x0F`, §2.17) / `TypedObject` (`0x10`, §2.18) parse
+  into dedicated variants; an `onMetaData` payload wrapped in a typed
+  object (FMS / Wowza relays do this) walks through to the same
+  property extraction path, and the producer's class alias surfaces
+  under `metadata["scriptdata.class"]`. `liveXML` accepts both the
+  ordinary string and the `XMLDocument` marker. `MovieClip` /
+  `RecordSet` (reserved-not-supported) + the AMF3 switch marker
+  (`0x11`, no AMF3 decoder yet) still error so contamination is loud.
 - FrameType 5 "video info / command" tags (spec E.4.3.1) are surfaced
   as packets with `flags.header = true` + `flags.discard = true` and a
   1-byte body carrying the command (0 = start of client-side-seeking
