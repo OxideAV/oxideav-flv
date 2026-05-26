@@ -1535,7 +1535,36 @@ fn read_u32_be<R: Read + ?Sized>(r: &mut R) -> Result<u32> {
     Ok(u32::from_be_bytes(b))
 }
 
-fn read_body<R: Read + ?Sized>(r: &mut R, size: u32) -> Result<Vec<u8>> {
+/// Read a tag payload of `size` bytes, with a pre-allocation safety
+/// check against the remaining length of the underlying stream.
+///
+/// The FLV `DataSize` field is a UI24 (max 16 777 215). A forged tag
+/// header on a small file (e.g. `data_size = 0xFFFFFF` on a 30-byte
+/// input) would otherwise cause [`Vec::with_capacity`] to commit ~16 MB
+/// before [`Read::read_exact`] fails with `UnexpectedEof`. We probe the
+/// stream's total length once and reject any `data_size` that exceeds
+/// "bytes remaining from current position" — that turns the OOM vector
+/// into an [`Error::InvalidData`] **before** any allocation occurs.
+///
+/// The probe uses [`Seek::stream_position`] + [`Seek::seek(End)`] +
+/// `seek(Start)` rather than `Seek::stream_len` (still unstable). On
+/// streams that don't support seeking-to-end (none of our inputs in
+/// practice — every container demuxer takes `Box<dyn ReadSeek>`) the
+/// probe falls back to "trust the size and let `read_exact` error".
+fn read_body<R: Read + Seek + ?Sized>(r: &mut R, size: u32) -> Result<Vec<u8>> {
+    let needed = size as u64;
+    if let Ok(cur) = r.stream_position() {
+        if let Ok(end) = r.seek(SeekFrom::End(0)) {
+            // Restore the cursor before erroring or reading.
+            r.seek(SeekFrom::Start(cur))?;
+            let remaining = end.saturating_sub(cur);
+            if needed > remaining {
+                return Err(Error::invalid(format!(
+                    "FLV tag: DataSize {needed} exceeds remaining stream bytes {remaining}"
+                )));
+            }
+        }
+    }
     let mut out = vec![0u8; size as usize];
     r.read_exact(&mut out)?;
     Ok(out)

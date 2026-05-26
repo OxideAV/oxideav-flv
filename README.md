@@ -191,6 +191,22 @@ oxideav-flv = "0.0"
     `ManyTracksManyCodecs` (no shared FourCc) maps the stream to the
     `flv:exaudio:multicodec` / `flv:exvideo:multicodec` sentinel.
 
+### Robustness
+
+The demuxer is fuzz-shaped by a hand-crafted adversarial-input suite
+(`tests/injection_robustness.rs`, 18 blobs) that exercises every parser
+lever — empty / truncated header, forged oversize `DataSize` (the 16 MB
+OOM lever), missing `PreviousTagSize` trailer, unknown AMF0 markers,
+`LongString` with `u32::MAX` length, unterminated Object body,
+non-object `onMetaData`, unknown `TagType`, forged Filter-flag with
+truncated preamble, zero-length tags, and mid-stream truncation. The
+guarantee is "never panics, never allocates a gigabyte, never spins
+forever; either errors cleanly with `Error::InvalidData` / `Eof` / `Io`,
+or degrades to a stream that terminates on the first `next_packet()`."
+A pre-allocation guard in `read_body` rejects any tag whose `DataSize`
+exceeds the remaining bytes of the underlying `Read + Seek` stream
+*before* committing the `Vec`.
+
 ### Muxer
 
 Not implemented — out of scope for the initial import. FLV muxing is

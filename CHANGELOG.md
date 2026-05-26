@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Injection-robustness regression suite (`tests/injection_robustness.rs`,
+  18 hand-crafted adversarial blobs). Each input forges a different
+  parser lever — empty / truncated file header, bad signature, forged
+  oversize `DataSize` (the 16 MB OOM lever), off-by-one body truncation,
+  missing `PreviousTagSize` trailer, unknown AMF0 type markers, truncated
+  AMF0 strings, `LongString` claiming `u32::MAX` length, unterminated
+  Object body, non-object `onMetaData` value, unknown `TagType`, forged
+  Filter-flag with truncated preamble, zero-length audio tag, mid-stream
+  truncation after discovery, and a flood of zero-size tags — and asserts
+  the parser either errors cleanly with `Error::InvalidData` / `Error::Eof`
+  / `Error::Io`, or degrades to a stream that terminates on the first
+  `next_packet()`. No panics, no OOM, no infinite loops. Hermetic — no
+  on-disk fixtures.
 - AMF0 Typed Object (marker `0x10`, AMF0 spec §2.18), XML Document
   (marker `0x0F`, §2.17), and Unsupported (marker `0x0D`, §2.15)
   parsing. The three markers used to hard-error inside `parse_amf0_value`,
@@ -244,6 +257,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stereo` overrides its `SoundType` bit.
 - New public types: `EncryptedTagPreamble`, `FrameType`,
   `VideoInfoCommand`.
+
+### Fixed
+
+- Pre-allocation guard on `read_body` (the tag-payload reader). The FLV
+  `DataSize` field is a UI24 (max 16 777 215), and the old code blindly
+  committed `vec![0u8; size as usize]` before `read_exact` could surface
+  `UnexpectedEof`. A forged tag header on a 30-byte file would therefore
+  pre-allocate ~16 MB. The new path probes the underlying `Read + Seek`
+  stream's length once and rejects any `DataSize` that exceeds remaining
+  bytes with `Error::InvalidData("FLV tag: DataSize N exceeds remaining
+  stream bytes M")` — turning the OOM vector into a cheap structural
+  rejection before any allocation occurs. Falls back to "trust the size
+  and let `read_exact` error" on streams that don't support seeking-to-end
+  (none of our `Box<dyn ReadSeek>` inputs in practice).
 
 ### Added (previously)
 
