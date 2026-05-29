@@ -64,6 +64,17 @@ oxideav-flv = "0.0"
     `EncryptionHeader.Version`, `Method`, `EncryptionAlgorithm`,
     `KeyLength`, and `KeyInfo.SubType` surface as `encryption.*`
     metadata; `FlvDemuxer::is_encrypted()` returns `true`.
+  - **Any other script name** (Enhanced-RTMP-v2 §"Enhancing onMetaData"
+    treats SCRIPTDATA as a generic "method-name + argument" carrier so
+    producers may emit names beyond the four spec-defined ones —
+    live-caption tracks, producer telemetry, RTMP-relayed status
+    snapshots, etc.) lifts the method name under
+    `metadata["scriptdata.name"]` (legacy sentinel) AND flattens the
+    argument payload under `scriptdata.<name>.<...>` via the same
+    walker that handles `onCuePoint` payloads. Scalars land directly
+    under `scriptdata.<name>`, composite values fan out with
+    `.<subkey>` / `[i]` suffixes, so the producer's full argument
+    structure reaches callers instead of being silently dropped.
 - `Demuxer::seek_to` — bisects the `keyframes` toc when present,
   otherwise scans tags forward to the first video keyframe (or audio
   packet, for audio-only files) at-or-after the requested pts.

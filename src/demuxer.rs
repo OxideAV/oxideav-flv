@@ -1177,9 +1177,29 @@ fn parse_script_body(
             *encryption = parse_additional_header(&value);
         }
         _ => {
-            // Unknown name — preserve the name itself so callers can see
-            // the file had a non-spec data tag.
-            metadata.push(("scriptdata.name".into(), name_str));
+            // Unknown script-tag name — preserve both the name AND the
+            // value payload so callers see the full script body. FLV
+            // spec v10.1 enumerates only four spec-defined names
+            // (`onMetaData` E.5, `onXMPData` E.6, `onCuePoint` Annex A,
+            // `|AdditionalHeader` F.2.1). Enhanced-RTMP-v2's
+            // §"Enhancing onMetaData" describes the ScriptTagBody as
+            // *encapsulating method invocations* (method name + single
+            // argument), so producers in the wild legitimately emit
+            // additional method names (live-caption tracks, producer
+            // telemetry, RTMP-relayed status snapshots, …).
+            //
+            // The name is surfaced under the stable `scriptdata.name`
+            // sentinel (unchanged from before). The argument value is
+            // additionally lifted through `flatten_amf_value` under a
+            // `scriptdata.<name>.<...>` prefix so its full structure
+            // reaches the metadata bag — scalars land directly under
+            // `scriptdata.<name>`, composite values fan out with
+            // `.<subkey>` / `[i]` suffixes per the existing flatten
+            // schema. Previously the value was silently dropped, which
+            // was a data-loss bug for every producer-defined script tag
+            // a non-spec FLV reader might want to inspect.
+            metadata.push(("scriptdata.name".into(), name_str.clone()));
+            flatten_amf_value(&value, &format!("scriptdata.{name_str}"), metadata);
         }
     }
 }
@@ -3030,5 +3050,115 @@ mod tests {
         assert_eq!(apkt.stream_index, 0);
         // Default (trackId 0) Opus payload only.
         assert_eq!(apkt.data, vec![0x4F, 0x67]);
+    }
+
+    /// Build a SCRIPTDATA tag body whose method name is the given
+    /// (non-spec) string and whose argument is a String AMF0 value.
+    /// Used by the `unknown_script_*` tests below.
+    fn script_string_arg(name: &str, value: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        body.extend_from_slice(name.as_bytes());
+        body.push(0x02);
+        body.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        body.extend_from_slice(value.as_bytes());
+        body
+    }
+
+    #[test]
+    fn unknown_script_name_preserves_string_argument() {
+        // FLV spec v10.1 names only `onMetaData` (E.5), `onXMPData`
+        // (E.6), `onCuePoint` (Annex A), and `|AdditionalHeader`
+        // (F.2.1). Enhanced-RTMP-v2 §"Enhancing onMetaData" treats
+        // SCRIPTDATA as a generic "method-name + argument" carrier, so
+        // producers in the wild emit other names (live captions,
+        // telemetry, …). Previously the demuxer dropped the argument
+        // value and only recorded the name; now both surface.
+        let script_tag = make_tag(0x12, 0, &script_string_arg("onCaptionInfo", "hello"));
+        let vp6_body = vec![((1u8 << 4) | 4), 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        // The legacy `scriptdata.name` sentinel still records the name.
+        assert!(dmx
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "scriptdata.name" && v == "onCaptionInfo"));
+        // The argument value lands under the scoped prefix.
+        assert!(dmx
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "scriptdata.onCaptionInfo" && v == "hello"));
+    }
+
+    #[test]
+    fn unknown_script_name_flattens_object_argument() {
+        // Same coverage, with an Object argument exercising the
+        // composite-flatten path. Producer-defined keys fan out under
+        // the `scriptdata.<name>.<subkey>` prefix.
+        let mut arg = Vec::new();
+        arg.push(0x03); // Object
+        arg.extend_from_slice(&("track".len() as u16).to_be_bytes());
+        arg.extend_from_slice(b"track");
+        arg.push(0x00);
+        arg.extend_from_slice(&7.0_f64.to_be_bytes());
+        arg.extend_from_slice(&("language".len() as u16).to_be_bytes());
+        arg.extend_from_slice(b"language");
+        arg.push(0x02);
+        arg.extend_from_slice(&("eng".len() as u16).to_be_bytes());
+        arg.extend_from_slice(b"eng");
+        arg.extend_from_slice(&[0x00, 0x00, 0x09]);
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&("onTextData".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"onTextData");
+        body.extend_from_slice(&arg);
+        let script_tag = make_tag(0x12, 0, &body);
+        let vp6_body = vec![((1u8 << 4) | 4), 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        assert!(dmx
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "scriptdata.name" && v == "onTextData"));
+        assert!(dmx
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "scriptdata.onTextData.track" && v == "7"));
+        assert!(dmx
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "scriptdata.onTextData.language" && v == "eng"));
+    }
+
+    #[test]
+    fn unknown_script_name_preserves_null_argument() {
+        // A Null argument used to leave the metadata bag with only the
+        // name sentinel; the flatten walker now lifts it under the
+        // sentinel string `"null"` so the absence-of-value is itself
+        // visible to callers.
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&("onSomeEvent".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"onSomeEvent");
+        body.push(0x05); // Null
+        let script_tag = make_tag(0x12, 0, &body);
+        let vp6_body = vec![((1u8 << 4) | 4), 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        assert!(dmx
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "scriptdata.name" && v == "onSomeEvent"));
+        assert!(dmx
+            .metadata()
+            .iter()
+            .any(|(k, v)| k == "scriptdata.onSomeEvent" && v == "null"));
     }
 }

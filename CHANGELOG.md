@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Unknown-script-name argument preservation. The `dispatch_script_tag`
+  arm that catches non-spec script-tag names used to record only the
+  method name under `metadata["scriptdata.name"]` and silently drop the
+  AMF0 argument payload. FLV spec v10.1 enumerates only four
+  spec-defined names (`onMetaData` E.5, `onXMPData` E.6, `onCuePoint`
+  Annex A, `|AdditionalHeader` F.2.1), but Enhanced-RTMP-v2 §"Enhancing
+  onMetaData" describes the ScriptTagBody as encapsulating method
+  invocations (method name + single argument), so producers in the
+  wild legitimately emit additional method names (live-caption tracks,
+  producer telemetry, RTMP-relayed status snapshots, …). The argument
+  is now lifted through the existing `flatten_amf_value` walker under
+  a `scriptdata.<name>.<...>` prefix — scalars (Number / Boolean /
+  String / Null / Undefined / Unsupported / Reference / Xml / Date)
+  land directly under `scriptdata.<name>`, composite values
+  (Object / EcmaArray / TypedObject / StrictArray / AvmPlus) fan out
+  with `.<subkey>` / `[i]` suffixes per the existing flatten schema.
+  The legacy `metadata["scriptdata.name"] = <name>` sentinel is
+  preserved so existing callers that only checked the name see no
+  surface change. Three new unit tests cover the string-argument,
+  nested-object-argument, and Null-argument variants; previously
+  every non-spec script tag emitted exactly one metadata entry
+  regardless of how rich its payload was.
+
 - `parse_on_metadata` fall-through preservation. Previously, a top-level
   `onMetaData` property whose value didn't match Number / Boolean /
   String — or wasn't a recognised composite key (`keyframes`,
