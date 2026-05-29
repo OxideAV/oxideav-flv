@@ -13,6 +13,7 @@
 #![deny(missing_debug_implementations)]
 
 pub mod amf0;
+pub mod amf3;
 pub mod demuxer;
 pub mod ex_audio;
 pub mod ex_video;
@@ -24,6 +25,7 @@ pub mod tag;
 use oxideav_core::ContainerRegistry;
 
 pub use amf0::{parse_amf0_value, AmfValue};
+pub use amf3::{parse_amf3_value, Amf3Array, Amf3Object, Amf3Value};
 pub use demuxer::{open as open_demuxer, FlvDemuxer};
 pub use ex_audio::{
     fourcc_audio_codec_id_str, AudioPacketModExType, AvMultitrackType, ExAudioPacketType,

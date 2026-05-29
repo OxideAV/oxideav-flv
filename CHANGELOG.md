@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- AMF3 (Adobe AMF 3 Specification, December 2007) decoder. The AMF0
+  `0x11` AVM+ switch marker (AMF0 spec §3.1) used to hard-error inside
+  `parse_amf0_value`; it now decodes the following bytes through the
+  full AMF3 grammar and surfaces them as
+  `AmfValue::AvmPlus(Box<Amf3Value>)`. The new `src/amf3.rs` module
+  covers all 13 type markers (§3.1 table: undefined / null / false /
+  true / integer / double / string / xml-doc / date / array / object /
+  xml / byte-array) with the three implicit reference tables (strings,
+  complex-objects, traits) per §2.2 + §3.8 + §3.12. The U29 variable-
+  length unsigned 29-bit integer primitive (§1.3.1) decodes all four
+  byte-length forms and proves the `2^29 - 1` cap is exact (the
+  four-byte form's 7+7+7+8 = 29 bits cannot overflow by construction).
+  UTF-8-vr (§1.3.2) preserves the empty-string-never-sent-by-reference
+  rule. Trait blocks support inline (sealed_count + dynamic + class
+  name + sealed property names), traits-ref (back-reference to a prior
+  trait entry), and traits-ext (externalizable — the flag is set and
+  zero body bytes consumed since the spec gives no parser recipe;
+  callers that know the class's private grammar can decode the
+  trailing bytes themselves). Object back-references decode to an
+  alias of the prior instance; circular graphs are handled by
+  reserving the object-table slot before descending into Array /
+  Object children. The demuxer's `flatten_amf_value` walker lowers
+  through a symmetric `flatten_amf3_value` companion so an AVM+ value
+  reached via `onCuePoint` or `VideoPacketType.Metadata` surfaces
+  under the same `metadata["prefix.key"]` shape as its AMF0
+  counterpart (numbers/strings/booleans flatten verbatim; Date as
+  `date:<ms>`; ByteArray as `bytearray:<len>`; Object class alias
+  under `.class`; externalizable under `.externalizable=true`; Array
+  assoc keys under `.key` and dense slots under `[i]`). 26 new
+  unit tests cover U29 boundary round-trips, integer sign-extension
+  at 2^29-1 → -1, string literal/reference, empty-string-never-ref,
+  date literal, array with both assoc and dense portions, anonymous
+  dynamic object, typed sealed Point(x, y) object, traits-ref
+  second-instance reuse, object-ref aliasing, externalizable opaque
+  flag, both XML markers, byte-array literal/ref, and truncation-
+  rejection of every variable-length primitive.
 - Injection-robustness regression suite (`tests/injection_robustness.rs`,
   18 hand-crafted adversarial blobs). Each input forges a different
   parser lever — empty / truncated file header, bad signature, forged

@@ -66,8 +66,32 @@ oxideav-flv = "0.0"
   property extraction path, and the producer's class alias surfaces
   under `metadata["scriptdata.class"]`. `liveXML` accepts both the
   ordinary string and the `XMLDocument` marker. `MovieClip` /
-  `RecordSet` (reserved-not-supported) + the AMF3 switch marker
-  (`0x11`, no AMF3 decoder yet) still error so contamination is loud.
+  `RecordSet` (reserved-not-supported) still error so contamination is
+  loud.
+- AMF3 (Adobe AMF 3 Specification, Dec 2007) — the AMF0 `0x11` AVM+
+  switch marker (AMF0 §3.1) now lifts the byte stream into a full AMF3
+  decoder, surfaced as `AmfValue::AvmPlus(Box<Amf3Value>)`. The AMF3
+  module covers all 13 type markers (`undefined` / `null` / `false` /
+  `true` / `integer` / `double` / `string` / `xml-doc` / `date` /
+  `array` / `object` / `xml` / `byte-array`) with the three implicit
+  reference tables (strings, complex-objects, traits) per AMF 3
+  §2.2 + §3.8 + §3.12. The U29 variable-length unsigned 29-bit integer
+  primitive (§1.3.1) decodes the 1-byte through 4-byte forms (with
+  exact `2^29 - 1` cap proof in tests), and UTF-8-vr (§1.3.2)
+  preserves the empty-string-never-sent-by-reference rule. Trait
+  blocks support inline (sealed_count + dynamic + class name + sealed
+  property names), traits-ref (back-reference to a prior trait), and
+  traits-ext (externalizable — the flag is set and zero body bytes
+  consumed since the spec gives no parser recipe; callers that know
+  the class's private grammar can decode the trailing bytes
+  themselves). Object back-references decode to an alias of the
+  prior instance; circular graphs are handled by reserving the
+  object-table slot before descending into Array / Object children.
+  Top-level demuxer flattening: an `AvmPlus` value reached via
+  `onCuePoint` or `VideoPacketType.Metadata` lowers through a
+  symmetric `flatten_amf3_value` walker so callers see AVM+ payloads
+  under the same `metadata["prefix.key"]` shape as their AMF0
+  counterparts.
 - FrameType 5 "video info / command" tags (spec E.4.3.1) are surfaced
   as packets with `flags.header = true` + `flags.discard = true` and a
   1-byte body carrying the command (0 = start of client-side-seeking

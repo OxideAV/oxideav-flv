@@ -45,12 +45,14 @@
 //! spec mirrors the MovieClip status); it surfaces as
 //! [`Error::InvalidData`].
 //!
-//! The `0x11` AVM+ object marker (AMF3 switch, §3.1) is treated as an
-//! error because the FLV crate has no AMF3 decoder yet. A future round
-//! that adds AMF3 support can lift this into a structured variant
-//! without disturbing the AMF0-only callers.
+//! The `0x11` AVM+ object marker (AMF3 switch, AMF0 spec §3.1) lifts
+//! the decode into the AMF3 grammar; the following bytes are parsed
+//! through [`crate::amf3::parse_amf3_value`] and surfaced as
+//! [`AmfValue::AvmPlus`].
 
 use oxideav_core::{Error, Result};
+
+use crate::amf3::{parse_amf3_value, Amf3Value};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AmfValue {
@@ -88,6 +90,11 @@ pub enum AmfValue {
         class_name: String,
         body: Vec<(String, AmfValue)>,
     },
+    /// AMF0 AVM+ Object (marker `0x11`, AMF0 spec §3.1). The byte
+    /// stream switches to AMF3 (a.k.a. "ActionScript 3.0 serialisation
+    /// format") for exactly one value; the inner value is fully
+    /// decoded via the AMF3 grammar.
+    AvmPlus(Box<Amf3Value>),
 }
 
 impl AmfValue {
@@ -240,6 +247,13 @@ pub fn parse_amf0_value(data: &[u8], pos: usize) -> Result<(AmfValue, usize)> {
             let (body, np) = parse_object_body(data, p)?;
             p = np;
             AmfValue::TypedObject { class_name, body }
+        }
+        0x11 => {
+            // AVM+ switch marker (AMF0 spec §3.1) — the next value is
+            // encoded with the AMF3 grammar.
+            let (inner, np) = parse_amf3_value(data, p)?;
+            p = np;
+            AmfValue::AvmPlus(Box::new(inner))
         }
         other => {
             return Err(Error::invalid(format!(
@@ -476,9 +490,24 @@ mod tests {
     }
 
     #[test]
-    fn amf3_switch_marker_still_errors() {
-        // §3.1 AVM+ object marker 0x11 — no AMF3 decoder yet, so we
-        // reject it loudly rather than fall through silently.
+    fn amf3_switch_marker_decodes_inner_value() {
+        // §3.1 AVM+ object marker 0x11: the next byte is an AMF3
+        // marker. `0x03` = AMF3 true-marker, which carries no body.
+        let bytes = [0x11, 0x03];
+        let (v, p) = parse_amf0_value(&bytes, 0).unwrap();
+        assert_eq!(p, 2);
+        match v {
+            AmfValue::AvmPlus(inner) => {
+                assert_eq!(*inner, Amf3Value::Boolean(true));
+            }
+            other => panic!("expected AvmPlus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn amf3_switch_marker_with_truncated_inner_errors() {
+        // 0x11 by itself: the next byte should be an AMF3 marker but
+        // the input ends.
         let bytes = [0x11];
         assert!(matches!(
             parse_amf0_value(&bytes, 0),

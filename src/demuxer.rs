@@ -31,6 +31,7 @@ use oxideav_core::{
 use oxideav_core::{Demuxer, ReadSeek};
 
 use crate::amf0::{parse_amf0_value, AmfValue};
+use crate::amf3::{Amf3Array, Amf3Object, Amf3Value};
 use crate::ex_audio::{fourcc_audio_codec_id_str, ExAudioPacketType, ExAudioTagHeader};
 use crate::ex_video::{
     fourcc_codec_id_str, ExFrameType, ExPacketType, ExVideoTagHeader, FOURCC_AVC1, FOURCC_HVC1,
@@ -1335,6 +1336,57 @@ fn flatten_amf_value(value: &AmfValue, prefix: &str, out: &mut Vec<(String, Stri
         AmfValue::StrictArray(items) => {
             for (i, v) in items.iter().enumerate() {
                 flatten_amf_value(v, &format!("{prefix}[{i}]"), out);
+            }
+        }
+        AmfValue::AvmPlus(inner) => {
+            flatten_amf3_value(inner, prefix, out);
+        }
+    }
+}
+
+/// Flatten an AMF3 value into the same `(key, string)` shape as
+/// [`flatten_amf_value`] uses for AMF0 — so callers consuming the
+/// `metadata[...]` bag see AVM+ payloads under the same prefix scheme.
+fn flatten_amf3_value(value: &Amf3Value, prefix: &str, out: &mut Vec<(String, String)>) {
+    match value {
+        Amf3Value::Undefined => out.push((prefix.into(), "undefined".into())),
+        Amf3Value::Null => out.push((prefix.into(), "null".into())),
+        Amf3Value::Boolean(b) => out.push((prefix.into(), b.to_string())),
+        Amf3Value::Integer(i) => out.push((prefix.into(), i.to_string())),
+        Amf3Value::Double(d) => out.push((prefix.into(), format_number(*d))),
+        Amf3Value::String(s) => out.push((prefix.into(), s.clone())),
+        Amf3Value::Xml(s) | Amf3Value::XmlDocument(s) => out.push((prefix.into(), s.clone())),
+        Amf3Value::Date(ms) => out.push((prefix.into(), format!("date:{ms}"))),
+        Amf3Value::ByteArray(bytes) => {
+            out.push((prefix.into(), format!("bytearray:{}", bytes.len())));
+        }
+        Amf3Value::Array(Amf3Array { assoc, dense }) => {
+            for (k, v) in assoc {
+                flatten_amf3_value(v, &format!("{prefix}.{k}"), out);
+            }
+            for (i, v) in dense.iter().enumerate() {
+                flatten_amf3_value(v, &format!("{prefix}[{i}]"), out);
+            }
+        }
+        Amf3Value::Object(Amf3Object {
+            class_name,
+            externalizable,
+            sealed_names,
+            sealed_values,
+            dynamic_members,
+            ..
+        }) => {
+            if !class_name.is_empty() {
+                out.push((format!("{prefix}.class"), class_name.clone()));
+            }
+            if *externalizable {
+                out.push((format!("{prefix}.externalizable"), "true".into()));
+            }
+            for (name, val) in sealed_names.iter().zip(sealed_values.iter()) {
+                flatten_amf3_value(val, &format!("{prefix}.{name}"), out);
+            }
+            for (k, v) in dynamic_members {
+                flatten_amf3_value(v, &format!("{prefix}.{k}"), out);
             }
         }
     }
