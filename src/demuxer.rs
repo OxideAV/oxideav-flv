@@ -1247,7 +1247,28 @@ fn parse_on_metadata(
             {
                 flatten_amf_value(v, &k.to_ascii_lowercase(), metadata);
             }
-            _ => {}
+            // Any other top-level property (Date, Null, Undefined,
+            // Unsupported, Reference, Xml, StrictArray, AvmPlus, or a
+            // nested Object/EcmaArray/TypedObject whose key isn't one
+            // of the explicitly-handled ones above) used to be silently
+            // dropped. Adobe's *Flash Video File Format Specification*
+            // v10.1 Annex B "Stream Properties" enumerates a fixed
+            // schema (avclevel / avcprofile / moovposition / ...) but
+            // observed FLV producers in the wild also emit:
+            //   * `metadatacreator`, `encoder`, `creationdate` as
+            //     strings (handled) and as `Date` (was dropped);
+            //   * HDR / color-config sub-objects at top level (not
+            //     just under the E-FLV `colorInfo` envelope);
+            //   * `filepositions` / `times` arrays outside the
+            //     `keyframes` container (some Wowza variants);
+            //   * AMF3 sub-trees behind the `0x11` AVM+ marker for
+            //     producers that switch encodings mid-onMetaData.
+            // Flatten every other variant through `flatten_amf_value`
+            // under its original property name so callers reading the
+            // metadata bag see the producer's actual data instead of
+            // an empty key set. Scalars land directly under `k`;
+            // composite values gain `k.<subkey>` or `k[i]` suffixes.
+            _ => flatten_amf_value(v, k, metadata),
         }
     }
 }
@@ -2115,6 +2136,133 @@ mod tests {
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
         let dmx = open(input, &NullCodecResolver).unwrap();
         assert_eq!(dmx.streams()[0].params.bit_rate, Some(256_000));
+    }
+
+    #[test]
+    fn on_metadata_date_field_lands_in_metadata_bag() {
+        // Adobe FLV Annex E.5 lets producers stamp `creationdate` /
+        // `metadatacreationdate` as an AMF0 Date (marker 0x0B, §2.13:
+        // double millis since epoch + i16 UTC-offset). Producers in
+        // the wild (FMS, OBS post-2024) emit this. Prior versions of
+        // `parse_on_metadata` matched only Number/Boolean/String at
+        // top level and silently dropped Date, hiding the timestamp
+        // from `Demuxer::metadata`. The fallthrough flatten now
+        // surfaces it under the original property name.
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&("onMetaData".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"onMetaData");
+        body.push(0x08); // ECMA array
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&("creationdate".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"creationdate");
+        body.push(0x0B); // Date marker
+        body.extend_from_slice(&1_700_000_000_000.0_f64.to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes()); // UTC offset
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        let script_tag = make_tag(0x12, 0, &body);
+        let vp6_body = vec![(1u8 << 4) | 4, 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        // The Date string-form is `date:<millis>tz:<offset>` per
+        // `flatten_amf_value` — assert presence under the original key.
+        assert!(
+            dmx.metadata().iter().any(|(k, v)| k == "creationdate"
+                && v.starts_with("date:1700000000000")
+                && v.ends_with("tz:0")),
+            "creationdate not surfaced; metadata={:?}",
+            dmx.metadata()
+        );
+    }
+
+    #[test]
+    fn on_metadata_nested_object_outside_known_schema_is_flattened() {
+        // A producer-defined top-level sub-object (e.g. a colour-config
+        // pack at the FLV-scriptdata level rather than under the E-FLV
+        // `colorInfo` AMF envelope). It is neither `keyframes` nor an
+        // Enhanced-RTMP track-info map, so the prior code dropped it.
+        // The fallthrough flatten now lifts every leaf into the bag
+        // under `<key>.<subkey>` paths.
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&("onMetaData".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"onMetaData");
+        body.push(0x08); // outer ECMA array
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&("producerInfo".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"producerInfo");
+        body.push(0x03); // Object marker
+        body.extend_from_slice(&("name".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"name");
+        body.push(0x02);
+        body.extend_from_slice(&("obs-32.0".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"obs-32.0");
+        body.extend_from_slice(&("buildno".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"buildno");
+        body.push(0x00);
+        body.extend_from_slice(&42.0_f64.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x00, 0x09]); // close inner Object
+        body.extend_from_slice(&[0x00, 0x00, 0x09]); // close outer ECMA
+        let script_tag = make_tag(0x12, 0, &body);
+        let vp6_body = vec![(1u8 << 4) | 4, 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        let md = dmx.metadata();
+        assert!(
+            md.iter()
+                .any(|(k, v)| k == "producerInfo.name" && v == "obs-32.0"),
+            "producerInfo.name missing; metadata={:?}",
+            md
+        );
+        assert!(
+            md.iter()
+                .any(|(k, v)| k == "producerInfo.buildno" && v == "42"),
+            "producerInfo.buildno missing; metadata={:?}",
+            md
+        );
+    }
+
+    #[test]
+    fn on_metadata_null_and_undefined_sentinels_preserved() {
+        // AMF0 Null (0x05, §2.7) and Undefined (0x06, §2.8) at top
+        // level used to be silently dropped. Callers comparing two
+        // FLVs need to see that the producer explicitly emitted a
+        // null sentinel for a field rather than omitting it; surface
+        // both under string-form sentinels.
+        let mut body = Vec::new();
+        body.push(0x02);
+        body.extend_from_slice(&("onMetaData".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"onMetaData");
+        body.push(0x08); // ECMA array
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&("subtitle".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"subtitle");
+        body.push(0x05); // Null
+        body.extend_from_slice(&("rating".len() as u16).to_be_bytes());
+        body.extend_from_slice(b"rating");
+        body.push(0x06); // Undefined
+        body.extend_from_slice(&[0x00, 0x00, 0x09]);
+        let script_tag = make_tag(0x12, 0, &body);
+        let vp6_body = vec![(1u8 << 4) | 4, 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&script_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let dmx = open(input, &NullCodecResolver).unwrap();
+        let md = dmx.metadata();
+        assert!(
+            md.iter().any(|(k, v)| k == "subtitle" && v == "null"),
+            "subtitle=null missing; metadata={:?}",
+            md
+        );
+        assert!(
+            md.iter().any(|(k, v)| k == "rating" && v == "undefined"),
+            "rating=undefined missing; metadata={:?}",
+            md
+        );
     }
 
     #[test]

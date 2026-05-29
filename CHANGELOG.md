@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `parse_on_metadata` fall-through preservation. Previously, a top-level
+  `onMetaData` property whose value didn't match Number / Boolean /
+  String — or wasn't a recognised composite key (`keyframes`,
+  `audioTrackIdInfoMap`, `videoTrackIdInfoMap`) — was silently dropped
+  from `Demuxer::metadata`. AMF0 Null (§2.7), Undefined (§2.8), Date
+  (§2.13), Reference (§2.14), Unsupported (§2.15), XMLDocument (§2.17),
+  StrictArray (§2.12), the AVM+ AMF3 sub-tree (§3.1), and any
+  producer-defined nested Object/EcmaArray/TypedObject outside the
+  known schema went unrecorded. The fall-through arm now lifts every
+  unmatched variant through `flatten_amf_value` under its original
+  property name, so callers reading the metadata bag see the
+  producer's full top-level surface. Worked examples: an Annex E.5
+  `creationdate` Date lands as
+  `metadata["creationdate"] = "date:<millis>tz:<offset>"`; a producer
+  `producerInfo` sub-object lifts each leaf under
+  `metadata["producerInfo.name"]` / `metadata["producerInfo.buildno"]`
+  paths; explicit Null / Undefined sentinels surface as the strings
+  `"null"` / `"undefined"`. Three new unit tests cover the Date,
+  nested-object, and Null/Undefined variants. Existing
+  `on_metadata_unsupported_value_does_not_drop_neighbouring_fields`
+  test (the `0x0D` Unsupported case) still passes — the change is
+  strictly additive on top of every previously-recognised path.
+
 - AMF3 (Adobe AMF 3 Specification, December 2007) decoder. The AMF0
   `0x11` AVM+ switch marker (AMF0 spec §3.1) used to hard-error inside
   `parse_amf0_value`; it now decodes the following bytes through the

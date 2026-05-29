@@ -45,7 +45,16 @@ oxideav-flv = "0.0"
     top-level fields) flatten under
     `metadata["videotrackidinfomap.1.width"]`,
     `metadata["audiotrackidinfomap.2.samplerate"]`, … so callers read
-    per-track bitrate / resolution / codec without an AMF model.
+    per-track bitrate / resolution / codec without an AMF model. Any
+    top-level property whose value doesn't fit those buckets — Null,
+    Undefined, Date (e.g. `creationdate`), Reference, Unsupported,
+    XMLDocument, StrictArray, an `0x11` AVM+ AMF3 sub-tree, or a
+    producer-defined nested Object outside the known schema — is
+    lifted through the AMF flatten walker under its original property
+    name, so the metadata bag preserves the producer's full
+    `onMetaData` surface (Date → `"date:<millis>tz:<offset>"`,
+    nested objects → `<key>.<subkey>` paths, Null/Undefined → the
+    string sentinels `"null"` / `"undefined"`).
   - `onXMPData` (Annex E.6) — `liveXML` body surfaced via
     `metadata["xmp"]`.
   - `onCuePoint` (Annex A) — payload flattened into
