@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-flv/compare/v0.0.3...v0.0.4) - 2026-05-29
+
+### Other
+
+- preserve unknown script-tag argument payloads via flatten
+- preserve top-level onMetaData fields outside the known schema
+- full Adobe AMF 3 decoder + AMF0 0x11 AVM+ switch
+- injection-robustness suite + read_body pre-alloc guard
+- TypedObject / XMLDocument / Unsupported markers
+- lift onMetaData audiosamplesize into sample_format
+- parse onMetaData audioTrackIdInfoMap / videoTrackIdInfoMap
+- parse E-FLV VideoPacketType.Metadata HDR colorInfo into metadata bag
+- E-FLV multitrack body splitter + default-track routing
+- Enhanced-RTMP VideoCommand UI8 on the Ex video path
+- typed E-FLV ModEx walk (Enhanced RTMP v2 §ModEx)
+- Enhanced RTMP / E-FLV ExAudioTagHeader (Opus/FLAC/AC-3/E-AC-3/MP3/AAC FourCC)
+- Enhanced RTMP / E-FLV ExVideoTagHeader (AV1/VP9/HEVC/VVC/VP8 + AVC FourCC)
+- FLV encryption (Annex F) + FrameType=5 + AMF0 Reference + onMetaData enrichment
+- add Demuxer::seek_to with keyframes-toc + scan-forward paths
+
 ### Added
 
 - Unknown-script-name argument preservation. The `dispatch_script_tag`
