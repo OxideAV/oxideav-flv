@@ -253,8 +253,45 @@ exceeds the remaining bytes of the underlying `Read + Seek` stream
 
 ### Muxer
 
-Not implemented — out of scope for the initial import. FLV muxing is
-rare and easy to add later when a user actually needs it.
+A first muxer slice is implemented: enough to write a playable
+audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
+
+| Primitive | Function | Spec |
+| --- | --- | --- |
+| File header | `header::write(w, has_audio, has_video)` | §E.2 |
+| Leading `PreviousTagSize0` | `tag::write_first_previous_tag_size(w)` | §E.3 |
+| Generic tag | `tag::write_tag(w, type, ts_ms, stream_id, body)` | §E.4.1 |
+| MP3 audio tag | `tag::write_mp3_tag(w, ts_ms, rate_idx, is_16bit, is_stereo, frame)` | §E.4.2.1 |
+| Raw AAC audio tag | `tag::write_aac_raw_tag(w, ts_ms, raw_au)` | §E.4.2.1/2 |
+| AMF0 writers | `amf0::{write_number, write_boolean, write_string, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 |
+| `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |
+
+`write_tag` returns the total bytes written (`11 + body.len() + 4`) and
+emits the trailing `PreviousTagSize = 11 + DataSize` back-pointer.
+`MetadataBag` is an ordered bag of the three AMF0 scalar property types
+(Number / Boolean / String); insertion order is preserved on the wire so
+the output is deterministic.
+
+```rust
+use oxideav_flv::{header, script, script::MetadataBag, tag};
+
+# let mp3_frame: Vec<u8> = vec![];
+let mut flv = Vec::new();
+header::write(&mut flv, true, false)?; // audio-only
+tag::write_first_previous_tag_size(&mut flv)?;
+let meta = MetadataBag::new()
+    .number("duration", 2.0)
+    .number("audiosamplerate", 44_100.0)
+    .boolean("stereo", true)
+    .string("encoder", "oxideav-flv");
+script::write_on_metadata(&mut flv, &meta)?;
+tag::write_mp3_tag(&mut flv, 0, 3, true, true, &mp3_frame)?;
+# Ok::<(), oxideav_core::Error>(())
+```
+
+Still out of scope (followups): the `keyframes` seek-table writer, the
+H.263 / VP6 / AVC video tag writers (incl. `AVCDecoderConfigurationRecord`),
+and the Enhanced-RTMP `ExVideoTag` / `ExAudioTag` writers.
 
 ## Quick use
 

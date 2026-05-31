@@ -50,6 +50,8 @@
 //! through [`crate::amf3::parse_amf3_value`] and surfaced as
 //! [`AmfValue::AvmPlus`].
 
+use std::io::Write;
+
 use oxideav_core::{Error, Result};
 
 use crate::amf3::{parse_amf3_value, Amf3Value};
@@ -288,6 +290,89 @@ fn parse_object_body(data: &[u8], start: usize) -> Result<(Vec<(String, AmfValue
     }
 }
 
+// ---- AMF0 writers ----------------------------------------------------------
+//
+// The minimal serialiser surface needed to emit an FLV `onMetaData`
+// script tag (spec Annex E.4.4 / AMF0 §2). Each `write_*` for a typed
+// value emits the one-byte type marker followed by the payload, mirroring
+// the `parse_amf0_value` grammar above. Property *names* inside an object
+// or ECMA array are bare length-prefixed strings with **no** type marker
+// (spec SCRIPTDATASTRING, E.4.4.10) — [`write_property_name`] emits that
+// form, while [`write_string`] emits a full String *value* (marker
+// `0x02`).
+
+/// Write an AMF0 Number value (marker `0x00` + 8-byte BE IEEE-754
+/// double, §2.2).
+pub fn write_number<W: Write + ?Sized>(w: &mut W, n: f64) -> Result<()> {
+    w.write_all(&[0x00])?;
+    w.write_all(&n.to_be_bytes())?;
+    Ok(())
+}
+
+/// Write an AMF0 Boolean value (marker `0x01` + one byte `0`/`1`, §2.3).
+pub fn write_boolean<W: Write + ?Sized>(w: &mut W, b: bool) -> Result<()> {
+    w.write_all(&[0x01, u8::from(b)])?;
+    Ok(())
+}
+
+/// Write an AMF0 String value (marker `0x02` + UI16 BE length + UTF-8
+/// bytes, §2.4). Errors if `s` exceeds 65535 bytes — a longer payload
+/// requires the Long String type (`0x0C`), which `onMetaData` property
+/// values do not need.
+pub fn write_string<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
+    w.write_all(&[0x02])?;
+    write_utf8_u16(w, s)
+}
+
+/// Write a bare AMF0 property name — the UI16-length-prefixed UTF-8
+/// string that precedes each value inside an Object / ECMA array body
+/// (SCRIPTDATASTRING, spec E.4.4.10). No type marker.
+pub fn write_property_name<W: Write + ?Sized>(w: &mut W, name: &str) -> Result<()> {
+    write_utf8_u16(w, name)
+}
+
+/// Write the AMF0 anonymous-Object start marker (`0x03`, §2.5). Property
+/// pairs follow (each a [`write_property_name`] + a value), terminated by
+/// [`write_object_end`].
+pub fn write_object_start<W: Write + ?Sized>(w: &mut W) -> Result<()> {
+    w.write_all(&[0x03])?;
+    Ok(())
+}
+
+/// Write the AMF0 ECMA-array start marker and its `count` hint: marker
+/// `0x08` followed by the UI32 BE associative-count (§2.10). The body is
+/// the same `(name, value)*` sequence as an Object, terminated by
+/// [`write_object_end`]. `count` is an approximate-length hint; decoders
+/// (including this crate's) ignore the exact value, but emitting the
+/// true property count is the convention FLV producers follow.
+pub fn write_ecma_array_start<W: Write + ?Sized>(w: &mut W, count: u32) -> Result<()> {
+    w.write_all(&[0x08])?;
+    w.write_all(&count.to_be_bytes())?;
+    Ok(())
+}
+
+/// Write the AMF0 object-end terminator — an empty property name plus
+/// the object-end marker (`0x00 0x00 0x09`, SCRIPTDATAOBJECTEND, spec
+/// E.4.4.7). Closes both Object and ECMA-array bodies.
+pub fn write_object_end<W: Write + ?Sized>(w: &mut W) -> Result<()> {
+    w.write_all(&[0x00, 0x00, 0x09])?;
+    Ok(())
+}
+
+/// Shared helper: UI16 BE length + UTF-8 bytes.
+fn write_utf8_u16<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
+    let bytes = s.as_bytes();
+    if bytes.len() > u16::MAX as usize {
+        return Err(Error::invalid(format!(
+            "AMF0: string length {} exceeds UI16 max (use a long string)",
+            bytes.len()
+        )));
+    }
+    w.write_all(&(bytes.len() as u16).to_be_bytes())?;
+    w.write_all(bytes)?;
+    Ok(())
+}
+
 fn peek_byte(data: &[u8], pos: usize) -> Result<u8> {
     data.get(pos)
         .copied()
@@ -511,6 +596,84 @@ mod tests {
         let bytes = [0x11];
         assert!(matches!(
             parse_amf0_value(&bytes, 0),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn write_number_round_trips_through_parse() {
+        let mut b = Vec::new();
+        write_number(&mut b, 1234.5).unwrap();
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(v, AmfValue::Number(1234.5));
+        assert_eq!(p, b.len());
+    }
+
+    #[test]
+    fn write_boolean_round_trips() {
+        for tv in [true, false] {
+            let mut b = Vec::new();
+            write_boolean(&mut b, tv).unwrap();
+            let (v, _) = parse_amf0_value(&b, 0).unwrap();
+            assert_eq!(v, AmfValue::Boolean(tv));
+        }
+    }
+
+    #[test]
+    fn write_string_round_trips() {
+        let mut b = Vec::new();
+        write_string(&mut b, "onMetaData").unwrap();
+        // marker 0x02 + u16 len(10) + bytes.
+        assert_eq!(b[0], 0x02);
+        assert_eq!(u16::from_be_bytes([b[1], b[2]]), 10);
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(v, AmfValue::String("onMetaData".into()));
+        assert_eq!(p, b.len());
+    }
+
+    #[test]
+    fn write_ecma_array_round_trips_with_object_parser() {
+        // Emit {"a": 1.0, "ok": true, "s": "x"} as an ECMA array and
+        // parse it back via the value parser.
+        let mut b = Vec::new();
+        write_ecma_array_start(&mut b, 3).unwrap();
+        write_property_name(&mut b, "a").unwrap();
+        write_number(&mut b, 1.0).unwrap();
+        write_property_name(&mut b, "ok").unwrap();
+        write_boolean(&mut b, true).unwrap();
+        write_property_name(&mut b, "s").unwrap();
+        write_string(&mut b, "x").unwrap();
+        write_object_end(&mut b).unwrap();
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(p, b.len());
+        match v {
+            AmfValue::EcmaArray(body) => {
+                assert_eq!(body.len(), 3);
+                assert_eq!(body[0], ("a".into(), AmfValue::Number(1.0)));
+                assert_eq!(body[1], ("ok".into(), AmfValue::Boolean(true)));
+                assert_eq!(body[2], ("s".into(), AmfValue::String("x".into())));
+            }
+            other => panic!("expected ecma array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_object_round_trips_with_parser() {
+        let mut b = Vec::new();
+        write_object_start(&mut b).unwrap();
+        write_property_name(&mut b, "k").unwrap();
+        write_number(&mut b, 7.0).unwrap();
+        write_object_end(&mut b).unwrap();
+        let (v, _) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(v.get("k"), Some(&AmfValue::Number(7.0)));
+    }
+
+    #[test]
+    fn write_string_rejects_oversize() {
+        let big = "x".repeat(70_000);
+        let mut b = Vec::new();
+        assert!(matches!(
+            write_string(&mut b, &big),
             Err(Error::InvalidData(_))
         ));
     }

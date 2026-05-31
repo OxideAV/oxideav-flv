@@ -11,13 +11,17 @@
 //!  11   N    payload (DataSize bytes)
 //! ```
 
-use std::io::Read;
+use std::io::{Read, Write};
 
 use oxideav_core::{Error, Result};
 
 /// Tag header length in bytes (not including the payload or the
 /// 4-byte `PreviousTagSize` prefix).
 pub const TAG_HEADER_LEN: u32 = 11;
+
+/// Maximum value of a `UI24` field — the `DataSize`, `Timestamp` (low
+/// 24 bits), and `StreamID` fields are all 24-bit (spec §E.4.1).
+const UI24_MAX: u32 = 0x00FF_FFFF;
 
 /// Tag-type byte values defined by the FLV spec. Other values are
 /// reserved and the demuxer surfaces them as a decoder-free `Packet`
@@ -38,6 +42,150 @@ impl TagType {
             _ => None,
         }
     }
+
+    /// The `TagType` UB[5] wire value (spec §E.4.1): `8` audio, `9`
+    /// video, `18` script data. Inverse of [`TagType::from_u8`].
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Audio => 0x08,
+            Self::Video => 0x09,
+            Self::ScriptData => 0x12,
+        }
+    }
+}
+
+// ---- tag stream writers ----------------------------------------------------
+
+/// Write the leading `PreviousTagSize0` field that opens an FLV file
+/// body (spec §E.3 — "Always 0"). Call this once, immediately after the
+/// 9-byte file header and before the first tag.
+pub fn write_first_previous_tag_size<W: Write + ?Sized>(w: &mut W) -> Result<()> {
+    w.write_all(&0u32.to_be_bytes())?;
+    Ok(())
+}
+
+/// Write one complete FLV tag: the 11-byte tag header, the `body`
+/// payload, and the trailing 4-byte `PreviousTagSize` back-pointer
+/// (spec §E.3 / §E.4.1).
+///
+/// * `tag_type` — audio / video / script.
+/// * `timestamp_ms` — full 32-bit presentation time; the low 24 bits go
+///   in `Timestamp`, the top 8 in `TimestampExtended` (E.4.1).
+/// * `stream_id` — the `StreamID` UI24, always `0` per spec.
+/// * `body` — the tag payload (`DataSize` is its length).
+///
+/// The trailing `PreviousTagSize` is `11 + body.len()`, i.e. the size of
+/// this tag including its header, exactly as a demuxer's reverse walk
+/// expects.
+///
+/// Returns the total number of bytes written for this tag
+/// (`11 + body.len() + 4`) so a caller chaining tags can track the file
+/// offset. Errors with [`Error::InvalidData`] if `body` exceeds the
+/// `UI24` `DataSize` limit or `stream_id` exceeds `UI24`.
+pub fn write_tag<W: Write + ?Sized>(
+    w: &mut W,
+    tag_type: TagType,
+    timestamp_ms: u32,
+    stream_id: u32,
+    body: &[u8],
+) -> Result<u32> {
+    let data_size = body.len();
+    if data_size as u64 > UI24_MAX as u64 {
+        return Err(Error::invalid(format!(
+            "FLV tag: DataSize {data_size} exceeds UI24 max {UI24_MAX}"
+        )));
+    }
+    if stream_id > UI24_MAX {
+        return Err(Error::invalid(format!(
+            "FLV tag: StreamID {stream_id} exceeds UI24 max {UI24_MAX}"
+        )));
+    }
+    let data_size = data_size as u32;
+    let ts_low = timestamp_ms & UI24_MAX;
+    let ts_ext = (timestamp_ms >> 24) as u8;
+    let mut header = [0u8; TAG_HEADER_LEN as usize];
+    // Reserved UB[2]=0, Filter UB[1]=0, TagType UB[5] — we never emit
+    // filtered (encrypted) tags here, so the leading three bits are 0.
+    header[0] = tag_type.to_u8();
+    header[1..4].copy_from_slice(&u24_to_be(data_size));
+    header[4..7].copy_from_slice(&u24_to_be(ts_low));
+    header[7] = ts_ext;
+    header[8..11].copy_from_slice(&u24_to_be(stream_id));
+    w.write_all(&header)?;
+    w.write_all(body)?;
+    // PreviousTagSize = 11 + DataSize (E.3).
+    let prev_tag_size = TAG_HEADER_LEN + data_size;
+    w.write_all(&prev_tag_size.to_be_bytes())?;
+    Ok(TAG_HEADER_LEN + data_size + 4)
+}
+
+/// Write an audio tag: a one-byte [`AudioTagHeader`] followed by
+/// `payload`, wrapped in a full FLV tag via [`write_tag`].
+///
+/// For AAC (`codec_id` 10) the caller is responsible for prepending the
+/// `AACPacketType` byte to `payload` (or use [`write_aac_raw_tag`]).
+pub fn write_audio_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    header: AudioTagHeader,
+    payload: &[u8],
+) -> Result<u32> {
+    let mut body = Vec::with_capacity(1 + payload.len());
+    body.push(header.to_byte());
+    body.extend_from_slice(payload);
+    write_tag(w, TagType::Audio, timestamp_ms, 0, &body)
+}
+
+/// Write an MP3 audio tag (`SoundFormat = 2`, spec §E.4.2.1).
+///
+/// `mp3_frame` is one raw MPEG-1/2 Audio Layer III frame; it becomes the
+/// `SoundData` body verbatim. `sample_rate_idx` is the 2-bit `SoundRate`
+/// code (`0`=5.5k, `1`=11k, `2`=22k, `3`=44k), `is_16bit` the `SoundSize`
+/// bit, `is_stereo` the `SoundType` bit.
+pub fn write_mp3_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    sample_rate_idx: u8,
+    is_16bit: bool,
+    is_stereo: bool,
+    mp3_frame: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: AUDIO_CODEC_MP3,
+        sample_rate_idx: sample_rate_idx & 0x03,
+        is_16bit,
+        is_stereo,
+    };
+    write_audio_tag(w, timestamp_ms, header, mp3_frame)
+}
+
+/// Write a raw AAC audio tag (`SoundFormat = 10`, `AACPacketType = 1`,
+/// spec §E.4.2.1 / §E.4.2.2).
+///
+/// `raw_au` is one raw AAC access unit. Per spec the `SoundRate` /
+/// `SoundSize` / `SoundType` bits for AAC are fixed at `3` (44 kHz) /
+/// 16-bit / stereo and ignored by the player (the real parameters come
+/// from the `AudioSpecificConfig`), so the header byte is `0xAF`.
+pub fn write_aac_raw_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    raw_au: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: AUDIO_CODEC_AAC,
+        sample_rate_idx: 3,
+        is_16bit: true,
+        is_stereo: true,
+    };
+    // AACPacketType UI8 = 1 (raw) precedes the access unit (E.4.2.1).
+    let mut payload = Vec::with_capacity(1 + raw_au.len());
+    payload.push(0x01);
+    payload.extend_from_slice(raw_au);
+    write_audio_tag(w, timestamp_ms, header, &payload)
+}
+
+fn u24_to_be(v: u32) -> [u8; 3] {
+    [(v >> 16) as u8, (v >> 8) as u8, v as u8]
 }
 
 /// Parsed 11-byte tag header.
@@ -136,6 +284,16 @@ impl AudioTagHeader {
             is_16bit: (b & 0x02) != 0,
             is_stereo: (b & 0x01) != 0,
         }
+    }
+
+    /// Pack the header back into its wire byte (spec §E.4.2.1):
+    /// `SoundFormat UB[4] | SoundRate UB[2] | SoundSize UB[1] |
+    /// SoundType UB[1]`. Inverse of [`AudioTagHeader::parse`].
+    pub fn to_byte(self) -> u8 {
+        ((self.codec_id & 0x0F) << 4)
+            | ((self.sample_rate_idx & 0x03) << 2)
+            | (u8::from(self.is_16bit) << 1)
+            | u8::from(self.is_stereo)
     }
 
     pub fn sample_rate_hz(self) -> u32 {
@@ -542,6 +700,115 @@ mod tests {
         let body = b"\x01Encryption\0\x00";
         assert!(matches!(
             EncryptedTagPreamble::parse(body),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn audio_header_byte_round_trips() {
+        // Every legal 4-bit codec / 2-bit rate / size / type combination
+        // packs and unpacks losslessly.
+        for codec_id in 0u8..16 {
+            for rate in 0u8..4 {
+                for &is_16bit in &[false, true] {
+                    for &is_stereo in &[false, true] {
+                        let h = AudioTagHeader {
+                            codec_id,
+                            sample_rate_idx: rate,
+                            is_16bit,
+                            is_stereo,
+                        };
+                        let back = AudioTagHeader::parse(h.to_byte());
+                        assert_eq!(back.codec_id, codec_id);
+                        assert_eq!(back.sample_rate_idx, rate);
+                        assert_eq!(back.is_16bit, is_16bit);
+                        assert_eq!(back.is_stereo, is_stereo);
+                    }
+                }
+            }
+        }
+        // Worked example from `audio_header_decode`: AAC/44k/16-bit/stereo
+        // packs to 0xAF.
+        let h = AudioTagHeader {
+            codec_id: 10,
+            sample_rate_idx: 3,
+            is_16bit: true,
+            is_stereo: true,
+        };
+        assert_eq!(h.to_byte(), 0xAF);
+    }
+
+    #[test]
+    fn write_tag_emits_header_body_and_trailer() {
+        // audio tag, 3-byte body, ts 0x01020304 (exercises the extended
+        // timestamp byte), stream 0.
+        let mut out = Vec::new();
+        let body = [0xAA, 0xBB, 0xCC];
+        let total = write_tag(&mut out, TagType::Audio, 0x0102_0304, 0, &body).unwrap();
+        // 11 header + 3 body + 4 trailer = 18.
+        assert_eq!(total, 18);
+        assert_eq!(out.len(), 18);
+        // TagType byte.
+        assert_eq!(out[0], 0x08);
+        // DataSize UI24 = 3.
+        assert_eq!(&out[1..4], &[0x00, 0x00, 0x03]);
+        // Timestamp low 24 bits = 0x020304, extended = 0x01.
+        assert_eq!(&out[4..7], &[0x02, 0x03, 0x04]);
+        assert_eq!(out[7], 0x01);
+        // StreamID UI24 = 0.
+        assert_eq!(&out[8..11], &[0x00, 0x00, 0x00]);
+        // Body.
+        assert_eq!(&out[11..14], &body);
+        // PreviousTagSize = 11 + 3 = 14.
+        assert_eq!(&out[14..18], &14u32.to_be_bytes());
+        // The header we just wrote parses back identically.
+        let h = TagHeader::read(&mut Cursor::new(&out)).unwrap();
+        assert_eq!(h.kind, Some(TagType::Audio));
+        assert_eq!(h.data_size, 3);
+        assert_eq!(h.timestamp_ms, 0x0102_0304);
+        assert_eq!(h.stream_id, 0);
+    }
+
+    #[test]
+    fn write_first_previous_tag_size_is_four_zero_bytes() {
+        let mut out = Vec::new();
+        write_first_previous_tag_size(&mut out).unwrap();
+        assert_eq!(out, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn write_mp3_tag_body_layout() {
+        let mut out = Vec::new();
+        let frame = [0xFF, 0xFB, 0x90, 0x00]; // MPEG-1 L3 sync + bytes
+        write_mp3_tag(&mut out, 26, 3, true, true, &frame).unwrap();
+        // After the 11-byte tag header: AudioTagHeader byte then frame.
+        let ah = AudioTagHeader::parse(out[11]);
+        assert_eq!(ah.codec_id, AUDIO_CODEC_MP3);
+        assert_eq!(ah.sample_rate_idx, 3);
+        assert!(ah.is_16bit && ah.is_stereo);
+        assert_eq!(&out[12..16], &frame);
+    }
+
+    #[test]
+    fn write_aac_raw_tag_prefixes_packet_type() {
+        let mut out = Vec::new();
+        let au = [0x21, 0x00, 0x03];
+        write_aac_raw_tag(&mut out, 0, &au).unwrap();
+        // header byte 0xAF, AACPacketType 0x01, then the access unit.
+        assert_eq!(out[11], 0xAF);
+        assert_eq!(out[12], 0x01);
+        assert_eq!(&out[13..16], &au);
+    }
+
+    #[test]
+    fn write_tag_rejects_oversized_body() {
+        // A body claiming > UI24 bytes can't be expressed; the writer
+        // rejects it rather than truncating the DataSize field. Use a
+        // cheap zero-filled buffer one byte past the limit.
+        let big = vec![0u8; (UI24_MAX as usize) + 1];
+        let mut out = Vec::new();
+        assert!(matches!(
+            write_tag(&mut out, TagType::Audio, 0, 0, &big),
             Err(Error::InvalidData(_))
         ));
     }

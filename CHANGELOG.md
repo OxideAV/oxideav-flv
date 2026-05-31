@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- First muxer slice (spec Annex E, AMF0 §2). New write-side surface that
+  round-trips bit-exactly through `FlvDemuxer`:
+  - `header::write` — the 9-byte file header (signature / version /
+    TypeFlags / DataOffset, §E.2).
+  - `tag::write_first_previous_tag_size`, `tag::write_tag` — the leading
+    `PreviousTagSize0` and the 11-byte tag header + body + trailing
+    `PreviousTagSize` framing (§E.3 / §E.4.1). `write_tag` returns the
+    total tag size for offset bookkeeping.
+  - `tag::write_audio_tag` / `tag::write_mp3_tag` /
+    `tag::write_aac_raw_tag` and `AudioTagHeader::to_byte` — audio tag
+    emit for legacy MP3 (`SoundFormat 2`) and raw AAC
+    (`SoundFormat 10`, `AACPacketType 1`), §E.4.2.1 / §E.4.2.2.
+  - AMF0 writers (`amf0::write_number` / `write_boolean` /
+    `write_string` / `write_property_name` / `write_object_start` /
+    `write_ecma_array_start` / `write_object_end`).
+  - `script::MetadataBag` + `script::write_on_metadata` — an ordered
+    bag of Number / Boolean / String properties serialised as an
+    `onMetaData` script tag (TagType `0x12`, §E.4.4 / §E.5).
+  - `tests/roundtrip_muxer.rs` — writes header + `onMetaData` + N MP3
+    tags, demuxes the buffer, and asserts the header flags, metadata
+    keys, `duration_micros`, and every audio body survive byte-for-byte.
+
 ## [0.0.4](https://github.com/OxideAV/oxideav-flv/compare/v0.0.3...v0.0.4) - 2026-05-29
 
 ### Other

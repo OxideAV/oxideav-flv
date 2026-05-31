@@ -7,8 +7,12 @@
 //! metadata (duration, width, height, codec ids) and consumed
 //! internally.
 //!
-//! See the crate README for the supported codec map. Muxing is not
-//! implemented.
+//! See the crate README for the supported codec map. A first muxer
+//! slice is also provided: [`header::write`] emits the file header,
+//! [`tag::write_tag`] / [`tag::write_mp3_tag`] write the tag stream, and
+//! [`script::write_on_metadata`] serialises an `onMetaData` script tag
+//! from a [`script::MetadataBag`]. The output round-trips bit-exactly
+//! through [`FlvDemuxer`].
 
 #![deny(missing_debug_implementations)]
 
@@ -20,6 +24,7 @@ pub mod ex_video;
 pub mod header;
 pub mod mod_ex;
 pub mod multitrack;
+pub mod script;
 pub mod tag;
 
 use oxideav_core::ContainerRegistry;
@@ -40,10 +45,12 @@ pub use ex_video::{
 pub use header::{FlvHeader, FLV_SIGNATURE};
 pub use mod_ex::{ModExEntry, ModExPayload};
 pub use multitrack::{split_tracks, MultitrackTrack};
+pub use script::{write_on_metadata, write_on_metadata_body, MetaValue, MetadataBag};
 pub use tag::{
-    audio_codec_id_str, video_codec_id_str, AudioTagHeader, EncryptedTagPreamble, FrameType,
-    TagHeader, TagType, VideoInfoCommand, VideoTagHeader, AUDIO_CODEC_AAC, AUDIO_CODEC_MP3,
-    AUDIO_CODEC_MP3_8K, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A, VIDEO_CODEC_VP6F,
+    audio_codec_id_str, video_codec_id_str, write_aac_raw_tag, write_audio_tag,
+    write_first_previous_tag_size, write_mp3_tag, write_tag, AudioTagHeader, EncryptedTagPreamble,
+    FrameType, TagHeader, TagType, VideoInfoCommand, VideoTagHeader, AUDIO_CODEC_AAC,
+    AUDIO_CODEC_MP3, AUDIO_CODEC_MP3_8K, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A, VIDEO_CODEC_VP6F,
 };
 
 /// Register the demuxer, its probe, and the `.flv` extension with a

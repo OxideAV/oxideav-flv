@@ -10,12 +10,31 @@
 //!       5     4  DataOffset (u32 big-endian — total header size, = 9)
 //! ```
 
-use std::io::Read;
+use std::io::{Read, Write};
 
 use oxideav_core::{Error, Result};
 
 /// Three-byte FLV file magic (`FLV`).
 pub const FLV_SIGNATURE: &[u8; 3] = b"FLV";
+
+/// Write a 9-byte FLV file header (spec §E.2).
+///
+/// Emits the signature `FLV`, version byte `1`, the `TypeFlags` byte
+/// (bit `0x04` = audio present, bit `0x01` = video present, all other
+/// bits reserved-zero per E.2), and the 4-byte big-endian `DataOffset`
+/// fixed at `9` — the header length for FLV version 1.
+///
+/// The inverse of [`FlvHeader::read`]: a header round-trips through
+/// `write` → `read` preserving `has_audio` / `has_video`.
+pub fn write<W: Write + ?Sized>(w: &mut W, has_audio: bool, has_video: bool) -> Result<()> {
+    // TypeFlagsReserved UB[5] = 0, TypeFlagsAudio UB[1], TypeFlagsReserved
+    // UB[1] = 0, TypeFlagsVideo UB[1]. Audio lands on bit 0x04, video on
+    // bit 0x01 (E.2).
+    let flags = (u8::from(has_audio) << 2) | u8::from(has_video);
+    let buf = [b'F', b'L', b'V', 0x01, flags, 0, 0, 0, 9];
+    w.write_all(&buf)?;
+    Ok(())
+}
 
 /// Decoded FLV file header.
 #[derive(Clone, Copy, Debug)]
@@ -101,5 +120,36 @@ mod tests {
         let h = FlvHeader::read(&mut Cursor::new(bytes)).unwrap();
         assert!(h.has_audio);
         assert!(!h.has_video);
+    }
+
+    #[test]
+    fn write_emits_exact_bytes() {
+        // audio + video: flags 0x05, DataOffset 9 (E.2).
+        let mut out = Vec::new();
+        write(&mut out, true, true).unwrap();
+        assert_eq!(out, [b'F', b'L', b'V', 0x01, 0x05, 0x00, 0x00, 0x00, 0x09]);
+
+        // audio-only: flags 0x04.
+        let mut out = Vec::new();
+        write(&mut out, true, false).unwrap();
+        assert_eq!(out[4], 0x04);
+
+        // video-only: flags 0x01.
+        let mut out = Vec::new();
+        write(&mut out, false, true).unwrap();
+        assert_eq!(out[4], 0x01);
+    }
+
+    #[test]
+    fn write_then_read_round_trips() {
+        for (a, v) in [(true, true), (true, false), (false, true), (false, false)] {
+            let mut out = Vec::new();
+            write(&mut out, a, v).unwrap();
+            let h = FlvHeader::read(&mut Cursor::new(out)).unwrap();
+            assert_eq!(h.version, 1);
+            assert_eq!(h.has_audio, a);
+            assert_eq!(h.has_video, v);
+            assert_eq!(h.data_offset, 9);
+        }
     }
 }
