@@ -9,6 +9,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Legacy video tag muxer slice (spec §E.4.3 / §E.4.3.1). The audio-only
+  first muxer slice now extends to H.263 / VP6 / VP6A / AVC video, so a
+  full audio+video FLV writes through the same writer family and the
+  demuxer recovers it bit-exactly:
+  - `tag::write_video_tag(w, ts_ms, VideoTagHeader, payload)` — generic
+    one-byte `FrameType | CodecID` header followed by `VIDEODATA`,
+    wrapped in a complete FLV tag.
+  - `tag::write_h263_tag(w, ts_ms, is_keyframe, frame)` — Sorenson H.263
+    (`flv1`, CodecID 2) writer; passes the bitstream frame verbatim as
+    `VIDEODATA`.
+  - `tag::write_vp6_tag(w, ts_ms, is_keyframe, frame)` — VP6 (`vp6f`,
+    CodecID 4) writer.
+  - `tag::write_vp6a_tag(w, ts_ms, is_keyframe, alpha_offset, frame)` —
+    VP6-with-alpha (`vp6a`, CodecID 5) writer, prefixing the spec
+    `AlphaOffset` UI8 to the BGR+alpha sub-stream. The demuxer route
+    that lifts the alpha-offset byte into `params.extradata` round-trips
+    through this writer.
+  - `tag::write_avc_sequence_header(w, ts_ms, config_record)` — AVC
+    (`h264`, CodecID 7) `AVCPacketType = 0` writer; the
+    `AVCDecoderConfigurationRecord` (ISO/IEC 14496-15) reaches
+    `params.extradata` verbatim after the round-trip.
+  - `tag::write_avc_nalu_tag(w, ts_ms, is_keyframe, composition_time_ms,
+    access_unit)` — AVC `AVCPacketType = 1` writer; packs the signed
+    24-bit `CompositionTime` (`pts - dts`, in milliseconds) and rejects
+    deltas outside `-2^23..=2^23 - 1` with `Error::InvalidData` rather
+    than truncating.
+  - `tag::write_avc_end_of_sequence(w, ts_ms)` — AVC `AVCPacketType = 2`
+    end-of-sequence sentinel; one-byte body, `CompositionTime = 0`.
+  - `tag::write_video_info_command_tag(w, ts_ms, VideoInfoCommand)` —
+    FrameType=5 video-info / command tag (spec E.4.3.1, IF
+    FrameType==5); emits the UI8 command byte (StartClientSeek /
+    EndClientSeek / `Unknown(u8)` passthrough).
+  - `VideoTagHeader::to_byte` / `FrameType::to_u8` /
+    `VideoInfoCommand::to_u8` — wire-byte inverses of the existing
+    `parse` / `from_u8` constructors so the new writers share one
+    encoding source-of-truth with the demuxer.
+  - `tests/roundtrip_muxer.rs` — four new video tests write a
+    video-only FLV with each codec and assert
+    `streams[0].params.codec_id` (`flv1` / `vp6f` / `vp6a` / `h264`),
+    keyframe flags, `extradata` (VP6A alpha offset, AVC config record),
+    and per-packet pts/dts including the B-frame reorder case
+    (positive + negative SI24 CTS).
+
 - First muxer slice (spec Annex E, AMF0 §2). New write-side surface that
   round-trips bit-exactly through `FlvDemuxer`:
   - `header::write` — the 9-byte file header (signature / version /

@@ -7,9 +7,12 @@
 //! metadata (duration, width, height, codec ids) and consumed
 //! internally.
 //!
-//! See the crate README for the supported codec map. A first muxer
-//! slice is also provided: [`header::write`] emits the file header,
-//! [`tag::write_tag`] / [`tag::write_mp3_tag`] write the tag stream, and
+//! See the crate README for the supported codec map. A muxer slice
+//! is also provided: [`header::write`] emits the file header,
+//! [`tag::write_tag`] / [`tag::write_mp3_tag`] / [`tag::write_aac_raw_tag`]
+//! write audio tags, [`tag::write_h263_tag`] / [`tag::write_vp6_tag`] /
+//! [`tag::write_vp6a_tag`] / [`tag::write_avc_sequence_header`] /
+//! [`tag::write_avc_nalu_tag`] write the legacy video tags, and
 //! [`script::write_on_metadata`] serialises an `onMetaData` script tag
 //! from a [`script::MetadataBag`]. The output round-trips bit-exactly
 //! through [`FlvDemuxer`].
@@ -48,9 +51,12 @@ pub use multitrack::{split_tracks, MultitrackTrack};
 pub use script::{write_on_metadata, write_on_metadata_body, MetaValue, MetadataBag};
 pub use tag::{
     audio_codec_id_str, video_codec_id_str, write_aac_raw_tag, write_audio_tag,
-    write_first_previous_tag_size, write_mp3_tag, write_tag, AudioTagHeader, EncryptedTagPreamble,
-    FrameType, TagHeader, TagType, VideoInfoCommand, VideoTagHeader, AUDIO_CODEC_AAC,
-    AUDIO_CODEC_MP3, AUDIO_CODEC_MP3_8K, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A, VIDEO_CODEC_VP6F,
+    write_avc_end_of_sequence, write_avc_nalu_tag, write_avc_sequence_header,
+    write_first_previous_tag_size, write_h263_tag, write_mp3_tag, write_tag,
+    write_video_info_command_tag, write_video_tag, write_vp6_tag, write_vp6a_tag, AudioTagHeader,
+    EncryptedTagPreamble, FrameType, TagHeader, TagType, VideoInfoCommand, VideoTagHeader,
+    AUDIO_CODEC_AAC, AUDIO_CODEC_MP3, AUDIO_CODEC_MP3_8K, VIDEO_CODEC_FLV1, VIDEO_CODEC_H264,
+    VIDEO_CODEC_VP6A, VIDEO_CODEC_VP6F,
 };
 
 /// Register the demuxer, its probe, and the `.flv` extension with a

@@ -184,6 +184,230 @@ pub fn write_aac_raw_tag<W: Write + ?Sized>(
     write_audio_tag(w, timestamp_ms, header, &payload)
 }
 
+/// Write a video tag: a one-byte [`VideoTagHeader`] followed by
+/// `payload`, wrapped in a full FLV tag via [`write_tag`] (spec
+/// §E.4.3 / §E.4.3.1).
+///
+/// `payload` is the codec-specific `VIDEODATA` body that follows the
+/// `FrameType | CodecID` byte. For AVC the caller is responsible for
+/// prepending the `AVCPacketType` + `CompositionTime` bytes (or use the
+/// dedicated [`write_avc_sequence_header`] / [`write_avc_nalu_tag`]
+/// helpers). For VP6 with alpha (codec_id 5) the first payload byte is
+/// the spec-defined alpha-data offset — see [`write_vp6a_tag`] for the
+/// canonical builder.
+pub fn write_video_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    header: VideoTagHeader,
+    payload: &[u8],
+) -> Result<u32> {
+    let mut body = Vec::with_capacity(1 + payload.len());
+    body.push(header.to_byte());
+    body.extend_from_slice(payload);
+    write_tag(w, TagType::Video, timestamp_ms, 0, &body)
+}
+
+/// Write a Sorenson H.263 (`flv1`, codec_id 2) video tag, spec §E.4.3.1.
+///
+/// `is_keyframe` picks [`FrameType::Key`] vs [`FrameType::Inter`];
+/// `frame` is one raw H.263 bitstream frame, written verbatim as
+/// `VIDEODATA`.
+pub fn write_h263_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_keyframe: bool,
+    frame: &[u8],
+) -> Result<u32> {
+    let header = VideoTagHeader {
+        frame_type: if is_keyframe {
+            FrameType::Key
+        } else {
+            FrameType::Inter
+        },
+        codec_id: VIDEO_CODEC_FLV1,
+    };
+    write_video_tag(w, timestamp_ms, header, frame)
+}
+
+/// Write a VP6 (`vp6f`, codec_id 4) video tag, spec §E.4.3.1.
+///
+/// `frame` is one raw VP6 bitstream frame, written verbatim as
+/// `VIDEODATA`. VP6 does not have the alpha-offset byte the VP6A
+/// variant carries.
+pub fn write_vp6_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_keyframe: bool,
+    frame: &[u8],
+) -> Result<u32> {
+    let header = VideoTagHeader {
+        frame_type: if is_keyframe {
+            FrameType::Key
+        } else {
+            FrameType::Inter
+        },
+        codec_id: VIDEO_CODEC_VP6F,
+    };
+    write_video_tag(w, timestamp_ms, header, frame)
+}
+
+/// Write a VP6-with-alpha (`vp6a`, codec_id 5) video tag, spec §E.4.3.1.
+///
+/// The VIDEODATA body for VP6A is:
+///
+/// ```text
+///   1   AlphaOffset (UI8 — byte offset to the alpha-channel sub-stream)
+///   N   VP6 video data (the BGR sub-stream)
+///   M   VP6 alpha data
+/// ```
+///
+/// `alpha_offset` is the UI8 byte offset from the *start of the
+/// VP6-video sub-stream* to the start of the alpha sub-stream (spec
+/// E.4.3.1 IF CodecID == 5). `frame` is the concatenated
+/// `vp6_video | vp6_alpha` payload. The demuxer surfaces the alpha
+/// offset through extradata; this writer preserves the spec layout
+/// byte-exactly.
+pub fn write_vp6a_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_keyframe: bool,
+    alpha_offset: u8,
+    frame: &[u8],
+) -> Result<u32> {
+    let header = VideoTagHeader {
+        frame_type: if is_keyframe {
+            FrameType::Key
+        } else {
+            FrameType::Inter
+        },
+        codec_id: VIDEO_CODEC_VP6A,
+    };
+    let mut payload = Vec::with_capacity(1 + frame.len());
+    payload.push(alpha_offset);
+    payload.extend_from_slice(frame);
+    write_video_tag(w, timestamp_ms, header, &payload)
+}
+
+/// Write an AVC sequence-header video tag (`AVCPacketType = 0`, spec
+/// §E.4.3.1 IF CodecID == 7). The body layout is:
+///
+/// ```text
+///   0   VideoTagHeader byte  (FrameType=Key | CodecID=7 = 0x17)
+///   1   AVCPacketType UI8    (0 — AVCDecoderConfigurationRecord)
+///   2   CompositionTime SI24 (0 for the sequence header per spec)
+///   5   AVCDecoderConfigurationRecord (the `extradata` blob)
+/// ```
+///
+/// `config_record` is the
+/// `AVCDecoderConfigurationRecord` (ISO/IEC 14496-15) verbatim — the
+/// same byte sequence the demuxer surfaces to `params.extradata`.
+/// The frame type is forced to [`FrameType::Key`] per spec convention
+/// (a sequence header opens a configuration window and is always
+/// emitted on a key frame).
+pub fn write_avc_sequence_header<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    config_record: &[u8],
+) -> Result<u32> {
+    let header = VideoTagHeader {
+        frame_type: FrameType::Key,
+        codec_id: VIDEO_CODEC_H264,
+    };
+    let mut payload = Vec::with_capacity(4 + config_record.len());
+    payload.push(0x00); // AVCPacketType = 0 (sequence header)
+    payload.extend_from_slice(&u24_to_be(0)); // CompositionTime = 0
+    payload.extend_from_slice(config_record);
+    write_video_tag(w, timestamp_ms, header, &payload)
+}
+
+/// Write an AVC NALU access-unit video tag (`AVCPacketType = 1`, spec
+/// §E.4.3.1 IF CodecID == 7). The body layout is:
+///
+/// ```text
+///   0   VideoTagHeader byte
+///   1   AVCPacketType UI8    (1 — one or more length-prefixed NALUs)
+///   2   CompositionTime SI24 (pts - dts, in milliseconds, signed 24-bit)
+///   5   NALU access unit     (length-prefixed per the sequence header's
+///                             lengthSizeMinusOne, conventionally 4-byte BE)
+/// ```
+///
+/// `composition_time_ms` is the signed 24-bit composition-time offset
+/// (`pts - dts`) expressed in milliseconds; it ranges
+/// `-8_388_608..=8_388_607` and is sign-truncated into the wire SI24 on
+/// overflow with [`Error::InvalidData`]. `access_unit` is one or more
+/// length-prefixed NALUs concatenated, exactly as the spec's
+/// "NALU access unit" requires.
+pub fn write_avc_nalu_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_keyframe: bool,
+    composition_time_ms: i32,
+    access_unit: &[u8],
+) -> Result<u32> {
+    // Reject out-of-SI24 composition times rather than silently truncating;
+    // signed 24-bit range is [-2^23, 2^23 - 1].
+    if !(-(1 << 23)..(1 << 23)).contains(&composition_time_ms) {
+        return Err(Error::invalid(format!(
+            "AVC tag: CompositionTime {composition_time_ms} ms outside SI24 range"
+        )));
+    }
+    let header = VideoTagHeader {
+        frame_type: if is_keyframe {
+            FrameType::Key
+        } else {
+            FrameType::Inter
+        },
+        codec_id: VIDEO_CODEC_H264,
+    };
+    // SI24 BE — preserve the low 24 bits of the two's-complement encoding.
+    let cts_bits = composition_time_ms as u32 & 0x00FF_FFFF;
+    let mut payload = Vec::with_capacity(4 + access_unit.len());
+    payload.push(0x01); // AVCPacketType = 1 (NALU)
+    payload.extend_from_slice(&u24_to_be(cts_bits));
+    payload.extend_from_slice(access_unit);
+    write_video_tag(w, timestamp_ms, header, &payload)
+}
+
+/// Write an AVC end-of-sequence video tag (`AVCPacketType = 2`, spec
+/// §E.4.3.1 IF CodecID == 7) — a one-byte body terminating the AVC
+/// sub-stream. `CompositionTime` is `0` and the body has no NALU data.
+pub fn write_avc_end_of_sequence<W: Write + ?Sized>(w: &mut W, timestamp_ms: u32) -> Result<u32> {
+    let header = VideoTagHeader {
+        // End-of-sequence is conventionally emitted on a non-keyframe slot;
+        // spec doesn't constrain the FrameType bits but DisposableInter
+        // is the closest "this is not codec data" marker available in the
+        // legacy field. Decoders won't try to decode it (AVCPacketType=2
+        // is the signal).
+        frame_type: FrameType::DisposableInter,
+        codec_id: VIDEO_CODEC_H264,
+    };
+    let mut payload = Vec::with_capacity(4);
+    payload.push(0x02); // AVCPacketType = 2 (end of sequence)
+    payload.extend_from_slice(&u24_to_be(0));
+    write_video_tag(w, timestamp_ms, header, &payload)
+}
+
+/// Write a FrameType=5 "video info / command" tag (spec §E.4.3.1 IF
+/// FrameType == 5). The body is a one-byte UI8 command (`0` =
+/// StartClientSeek, `1` = EndClientSeek; other codes are reserved but
+/// passed through verbatim via [`VideoInfoCommand::Unknown`]).
+///
+/// CodecID in the wire byte is set to `0` — the spec gives no
+/// codec-id meaning for FrameType=5, and a real-world parser ignores
+/// the low nibble entirely. The demuxer surfaces such tags with
+/// `flags.header = true` + `flags.discard = true`.
+pub fn write_video_info_command_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    command: VideoInfoCommand,
+) -> Result<u32> {
+    let header = VideoTagHeader {
+        frame_type: FrameType::VideoInfo,
+        codec_id: 0,
+    };
+    write_video_tag(w, timestamp_ms, header, &[command.to_u8()])
+}
+
 fn u24_to_be(v: u32) -> [u8; 3] {
     [(v >> 16) as u8, (v >> 8) as u8, v as u8]
 }
@@ -378,6 +602,24 @@ impl FrameType {
             other => Self::Unknown(other),
         }
     }
+
+    /// The 4-bit FrameType nibble that goes in the high bits of the
+    /// video tag's first byte (spec §E.4.3.1). Inverse of
+    /// [`FrameType::from_u8`].
+    ///
+    /// `Unknown(n)` is masked to 4 bits — values outside `0..=15` are
+    /// not representable in the wire field and the caller's choice to
+    /// build them is preserved modulo 16.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Key => 1,
+            Self::Inter => 2,
+            Self::DisposableInter => 3,
+            Self::GeneratedKey => 4,
+            Self::VideoInfo => 5,
+            Self::Unknown(n) => n & 0x0F,
+        }
+    }
 }
 
 /// Body-byte command values for [`FrameType::VideoInfo`] tags
@@ -400,6 +642,16 @@ impl VideoInfoCommand {
             other => Self::Unknown(other),
         }
     }
+
+    /// Wire UI8 value for this command (spec §E.4.3.1 IF FrameType==5).
+    /// Inverse of [`VideoInfoCommand::from_u8`].
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::StartClientSeek => 0,
+            Self::EndClientSeek => 1,
+            Self::Unknown(n) => n,
+        }
+    }
 }
 
 /// Decoded video tag header — the first byte of every video payload.
@@ -415,6 +667,13 @@ impl VideoTagHeader {
             frame_type: FrameType::from_u8(b >> 4),
             codec_id: b & 0x0F,
         }
+    }
+
+    /// Pack the header back into its wire byte (spec §E.4.3.1):
+    /// `FrameType UB[4] | CodecID UB[4]`. Inverse of
+    /// [`VideoTagHeader::parse`].
+    pub fn to_byte(self) -> u8 {
+        (self.frame_type.to_u8() << 4) | (self.codec_id & 0x0F)
     }
 
     pub fn is_keyframe(self) -> bool {
@@ -811,6 +1070,172 @@ mod tests {
             write_tag(&mut out, TagType::Audio, 0, 0, &big),
             Err(Error::InvalidData(_))
         ));
+    }
+
+    #[test]
+    fn video_header_byte_round_trips() {
+        // Every legal FrameType (0..=15 including Unknown) packs with
+        // every 4-bit codec_id lossless-ly.
+        for ft in [
+            FrameType::Key,
+            FrameType::Inter,
+            FrameType::DisposableInter,
+            FrameType::GeneratedKey,
+            FrameType::VideoInfo,
+            FrameType::Unknown(7),
+            FrameType::Unknown(0),
+            FrameType::Unknown(15),
+        ] {
+            for codec in 0u8..16 {
+                let h = VideoTagHeader {
+                    frame_type: ft,
+                    codec_id: codec,
+                };
+                let back = VideoTagHeader::parse(h.to_byte());
+                assert_eq!(back.codec_id, codec);
+                // FrameType round-trips exactly because the wire field
+                // is 4 bits and we masked Unknown(n) to 4 bits.
+                assert_eq!(back.frame_type.to_u8(), ft.to_u8());
+            }
+        }
+        // Worked example: keyframe + AVC (codec 7) packs to 0x17.
+        let h = VideoTagHeader {
+            frame_type: FrameType::Key,
+            codec_id: VIDEO_CODEC_H264,
+        };
+        assert_eq!(h.to_byte(), 0x17);
+    }
+
+    #[test]
+    fn write_h263_keyframe_emits_video_tag_with_flv1_id() {
+        let mut out = Vec::new();
+        let frame = [0x00, 0x00, 0x84, 0x00, 0x07]; // arbitrary H.263 bits
+        write_h263_tag(&mut out, 42, true, &frame).unwrap();
+        // 11-byte tag header + 1 video header byte + 5 frame bytes + 4 trailer = 21
+        assert_eq!(out.len(), 21);
+        assert_eq!(out[0], 0x09); // TagType = Video
+                                  // VideoTagHeader: FrameType=Key(1) | CodecID=FLV1(2) = 0x12.
+        let vh = VideoTagHeader::parse(out[11]);
+        assert_eq!(vh.codec_id, VIDEO_CODEC_FLV1);
+        assert!(vh.is_keyframe());
+        assert_eq!(&out[12..17], &frame);
+        // PreviousTagSize = 11 + DataSize(6) = 17.
+        assert_eq!(&out[17..21], &17u32.to_be_bytes());
+    }
+
+    #[test]
+    fn write_vp6_inter_marks_inter_frame() {
+        let mut out = Vec::new();
+        write_vp6_tag(&mut out, 33, false, &[0xAA, 0xBB, 0xCC]).unwrap();
+        let vh = VideoTagHeader::parse(out[11]);
+        assert_eq!(vh.codec_id, VIDEO_CODEC_VP6F);
+        assert!(!vh.is_keyframe());
+        // The frame bytes follow the single header byte.
+        assert_eq!(&out[12..15], &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn write_vp6a_prefixes_alpha_offset_byte() {
+        let mut out = Vec::new();
+        let frame = [0x11, 0x22, 0x33, 0x44];
+        write_vp6a_tag(&mut out, 0, true, 0x07, &frame).unwrap();
+        let vh = VideoTagHeader::parse(out[11]);
+        assert_eq!(vh.codec_id, VIDEO_CODEC_VP6A);
+        assert!(vh.is_keyframe());
+        // VIDEODATA: AlphaOffset(0x07) || frame.
+        assert_eq!(out[12], 0x07);
+        assert_eq!(&out[13..17], &frame);
+    }
+
+    #[test]
+    fn write_avc_sequence_header_lays_out_packet_type_and_cto() {
+        let mut out = Vec::new();
+        // Synthetic AVCDecoderConfigurationRecord: just a few opaque bytes
+        // — the writer does not parse it.
+        let config = [0x01, 0x42, 0xC0, 0x1F, 0xFF, 0xE1];
+        write_avc_sequence_header(&mut out, 0, &config).unwrap();
+        // VideoTagHeader byte: Key(1)|H264(7) = 0x17.
+        assert_eq!(out[11], 0x17);
+        // AVCPacketType = 0.
+        assert_eq!(out[12], 0x00);
+        // CompositionTime = 0 (SI24 BE).
+        assert_eq!(&out[13..16], &[0, 0, 0]);
+        // The config record follows verbatim.
+        assert_eq!(&out[16..22], &config);
+    }
+
+    #[test]
+    fn write_avc_nalu_round_trips_negative_composition_time() {
+        let mut out = Vec::new();
+        let au = [0x00, 0x00, 0x00, 0x05, 0x65, 0x88, 0x84, 0x00, 0x20]; // length-prefixed IDR fragment
+                                                                         // CTS = -42 ms (B-frame reordering).
+        write_avc_nalu_tag(&mut out, 100, true, -42, &au).unwrap();
+        assert_eq!(out[11], 0x17); // Key|H264
+        assert_eq!(out[12], 0x01); // AVCPacketType = 1 (NALU)
+                                   // SI24 of -42 = two's-complement low 24 bits = 0xFFFFD6.
+        let raw = ((out[13] as u32) << 16) | ((out[14] as u32) << 8) | (out[15] as u32);
+        let sext = if raw & 0x0080_0000 != 0 {
+            raw | 0xFF00_0000
+        } else {
+            raw
+        };
+        assert_eq!(sext as i32, -42);
+        assert_eq!(&out[16..16 + au.len()], &au);
+    }
+
+    #[test]
+    fn write_avc_nalu_rejects_out_of_range_composition_time() {
+        let mut out = Vec::new();
+        // 2^23 is outside SI24 (max is 2^23 - 1).
+        assert!(matches!(
+            write_avc_nalu_tag(&mut out, 0, false, 1 << 23, &[]),
+            Err(Error::InvalidData(_))
+        ));
+        assert!(matches!(
+            write_avc_nalu_tag(&mut out, 0, false, -(1 << 23) - 1, &[]),
+            Err(Error::InvalidData(_))
+        ));
+        // Boundary values are accepted.
+        assert!(write_avc_nalu_tag(&mut out, 0, false, (1 << 23) - 1, &[]).is_ok());
+        let mut out2 = Vec::new();
+        assert!(write_avc_nalu_tag(&mut out2, 0, false, -(1 << 23), &[]).is_ok());
+    }
+
+    #[test]
+    fn write_avc_end_of_sequence_carries_packet_type_two() {
+        let mut out = Vec::new();
+        write_avc_end_of_sequence(&mut out, 1000).unwrap();
+        assert_eq!(out[12], 0x02); // AVCPacketType = 2 (EOS)
+        assert_eq!(&out[13..16], &[0, 0, 0]); // CompositionTime = 0
+                                              // Body is exactly 5 bytes (1 video header + 1 packet-type + 3 SI24).
+                                              // Total = 11 + 5 + 4 = 20.
+        assert_eq!(out.len(), 20);
+    }
+
+    #[test]
+    fn write_video_info_command_emits_one_byte_body() {
+        let mut out = Vec::new();
+        write_video_info_command_tag(&mut out, 5, VideoInfoCommand::StartClientSeek).unwrap();
+        // FrameType=VideoInfo(5)|CodecID=0 = 0x50.
+        assert_eq!(out[11], 0x50);
+        assert_eq!(out[12], 0x00); // StartClientSeek command byte
+                                   // 11 + 2 + 4 = 17.
+        assert_eq!(out.len(), 17);
+
+        let mut out = Vec::new();
+        write_video_info_command_tag(&mut out, 5, VideoInfoCommand::EndClientSeek).unwrap();
+        assert_eq!(out[12], 0x01);
+
+        let mut out = Vec::new();
+        write_video_info_command_tag(&mut out, 5, VideoInfoCommand::Unknown(0xAB)).unwrap();
+        assert_eq!(out[12], 0xAB);
+    }
+
+    #[test]
+    fn video_info_command_to_u8_round_trips() {
+        for v in [0u8, 1, 2, 0x7F, 0xAB, 0xFF] {
+            assert_eq!(VideoInfoCommand::from_u8(v).to_u8(), v);
+        }
     }
 
     #[test]

@@ -263,6 +263,14 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | Generic tag | `tag::write_tag(w, type, ts_ms, stream_id, body)` | §E.4.1 |
 | MP3 audio tag | `tag::write_mp3_tag(w, ts_ms, rate_idx, is_16bit, is_stereo, frame)` | §E.4.2.1 |
 | Raw AAC audio tag | `tag::write_aac_raw_tag(w, ts_ms, raw_au)` | §E.4.2.1/2 |
+| Generic video tag | `tag::write_video_tag(w, ts_ms, VideoTagHeader, payload)` | §E.4.3.1 |
+| Sorenson H.263 (`flv1`) tag | `tag::write_h263_tag(w, ts_ms, is_keyframe, frame)` | §E.4.3.1 |
+| VP6 (`vp6f`) tag | `tag::write_vp6_tag(w, ts_ms, is_keyframe, frame)` | §E.4.3.1 |
+| VP6-with-alpha (`vp6a`) tag | `tag::write_vp6a_tag(w, ts_ms, is_keyframe, alpha_offset, frame)` | §E.4.3.1 |
+| AVC sequence header | `tag::write_avc_sequence_header(w, ts_ms, config_record)` | §E.4.3.1 |
+| AVC NALU access unit | `tag::write_avc_nalu_tag(w, ts_ms, is_keyframe, composition_time_ms, au)` | §E.4.3.1 |
+| AVC end-of-sequence | `tag::write_avc_end_of_sequence(w, ts_ms)` | §E.4.3.1 |
+| Video info / command tag | `tag::write_video_info_command_tag(w, ts_ms, VideoInfoCommand)` | §E.4.3.1 |
 | AMF0 writers | `amf0::{write_number, write_boolean, write_string, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 |
 | `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |
 
@@ -271,6 +279,16 @@ emits the trailing `PreviousTagSize = 11 + DataSize` back-pointer.
 `MetadataBag` is an ordered bag of the three AMF0 scalar property types
 (Number / Boolean / String); insertion order is preserved on the wire so
 the output is deterministic.
+
+The video tag writers all share the same `VideoTagHeader` / `FrameType`
+model the demuxer uses; `write_avc_nalu_tag` packs `pts - dts` as the
+SI24 `CompositionTime` (rejecting out-of-range deltas with
+`Error::InvalidData`), and `write_avc_sequence_header` carries the
+`AVCDecoderConfigurationRecord` verbatim so that
+`extradata == config_record` after the round-trip. Tests in
+`tests/roundtrip_muxer.rs` write video-only FLVs for H.263 / VP6 / VP6A /
+AVC and assert the demuxer recovers the codec id, keyframe flag,
+extradata, and per-packet pts/dts including the B-frame reorder case.
 
 ```rust
 use oxideav_flv::{header, script, script::MetadataBag, tag};
@@ -289,9 +307,9 @@ tag::write_mp3_tag(&mut flv, 0, 3, true, true, &mp3_frame)?;
 # Ok::<(), oxideav_core::Error>(())
 ```
 
-Still out of scope (followups): the `keyframes` seek-table writer, the
-H.263 / VP6 / AVC video tag writers (incl. `AVCDecoderConfigurationRecord`),
-and the Enhanced-RTMP `ExVideoTag` / `ExAudioTag` writers.
+Still out of scope (followups): the `keyframes` seek-table writer, and
+the Enhanced-RTMP `ExVideoTag` / `ExAudioTag` writers (AV1 / VP9 / HEVC /
+VVC / Opus / FLAC / AC-3 / E-AC-3 FourCC paths).
 
 ## Quick use
 
