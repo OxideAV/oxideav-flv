@@ -104,6 +104,20 @@ impl ExFrameType {
     pub fn is_keyframe(self) -> bool {
         matches!(self, Self::KeyFrame | Self::GeneratedKeyFrame)
     }
+
+    /// 3-bit wire value (bits 6..4 of the ExVideo leading byte, spec
+    /// enhanced-rtmp-v2 §`Extended VideoTagHeader`). Inverse of
+    /// [`Self::from_u8`]. `Reserved(n)` is masked to 3 bits.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::KeyFrame => 1,
+            Self::InterFrame => 2,
+            Self::DisposableInterFrame => 3,
+            Self::GeneratedKeyFrame => 4,
+            Self::Command => 5,
+            Self::Reserved(n) => n & 0x07,
+        }
+    }
 }
 
 /// Ex-video PacketType (bits 3..0 of the leading byte when IsExHeader=1).
@@ -148,6 +162,23 @@ impl ExPacketType {
             6 => Self::Multitrack,
             7 => Self::ModEx,
             other => Self::Reserved(other),
+        }
+    }
+
+    /// 4-bit wire value (bits 3..0 of the ExVideo leading byte, spec
+    /// enhanced-rtmp-v2 §`Extended VideoTagHeader`). Inverse of
+    /// [`Self::from_u8`]. `Reserved(n)` is masked to 4 bits.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::SequenceStart => 0,
+            Self::CodedFrames => 1,
+            Self::SequenceEnd => 2,
+            Self::CodedFramesX => 3,
+            Self::Metadata => 4,
+            Self::Mpeg2TsSequenceStart => 5,
+            Self::Multitrack => 6,
+            Self::ModEx => 7,
+            Self::Reserved(n) => n & 0x0F,
         }
     }
 }
@@ -400,6 +431,152 @@ impl ExVideoTagHeader {
             mod_ex_entries,
             video_command,
         }))
+    }
+
+    /// Serialise this header to the wire bytes that opens an
+    /// `ExVideoTagBody` — the inverse of [`Self::parse`].
+    ///
+    /// The output is appended to `out`. After return the caller appends
+    /// the codec-specific payload (e.g. AV1CodecConfigurationRecord for
+    /// SequenceStart, NALU access-unit for HEVC CodedFrames after the
+    /// CTO bytes are emitted here, etc.).
+    ///
+    /// Coverage and limitations for this slice:
+    ///
+    /// * Single-track headers are fully supported.
+    /// * Multitrack `OneTrack` / `ManyTracks` are supported (the shared
+    ///   FourCc is emitted once). `ManyTracksManyCodecs` is supported,
+    ///   the shared FourCc is omitted per spec.
+    /// * SI24 `CompositionTimeOffset` is emitted for HEVC / VVC / AVC
+    ///   `CodedFrames` (single-track only) when
+    ///   `composition_time_offset_ms` is `Some(_)`; for any other
+    ///   FourCc / packet-type combination a non-`None` CTO is rejected
+    ///   with [`Error::InvalidData`] since the spec leaves no slot for it.
+    /// * The trailing `VideoCommand` UI8 is emitted when
+    ///   `frame_type == Command` and `packet_type != Metadata`, mirroring
+    ///   the parser's spec-aligned guard. `video_command = None` on that
+    ///   combination is rejected (the spec requires the byte).
+    /// * ModEx prefix emission is **not** implemented in this slice —
+    ///   `mod_ex_entries` is required to be empty. Round-tripping the
+    ///   parsed ModEx-bearing wire shape will land in a follow-up round.
+    ///
+    /// Returns `Err(Error::InvalidData)` for any combination that doesn't
+    /// have a defined wire representation.
+    pub fn to_bytes(&self, out: &mut Vec<u8>) -> Result<()> {
+        // ModEx emission is deferred to a future round. The walker
+        // already round-trips the parsed entries; the inverse-emission
+        // step needs a canonical ordering decision we haven't taken yet.
+        if !self.mod_ex_entries.is_empty() {
+            return Err(Error::invalid(
+                "ExVideoTagHeader::to_bytes: ModEx emission not yet implemented",
+            ));
+        }
+        if self.timestamp_offset_nano != 0 {
+            return Err(Error::invalid(
+                "ExVideoTagHeader::to_bytes: nonzero timestamp_offset_nano without mod_ex_entries",
+            ));
+        }
+        let frame_bits = self.frame_type.to_u8() & 0x07;
+        // Single-track: leading-byte PacketType is the final packet type.
+        // Multitrack: leading-byte PacketType is `Multitrack`; the inner
+        // type goes into the multitrack header byte that follows the
+        // (shared) FourCc-or-not.
+        let (lead_pt, inner_pt_for_mt) = if self.multitrack.is_some() {
+            (ExPacketType::Multitrack.to_u8(), Some(self.packet_type))
+        } else {
+            (self.packet_type.to_u8() & 0x0F, None)
+        };
+        out.push(EX_HEADER_FLAG | (frame_bits << 4) | lead_pt);
+
+        if let Some(mt_type) = self.multitrack {
+            // Spec layout: UB[4] AvMultitrackType | UB[4] inner PacketType.
+            let inner_pt = inner_pt_for_mt.expect("set when multitrack is Some");
+            if matches!(inner_pt, ExPacketType::Multitrack) {
+                return Err(Error::invalid(
+                    "ExVideoTagHeader::to_bytes: nested Multitrack packet type",
+                ));
+            }
+            let mt_byte = (mt_type.to_u8() << 4) | (inner_pt.to_u8() & 0x0F);
+            out.push(mt_byte);
+            // FourCc is shared except in ManyTracksManyCodecs.
+            if matches!(mt_type, AvMultitrackType::ManyTracksManyCodecs) {
+                if self.fourcc.is_some() {
+                    return Err(Error::invalid(
+                        "ExVideoTagHeader::to_bytes: ManyTracksManyCodecs must not carry a shared FourCc",
+                    ));
+                }
+            } else {
+                let fcc = self.fourcc.ok_or_else(|| {
+                    Error::invalid(
+                        "ExVideoTagHeader::to_bytes: multitrack OneTrack/ManyTracks needs a shared FourCc",
+                    )
+                })?;
+                out.extend_from_slice(&fcc.to_be_bytes());
+            }
+            // No single-track CTO read on multitrack mode; the per-track
+            // CTO is part of each track's body payload.
+            if self.composition_time_offset_ms.is_some() {
+                return Err(Error::invalid(
+                    "ExVideoTagHeader::to_bytes: composition_time_offset_ms must be None in multitrack mode (per-track CTO lives in the payload)",
+                ));
+            }
+        } else {
+            // Single-track: FourCc immediately after the lead byte.
+            let fcc = self.fourcc.ok_or_else(|| {
+                Error::invalid("ExVideoTagHeader::to_bytes: single-track header needs a FourCc")
+            })?;
+            out.extend_from_slice(&fcc.to_be_bytes());
+
+            // SI24 CompositionTimeOffset — emitted only for HEVC / VVC /
+            // AVC `CodedFrames` (single-track), mirroring the parser.
+            let cto_slot = matches!(self.packet_type, ExPacketType::CodedFrames)
+                && matches!(fcc, FOURCC_HVC1 | FOURCC_VVC1 | FOURCC_AVC1);
+            match (cto_slot, self.composition_time_offset_ms) {
+                (true, Some(cto)) => {
+                    if !(-(1 << 23)..(1 << 23)).contains(&cto) {
+                        return Err(Error::invalid(format!(
+                            "ExVideoTagHeader::to_bytes: CompositionTimeOffset {cto} ms outside SI24 range"
+                        )));
+                    }
+                    let bits = (cto as u32) & 0x00FF_FFFF;
+                    out.push((bits >> 16) as u8);
+                    out.push((bits >> 8) as u8);
+                    out.push(bits as u8);
+                }
+                (true, None) => {
+                    return Err(Error::invalid(
+                        "ExVideoTagHeader::to_bytes: HEVC/VVC/AVC CodedFrames requires composition_time_offset_ms (use 0 for no reorder)",
+                    ));
+                }
+                (false, Some(_)) => {
+                    return Err(Error::invalid(
+                        "ExVideoTagHeader::to_bytes: composition_time_offset_ms is only defined for HEVC/VVC/AVC CodedFrames",
+                    ));
+                }
+                (false, None) => {}
+            }
+        }
+
+        // VideoCommand UI8: written iff frame_type == Command && packet_type != Metadata.
+        // Mirrors the parser guard.
+        let needs_command = matches!(self.frame_type, ExFrameType::Command)
+            && !matches!(self.packet_type, ExPacketType::Metadata);
+        match (needs_command, self.video_command) {
+            (true, Some(cmd)) => out.push(cmd.as_u8()),
+            (true, None) => {
+                return Err(Error::invalid(
+                    "ExVideoTagHeader::to_bytes: frame_type=Command with non-Metadata packet_type requires video_command",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(Error::invalid(
+                    "ExVideoTagHeader::to_bytes: video_command set without frame_type=Command (or with Metadata packet_type)",
+                ));
+            }
+            (false, None) => {}
+        }
+
+        Ok(())
     }
 }
 
@@ -901,6 +1078,222 @@ mod tests {
                 VideoPacketModExType::from_u8(v),
                 VideoPacketModExType::Reserved(v)
             );
+        }
+    }
+
+    // ---- to_bytes: parse-emit-parse round-trips ---------------------------
+
+    /// Helper: parse `body`, emit via `to_bytes`, and check that the
+    /// emitted bytes parse back into the same header. Returns the emitted
+    /// bytes so the caller can also check the byte-level layout when
+    /// useful.
+    fn assert_round_trips(body: &[u8]) -> Vec<u8> {
+        let h = ExVideoTagHeader::parse(body).unwrap().unwrap();
+        let payload_tail = &body[h.bytes_consumed..];
+        let mut out = Vec::new();
+        h.to_bytes(&mut out).unwrap();
+        out.extend_from_slice(payload_tail);
+        let h2 = ExVideoTagHeader::parse(&out).unwrap().unwrap();
+        assert_eq!(h.frame_type, h2.frame_type);
+        assert_eq!(h.packet_type, h2.packet_type);
+        assert_eq!(h.fourcc, h2.fourcc);
+        assert_eq!(h.multitrack, h2.multitrack);
+        assert_eq!(h.composition_time_offset_ms, h2.composition_time_offset_ms);
+        assert_eq!(h.video_command, h2.video_command);
+        assert_eq!(h.bytes_consumed, h2.bytes_consumed);
+        assert_eq!(&out[h2.bytes_consumed..], payload_tail);
+        out
+    }
+
+    #[test]
+    fn to_bytes_av1_sequence_start_round_trip() {
+        let mut body = vec![0x90];
+        body.extend_from_slice(b"av01");
+        body.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let out = assert_round_trips(&body);
+        // For the no-CTO single-track case the emitted bytes must match
+        // the original verbatim.
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_hevc_coded_frames_round_trip_with_cto() {
+        let mut body = vec![0xA1];
+        body.extend_from_slice(b"hvc1");
+        body.extend_from_slice(&[0x00, 0x00, 0x21]); // CTO = 33
+        body.extend_from_slice(&[0xCA, 0xFE]);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_hevc_coded_frames_round_trip_with_negative_cto() {
+        let mut body = vec![0xA1];
+        body.extend_from_slice(b"hvc1");
+        body.extend_from_slice(&[0xFF, 0xFF, 0xFF]); // CTO = -1
+        body.extend_from_slice(&[0x00]);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_coded_frames_x_round_trip() {
+        let mut body = vec![0xA3];
+        body.extend_from_slice(b"hvc1");
+        body.extend_from_slice(&[0xBE, 0xEF]);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_sequence_end_round_trip() {
+        let mut body = vec![0x92];
+        body.extend_from_slice(b"av01");
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_metadata_round_trip() {
+        let mut body = vec![0x94];
+        body.extend_from_slice(b"hvc1");
+        body.extend_from_slice(b"colorInfo-blob");
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_multitrack_one_track_round_trip() {
+        let mut body = vec![0x96];
+        body.push(0x01); // OneTrack | CodedFrames
+        body.extend_from_slice(b"av01");
+        body.extend_from_slice(&[0x00, 0xDE, 0xAD]);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_multitrack_many_tracks_many_codecs_round_trip() {
+        let mut body = vec![0x96];
+        body.push(0x21); // ManyTracksManyCodecs | CodedFrames
+        body.extend_from_slice(&[0xCA, 0xFE]);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_command_start_seek_round_trip() {
+        let mut body = vec![0xD0];
+        body.extend_from_slice(b"av01");
+        body.push(0x00);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_command_end_seek_round_trip() {
+        let mut body = vec![0xD0];
+        body.extend_from_slice(b"av01");
+        body.push(0x01);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_command_after_hevc_cto_round_trip() {
+        let mut body = vec![0xD1];
+        body.extend_from_slice(b"hvc1");
+        body.extend_from_slice(&[0x00, 0x00, 0x21]);
+        body.push(0x00);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_rejects_cto_on_non_hevc_codec() {
+        let h = ExVideoTagHeader {
+            frame_type: ExFrameType::InterFrame,
+            packet_type: ExPacketType::CodedFrames,
+            fourcc: Some(FOURCC_AV01),
+            multitrack: None,
+            bytes_consumed: 0,
+            composition_time_offset_ms: Some(33),
+            timestamp_offset_nano: 0,
+            mod_ex_entries: Vec::new(),
+            video_command: None,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(h.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn to_bytes_rejects_missing_cto_for_hevc_coded_frames() {
+        let h = ExVideoTagHeader {
+            frame_type: ExFrameType::InterFrame,
+            packet_type: ExPacketType::CodedFrames,
+            fourcc: Some(FOURCC_HVC1),
+            multitrack: None,
+            bytes_consumed: 0,
+            composition_time_offset_ms: None,
+            timestamp_offset_nano: 0,
+            mod_ex_entries: Vec::new(),
+            video_command: None,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(h.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn to_bytes_rejects_cto_overflow() {
+        let h = ExVideoTagHeader {
+            frame_type: ExFrameType::InterFrame,
+            packet_type: ExPacketType::CodedFrames,
+            fourcc: Some(FOURCC_HVC1),
+            multitrack: None,
+            bytes_consumed: 0,
+            composition_time_offset_ms: Some(1 << 23),
+            timestamp_offset_nano: 0,
+            mod_ex_entries: Vec::new(),
+            video_command: None,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(h.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn to_bytes_rejects_modex_emission() {
+        // ModEx emission is not yet implemented — the deferred case must
+        // surface a clear error rather than silently produce wrong bytes.
+        let h = ExVideoTagHeader {
+            frame_type: ExFrameType::KeyFrame,
+            packet_type: ExPacketType::CodedFrames,
+            fourcc: Some(FOURCC_AV01),
+            multitrack: None,
+            bytes_consumed: 0,
+            composition_time_offset_ms: None,
+            timestamp_offset_nano: 0,
+            mod_ex_entries: vec![ModExEntry {
+                subtype_raw: 0,
+                payload: crate::mod_ex::ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+                raw: vec![0, 0, 0x64],
+            }],
+            video_command: None,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(h.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn frame_type_round_trips_through_to_u8() {
+        for v in 0u8..8 {
+            assert_eq!(ExFrameType::from_u8(v).to_u8(), v);
+        }
+    }
+
+    #[test]
+    fn packet_type_round_trips_through_to_u8() {
+        for v in 0u8..16 {
+            assert_eq!(ExPacketType::from_u8(v).to_u8(), v);
         }
     }
 }

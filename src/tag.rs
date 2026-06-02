@@ -408,6 +408,465 @@ pub fn write_video_info_command_tag<W: Write + ?Sized>(
     write_video_tag(w, timestamp_ms, header, &[command.to_u8()])
 }
 
+// ---- Enhanced-RTMP / E-FLV ExVideo + ExAudio writers --------------------
+//
+// These mirror the parsers in `ex_video.rs` / `ex_audio.rs`. Each writer
+// emits a complete FLV tag: TAG_HEADER + ExHeader bytes (via
+// `ExVideoTagHeader::to_bytes` / `ExAudioTagHeader::to_bytes`) + the
+// codec-specific payload + trailing PreviousTagSize.
+//
+// The legacy `write_video_tag` / `write_audio_tag` family above is the
+// pre-2023 entry point. The Ex family below is the FourCC-mode entry
+// point used by enhanced-rtmp-v1 (FourCC av01 / vp09 / vp08 / hvc1 /
+// avc1 / vvc1 video and Opus / fLaC / ac-3 / ec-3 / .mp3 / mp4a audio).
+
+/// Write a fully-formed Enhanced-RTMP video tag from an
+/// [`ExVideoTagHeader`] and a codec-specific payload.
+///
+/// `payload` is the bytes that follow the ExHeader on the wire:
+///
+/// * For `SequenceStart` — the codec's configuration record (e.g. an
+///   `AV1CodecConfigurationRecord`, `HEVCDecoderConfigurationRecord`, …).
+/// * For `CodedFrames` — one or more coded frames. NOTE: the SI24
+///   `CompositionTimeOffset` for HEVC / VVC / AVC is emitted by
+///   [`ExVideoTagHeader::to_bytes`] from `header.composition_time_offset_ms`,
+///   so `payload` must *not* include it.
+/// * For `CodedFramesX` — coded frames with no CTO byte slot.
+/// * For `Metadata` — AMF-encoded `["colorInfo", Object]` (or future
+///   metadata frame variants).
+/// * For `SequenceEnd` — empty.
+///
+/// The dedicated `write_av1_*` / `write_hevc_*` / `write_opus_*` helpers
+/// below cover the common cases without the caller having to assemble
+/// the header struct by hand.
+pub fn write_ex_video_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    header: &crate::ex_video::ExVideoTagHeader,
+    payload: &[u8],
+) -> Result<u32> {
+    let mut body = Vec::with_capacity(8 + payload.len());
+    header.to_bytes(&mut body)?;
+    body.extend_from_slice(payload);
+    write_tag(w, TagType::Video, timestamp_ms, 0, &body)
+}
+
+/// Write a fully-formed Enhanced-RTMP audio tag from an
+/// [`ExAudioTagHeader`] and a codec-specific payload.
+///
+/// `payload` follows the ExHeader on the wire:
+///
+/// * For `SequenceStart` — the codec's configuration record (Opus RFC
+///   7845 ID header, `fLaC` + STREAMINFO, AAC AudioSpecificConfig).
+/// * For `CodedFrames` — one coded frame (ATSC AC-3 sync frame, FLAC
+///   frame, raw AAC AU, MP3 frame, Opus packet).
+/// * For `MultichannelConfig` — multichannel-config blob.
+/// * For `SequenceEnd` — empty.
+pub fn write_ex_audio_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    header: &crate::ex_audio::ExAudioTagHeader,
+    payload: &[u8],
+) -> Result<u32> {
+    let mut body = Vec::with_capacity(8 + payload.len());
+    header.to_bytes(&mut body)?;
+    body.extend_from_slice(payload);
+    write_tag(w, TagType::Audio, timestamp_ms, 0, &body)
+}
+
+// ---- Ex-video single-track convenience writers ----------------------------
+
+fn single_track_ex_video_header(
+    frame_type: crate::ex_video::ExFrameType,
+    packet_type: crate::ex_video::ExPacketType,
+    fourcc: u32,
+    composition_time_offset_ms: Option<i32>,
+) -> crate::ex_video::ExVideoTagHeader {
+    crate::ex_video::ExVideoTagHeader {
+        frame_type,
+        packet_type,
+        fourcc: Some(fourcc),
+        multitrack: None,
+        bytes_consumed: 0,
+        composition_time_offset_ms,
+        timestamp_offset_nano: 0,
+        mod_ex_entries: Vec::new(),
+        video_command: None,
+    }
+}
+
+/// Write an AV1 (`av01`) Enhanced-RTMP SequenceStart tag carrying the
+/// `AV1CodecConfigurationRecord` verbatim.
+///
+/// Frame type is forced to [`crate::ex_video::ExFrameType::KeyFrame`]
+/// per spec convention (the sequence header opens a fresh decoding
+/// window).
+pub fn write_av1_sequence_start<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    config_record: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_video_header(
+        crate::ex_video::ExFrameType::KeyFrame,
+        crate::ex_video::ExPacketType::SequenceStart,
+        crate::ex_video::FOURCC_AV01,
+        None,
+    );
+    write_ex_video_tag(w, timestamp_ms, &header, config_record)
+}
+
+/// Write an AV1 (`av01`) Enhanced-RTMP CodedFrames tag.
+///
+/// AV1 carries no SI24 `CompositionTimeOffset` (spec: CTO is only for
+/// HEVC / VVC / AVC `CodedFrames`); `payload` is one or more coded
+/// frames verbatim.
+pub fn write_av1_coded_frames<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_keyframe: bool,
+    payload: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_video_header(
+        if is_keyframe {
+            crate::ex_video::ExFrameType::KeyFrame
+        } else {
+            crate::ex_video::ExFrameType::InterFrame
+        },
+        crate::ex_video::ExPacketType::CodedFrames,
+        crate::ex_video::FOURCC_AV01,
+        None,
+    );
+    write_ex_video_tag(w, timestamp_ms, &header, payload)
+}
+
+/// Write a VP9 (`vp09`) Enhanced-RTMP SequenceStart tag carrying the
+/// `VPCodecConfigurationRecord`.
+pub fn write_vp9_sequence_start<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    config_record: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_video_header(
+        crate::ex_video::ExFrameType::KeyFrame,
+        crate::ex_video::ExPacketType::SequenceStart,
+        crate::ex_video::FOURCC_VP09,
+        None,
+    );
+    write_ex_video_tag(w, timestamp_ms, &header, config_record)
+}
+
+/// Write a VP9 (`vp09`) Enhanced-RTMP CodedFrames tag. No CTO byte
+/// slot per spec.
+pub fn write_vp9_coded_frames<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_keyframe: bool,
+    payload: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_video_header(
+        if is_keyframe {
+            crate::ex_video::ExFrameType::KeyFrame
+        } else {
+            crate::ex_video::ExFrameType::InterFrame
+        },
+        crate::ex_video::ExPacketType::CodedFrames,
+        crate::ex_video::FOURCC_VP09,
+        None,
+    );
+    write_ex_video_tag(w, timestamp_ms, &header, payload)
+}
+
+/// Write an HEVC (`hvc1`) Enhanced-RTMP SequenceStart tag carrying the
+/// `HEVCDecoderConfigurationRecord`.
+pub fn write_hevc_sequence_start<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    config_record: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_video_header(
+        crate::ex_video::ExFrameType::KeyFrame,
+        crate::ex_video::ExPacketType::SequenceStart,
+        crate::ex_video::FOURCC_HVC1,
+        None,
+    );
+    write_ex_video_tag(w, timestamp_ms, &header, config_record)
+}
+
+/// Write an HEVC (`hvc1`) Enhanced-RTMP CodedFrames tag.
+///
+/// `composition_time_offset_ms` is the signed 24-bit `CTS` (pts − dts)
+/// in milliseconds; the `to_bytes` step emits it as a SI24 between the
+/// FourCc and the NALU payload (mirroring legacy AVC). Use
+/// [`write_hevc_coded_frames_x`] for the no-CTO 3-byte-savings variant.
+pub fn write_hevc_coded_frames<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_keyframe: bool,
+    composition_time_offset_ms: i32,
+    payload: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_video_header(
+        if is_keyframe {
+            crate::ex_video::ExFrameType::KeyFrame
+        } else {
+            crate::ex_video::ExFrameType::InterFrame
+        },
+        crate::ex_video::ExPacketType::CodedFrames,
+        crate::ex_video::FOURCC_HVC1,
+        Some(composition_time_offset_ms),
+    );
+    write_ex_video_tag(w, timestamp_ms, &header, payload)
+}
+
+/// Write an HEVC (`hvc1`) Enhanced-RTMP `CodedFramesX` tag (implicit
+/// zero CTO; 3 bytes saved vs `CodedFrames`).
+pub fn write_hevc_coded_frames_x<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_keyframe: bool,
+    payload: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_video_header(
+        if is_keyframe {
+            crate::ex_video::ExFrameType::KeyFrame
+        } else {
+            crate::ex_video::ExFrameType::InterFrame
+        },
+        crate::ex_video::ExPacketType::CodedFramesX,
+        crate::ex_video::FOURCC_HVC1,
+        None,
+    );
+    write_ex_video_tag(w, timestamp_ms, &header, payload)
+}
+
+/// Write a VVC (`vvc1`) Enhanced-RTMP SequenceStart tag carrying the
+/// `VVCDecoderConfigurationRecord`.
+pub fn write_vvc_sequence_start<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    config_record: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_video_header(
+        crate::ex_video::ExFrameType::KeyFrame,
+        crate::ex_video::ExPacketType::SequenceStart,
+        crate::ex_video::FOURCC_VVC1,
+        None,
+    );
+    write_ex_video_tag(w, timestamp_ms, &header, config_record)
+}
+
+/// Write a VVC (`vvc1`) Enhanced-RTMP CodedFrames tag with SI24 CTO.
+pub fn write_vvc_coded_frames<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_keyframe: bool,
+    composition_time_offset_ms: i32,
+    payload: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_video_header(
+        if is_keyframe {
+            crate::ex_video::ExFrameType::KeyFrame
+        } else {
+            crate::ex_video::ExFrameType::InterFrame
+        },
+        crate::ex_video::ExPacketType::CodedFrames,
+        crate::ex_video::FOURCC_VVC1,
+        Some(composition_time_offset_ms),
+    );
+    write_ex_video_tag(w, timestamp_ms, &header, payload)
+}
+
+/// Write an Ex-video `SequenceEnd` tag for the given FourCc (no payload).
+pub fn write_ex_video_sequence_end<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    fourcc: u32,
+) -> Result<u32> {
+    let header = single_track_ex_video_header(
+        crate::ex_video::ExFrameType::KeyFrame,
+        crate::ex_video::ExPacketType::SequenceEnd,
+        fourcc,
+        None,
+    );
+    write_ex_video_tag(w, timestamp_ms, &header, &[])
+}
+
+/// Write an Ex-video `Metadata` tag (HDR colorInfo / future extensions).
+/// `amf_payload` is the AMF-encoded `["colorInfo", Object]` body.
+pub fn write_ex_video_metadata<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    fourcc: u32,
+    amf_payload: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_video_header(
+        crate::ex_video::ExFrameType::KeyFrame,
+        crate::ex_video::ExPacketType::Metadata,
+        fourcc,
+        None,
+    );
+    write_ex_video_tag(w, timestamp_ms, &header, amf_payload)
+}
+
+// ---- Ex-audio single-track convenience writers ----------------------------
+
+fn single_track_ex_audio_header(
+    packet_type: crate::ex_audio::ExAudioPacketType,
+    fourcc: u32,
+) -> crate::ex_audio::ExAudioTagHeader {
+    crate::ex_audio::ExAudioTagHeader {
+        packet_type,
+        fourcc: Some(fourcc),
+        multitrack: None,
+        timestamp_offset_nano: 0,
+        mod_ex_entries: Vec::new(),
+        bytes_consumed: 0,
+    }
+}
+
+/// Write an Opus Enhanced-RTMP SequenceStart tag carrying the RFC 7845
+/// OpusHead ID header.
+pub fn write_opus_sequence_start<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    opus_head: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_audio_header(
+        crate::ex_audio::ExAudioPacketType::SequenceStart,
+        crate::ex_audio::FOURCC_OPUS,
+    );
+    write_ex_audio_tag(w, timestamp_ms, &header, opus_head)
+}
+
+/// Write an Opus Enhanced-RTMP CodedFrames tag carrying one Opus packet.
+pub fn write_opus_coded_frames<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    packet: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_audio_header(
+        crate::ex_audio::ExAudioPacketType::CodedFrames,
+        crate::ex_audio::FOURCC_OPUS,
+    );
+    write_ex_audio_tag(w, timestamp_ms, &header, packet)
+}
+
+/// Write a FLAC (`fLaC`) Enhanced-RTMP SequenceStart tag carrying the
+/// Xiph `fLaC` marker + STREAMINFO metadata block.
+pub fn write_flac_sequence_start<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    flac_marker_and_streaminfo: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_audio_header(
+        crate::ex_audio::ExAudioPacketType::SequenceStart,
+        crate::ex_audio::FOURCC_FLAC,
+    );
+    write_ex_audio_tag(w, timestamp_ms, &header, flac_marker_and_streaminfo)
+}
+
+/// Write a FLAC (`fLaC`) Enhanced-RTMP CodedFrames tag carrying one
+/// FLAC frame.
+pub fn write_flac_coded_frames<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    flac_frame: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_audio_header(
+        crate::ex_audio::ExAudioPacketType::CodedFrames,
+        crate::ex_audio::FOURCC_FLAC,
+    );
+    write_ex_audio_tag(w, timestamp_ms, &header, flac_frame)
+}
+
+/// Write an AC-3 (`ac-3`) Enhanced-RTMP CodedFrames tag carrying one
+/// ATSC AC-3 sync frame. AC-3 is self-synchronising so a
+/// `SequenceStart` is not required.
+pub fn write_ac3_coded_frames<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    ac3_sync_frame: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_audio_header(
+        crate::ex_audio::ExAudioPacketType::CodedFrames,
+        crate::ex_audio::FOURCC_AC3,
+    );
+    write_ex_audio_tag(w, timestamp_ms, &header, ac3_sync_frame)
+}
+
+/// Write an E-AC-3 (`ec-3`) Enhanced-RTMP CodedFrames tag carrying one
+/// ATSC E-AC-3 sync frame.
+pub fn write_eac3_coded_frames<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    eac3_sync_frame: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_audio_header(
+        crate::ex_audio::ExAudioPacketType::CodedFrames,
+        crate::ex_audio::FOURCC_EAC3,
+    );
+    write_ex_audio_tag(w, timestamp_ms, &header, eac3_sync_frame)
+}
+
+/// Write an MP3 Enhanced-RTMP CodedFrames tag (`.mp3` FourCc — distinct
+/// from the legacy `SoundFormat=2` MP3 path that still uses
+/// [`write_mp3_tag`]).
+pub fn write_mp3_ex_coded_frames<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    mp3_frame: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_audio_header(
+        crate::ex_audio::ExAudioPacketType::CodedFrames,
+        crate::ex_audio::FOURCC_MP3,
+    );
+    write_ex_audio_tag(w, timestamp_ms, &header, mp3_frame)
+}
+
+/// Write an AAC (`mp4a`) Enhanced-RTMP SequenceStart tag carrying the
+/// ISO/IEC 14496-3 `AudioSpecificConfig`.
+///
+/// This is the FourCc-mode counterpart to legacy
+/// [`write_aac_raw_tag`] — the same AAC stream can be expressed either
+/// via `SoundFormat=10` (legacy) or FourCc `mp4a` (Ex). The decoder
+/// resolves the codec id identically (`"aac"`).
+pub fn write_aac_ex_sequence_start<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    audio_specific_config: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_audio_header(
+        crate::ex_audio::ExAudioPacketType::SequenceStart,
+        crate::ex_audio::FOURCC_AAC,
+    );
+    write_ex_audio_tag(w, timestamp_ms, &header, audio_specific_config)
+}
+
+/// Write an AAC (`mp4a`) Enhanced-RTMP CodedFrames tag carrying one raw
+/// AAC access unit.
+pub fn write_aac_ex_coded_frames<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    raw_au: &[u8],
+) -> Result<u32> {
+    let header = single_track_ex_audio_header(
+        crate::ex_audio::ExAudioPacketType::CodedFrames,
+        crate::ex_audio::FOURCC_AAC,
+    );
+    write_ex_audio_tag(w, timestamp_ms, &header, raw_au)
+}
+
+/// Write an Ex-audio `SequenceEnd` tag for the given FourCc (no payload).
+pub fn write_ex_audio_sequence_end<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    fourcc: u32,
+) -> Result<u32> {
+    let header =
+        single_track_ex_audio_header(crate::ex_audio::ExAudioPacketType::SequenceEnd, fourcc);
+    write_ex_audio_tag(w, timestamp_ms, &header, &[])
+}
+
 fn u24_to_be(v: u32) -> [u8; 3] {
     [(v >> 16) as u8, (v >> 8) as u8, v as u8]
 }

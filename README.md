@@ -271,6 +271,19 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | AVC NALU access unit | `tag::write_avc_nalu_tag(w, ts_ms, is_keyframe, composition_time_ms, au)` | §E.4.3.1 |
 | AVC end-of-sequence | `tag::write_avc_end_of_sequence(w, ts_ms)` | §E.4.3.1 |
 | Video info / command tag | `tag::write_video_info_command_tag(w, ts_ms, VideoInfoCommand)` | §E.4.3.1 |
+| Generic Ex-video tag | `tag::write_ex_video_tag(w, ts_ms, &ExVideoTagHeader, payload)` | enhanced-rtmp v1/v2 |
+| AV1 sequence start / coded frames | `tag::write_av1_sequence_start` / `tag::write_av1_coded_frames` | FourCc `av01` |
+| VP9 sequence start / coded frames | `tag::write_vp9_sequence_start` / `tag::write_vp9_coded_frames` | FourCc `vp09` |
+| HEVC sequence start / coded frames (SI24 CTO) / coded-frames-x | `tag::write_hevc_sequence_start` / `tag::write_hevc_coded_frames` / `tag::write_hevc_coded_frames_x` | FourCc `hvc1` |
+| VVC sequence start / coded frames | `tag::write_vvc_sequence_start` / `tag::write_vvc_coded_frames` | FourCc `vvc1` |
+| Ex-video sequence end / metadata | `tag::write_ex_video_sequence_end` / `tag::write_ex_video_metadata` | enhanced-rtmp v1/v2 |
+| Generic Ex-audio tag | `tag::write_ex_audio_tag(w, ts_ms, &ExAudioTagHeader, payload)` | enhanced-rtmp v2 |
+| Opus sequence start / coded frames | `tag::write_opus_sequence_start` / `tag::write_opus_coded_frames` | FourCc `Opus` |
+| FLAC sequence start / coded frames | `tag::write_flac_sequence_start` / `tag::write_flac_coded_frames` | FourCc `fLaC` |
+| AC-3 / E-AC-3 coded frames | `tag::write_ac3_coded_frames` / `tag::write_eac3_coded_frames` | FourCc `ac-3` / `ec-3` |
+| MP3 (FourCc-mode) coded frames | `tag::write_mp3_ex_coded_frames` | FourCc `.mp3` |
+| AAC (FourCc-mode) sequence start / coded frames | `tag::write_aac_ex_sequence_start` / `tag::write_aac_ex_coded_frames` | FourCc `mp4a` |
+| Ex-audio sequence end | `tag::write_ex_audio_sequence_end` | enhanced-rtmp v2 |
 | AMF0 writers | `amf0::{write_number, write_boolean, write_string, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 |
 | `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |
 
@@ -290,6 +303,21 @@ SI24 `CompositionTime` (rejecting out-of-range deltas with
 AVC and assert the demuxer recovers the codec id, keyframe flag,
 extradata, and per-packet pts/dts including the B-frame reorder case.
 
+The Enhanced-RTMP `ExVideoTagHeader` / `ExAudioTagHeader` writers share
+the same encoding source of truth as the parser via the new `to_bytes`
+inverse: `ExFrameType::to_u8` / `ExPacketType::to_u8` /
+`ExAudioPacketType::to_u8` / `AvMultitrackType::to_u8` round-trip every
+nibble; `write_hevc_coded_frames` emits the SI24
+`CompositionTimeOffset` between the FourCc and the NALU payload
+(positive + negative + zero deltas all round-trip), and FourCc-mode
+`SequenceStart` config records (`AV1CodecConfigurationRecord`,
+`HEVCDecoderConfigurationRecord`, Opus RFC 7845 OpusHead, FLAC
+STREAMINFO, AAC `AudioSpecificConfig`) reach `params.extradata`
+verbatim. Multitrack emission is supported on the video side
+(`OneTrack` / `ManyTracks` / `ManyTracksManyCodecs`); ExAudio
+multitrack and ModEx prefix emission are deferred — the writer
+returns `Error::InvalidData` rather than emit incorrect bytes.
+
 ```rust
 use oxideav_flv::{header, script, script::MetadataBag, tag};
 
@@ -307,9 +335,10 @@ tag::write_mp3_tag(&mut flv, 0, 3, true, true, &mp3_frame)?;
 # Ok::<(), oxideav_core::Error>(())
 ```
 
-Still out of scope (followups): the `keyframes` seek-table writer, and
-the Enhanced-RTMP `ExVideoTag` / `ExAudioTag` writers (AV1 / VP9 / HEVC /
-VVC / Opus / FLAC / AC-3 / E-AC-3 FourCC paths).
+Still out of scope (followups): the `keyframes` seek-table writer, the
+ExAudio multitrack emit path (waiting on the parser to surface the inner
+`AudioPacketType`), and ExVideo / ExAudio ModEx prefix emission
+(`TimestampOffsetNano` and reserved-subtype passthrough).
 
 ## Quick use
 

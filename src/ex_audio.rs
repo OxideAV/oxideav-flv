@@ -120,6 +120,23 @@ impl ExAudioPacketType {
             other => Self::Reserved(other),
         }
     }
+
+    /// 4-bit wire value (the low nibble of the ExAudio leading byte,
+    /// spec enhanced-rtmp-v2 §`ExAudioTagHeader`). Inverse of
+    /// [`Self::from_u8`]. `Reserved(n)` is masked to 4 bits.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::SequenceStart => 0,
+            Self::CodedFrames => 1,
+            Self::SequenceEnd => 2,
+            Self::Reserved3 => 3,
+            Self::MultichannelConfig => 4,
+            Self::Multitrack => 5,
+            Self::Reserved6 => 6,
+            Self::ModEx => 7,
+            Self::Reserved(n) => n & 0x0F,
+        }
+    }
 }
 
 /// `AudioPacketModExType` (UB[4] following the ModEx blob).
@@ -273,6 +290,57 @@ impl ExAudioTagHeader {
             mod_ex_entries,
             bytes_consumed: cursor,
         }))
+    }
+
+    /// Serialise this header to the wire bytes that opens an
+    /// `ExAudioTagBody` — the inverse of [`Self::parse`].
+    ///
+    /// The output is appended to `out`. After return the caller appends
+    /// the codec-specific payload (Opus ID header / FLAC STREAMINFO /
+    /// AAC AudioSpecificConfig for `SequenceStart`, AC-3 sync frames for
+    /// `CodedFrames`, etc.).
+    ///
+    /// Coverage and limitations for this slice:
+    ///
+    /// * Single-track headers are fully supported (the common case for
+    ///   every Enhanced-RTMP audio FourCc — Opus / fLaC / ac-3 / ec-3 /
+    ///   .mp3 / mp4a).
+    /// * ModEx prefix emission is **not** implemented in this slice —
+    ///   `mod_ex_entries` is required to be empty and
+    ///   `timestamp_offset_nano` must be `0`. Round-tripping the parsed
+    ///   ModEx-bearing wire shape will land in a follow-up round.
+    /// * Multitrack emission is **not** implemented in this slice. The
+    ///   audio parser stores `packet_type = Multitrack` and discards the
+    ///   inner `AudioPacketType` (vs the video parser which surfaces the
+    ///   inner type), so faithful inversion requires a model addition
+    ///   (e.g. `inner_packet_type: Option<ExAudioPacketType>`). Deferred
+    ///   to keep this round on the wire-byte writer only.
+    ///
+    /// Returns `Err(Error::InvalidData)` on combinations the spec leaves
+    /// no wire representation for.
+    pub fn to_bytes(&self, out: &mut Vec<u8>) -> Result<()> {
+        if !self.mod_ex_entries.is_empty() {
+            return Err(Error::invalid(
+                "ExAudioTagHeader::to_bytes: ModEx emission not yet implemented",
+            ));
+        }
+        if self.timestamp_offset_nano != 0 {
+            return Err(Error::invalid(
+                "ExAudioTagHeader::to_bytes: nonzero timestamp_offset_nano without mod_ex_entries",
+            ));
+        }
+        if self.multitrack.is_some() {
+            return Err(Error::invalid(
+                "ExAudioTagHeader::to_bytes: multitrack emission not yet implemented (inner AudioPacketType is not surfaced by the parser)",
+            ));
+        }
+        // SoundFormat=9 (ExHeader) high nibble + AudioPacketType low nibble.
+        out.push((SOUND_FORMAT_EX_HEADER << 4) | (self.packet_type.to_u8() & 0x0F));
+        let fcc = self.fourcc.ok_or_else(|| {
+            Error::invalid("ExAudioTagHeader::to_bytes: single-track header needs a FourCc")
+        })?;
+        out.extend_from_slice(&fcc.to_be_bytes());
+        Ok(())
     }
 }
 
@@ -588,5 +656,141 @@ mod tests {
             fourcc_audio_codec_id_str(h.fourcc.unwrap()),
             "flv:exaudio:0x01020304"
         );
+    }
+
+    // ---- to_bytes: parse-emit-parse round-trips ---------------------------
+
+    fn assert_round_trips(body: &[u8]) -> Vec<u8> {
+        let h = ExAudioTagHeader::parse(body).unwrap().unwrap();
+        let payload_tail = &body[h.bytes_consumed..];
+        let mut out = Vec::new();
+        h.to_bytes(&mut out).unwrap();
+        out.extend_from_slice(payload_tail);
+        let h2 = ExAudioTagHeader::parse(&out).unwrap().unwrap();
+        assert_eq!(h.packet_type, h2.packet_type);
+        assert_eq!(h.fourcc, h2.fourcc);
+        assert_eq!(h.multitrack, h2.multitrack);
+        assert_eq!(h.bytes_consumed, h2.bytes_consumed);
+        assert_eq!(&out[h2.bytes_consumed..], payload_tail);
+        out
+    }
+
+    #[test]
+    fn to_bytes_opus_sequence_start_round_trip() {
+        let mut body = vec![0x90];
+        body.extend_from_slice(b"Opus");
+        body.extend_from_slice(&[0x4F, 0x70, 0x75, 0x73]);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_flac_round_trip() {
+        let mut body = vec![0x91];
+        body.extend_from_slice(b"fLaC");
+        body.extend_from_slice(&[0xFF, 0xF8]);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_ac3_coded_frames_round_trip() {
+        let mut body = vec![0x91];
+        body.extend_from_slice(b"ac-3");
+        body.extend_from_slice(&[0x0B, 0x77, 0x00]);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_mp3_round_trip() {
+        let mut body = vec![0x91];
+        body.extend_from_slice(b".mp3");
+        body.extend_from_slice(&[0xFF, 0xFB, 0x90]);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_aac_mp4a_sequence_start_round_trip() {
+        let mut body = vec![0x90];
+        body.extend_from_slice(b"mp4a");
+        body.extend_from_slice(&[0x12, 0x10]);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_sequence_end_round_trip() {
+        let mut body = vec![0x92];
+        body.extend_from_slice(b"Opus");
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_multichannel_config_round_trip() {
+        let mut body = vec![0x94];
+        body.extend_from_slice(b"Opus");
+        body.push(0x01);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_rejects_multitrack_emission() {
+        // Multitrack emission is deferred (the parser doesn't surface
+        // the inner AudioPacketType, so faithful inversion needs a
+        // model field). Until then the writer must refuse rather than
+        // silently produce wrong bytes.
+        let h = ExAudioTagHeader {
+            packet_type: ExAudioPacketType::Multitrack,
+            fourcc: Some(FOURCC_OPUS),
+            multitrack: Some(AvMultitrackType::OneTrack),
+            timestamp_offset_nano: 0,
+            mod_ex_entries: Vec::new(),
+            bytes_consumed: 0,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(h.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn to_bytes_rejects_modex_emission() {
+        let h = ExAudioTagHeader {
+            packet_type: ExAudioPacketType::CodedFrames,
+            fourcc: Some(FOURCC_OPUS),
+            multitrack: None,
+            timestamp_offset_nano: 0,
+            mod_ex_entries: vec![ModExEntry {
+                subtype_raw: 0,
+                payload: crate::mod_ex::ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+                raw: vec![0, 0, 0x64],
+            }],
+            bytes_consumed: 0,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(h.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn to_bytes_rejects_missing_fourcc_single_track() {
+        let h = ExAudioTagHeader {
+            packet_type: ExAudioPacketType::CodedFrames,
+            fourcc: None,
+            multitrack: None,
+            timestamp_offset_nano: 0,
+            mod_ex_entries: Vec::new(),
+            bytes_consumed: 0,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(h.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn audio_packet_type_round_trips_through_to_u8() {
+        for v in 0u8..16 {
+            assert_eq!(ExAudioPacketType::from_u8(v).to_u8(), v);
+        }
     }
 }

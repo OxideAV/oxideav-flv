@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced-RTMP v1 ExVideo / ExAudio muxer slice (Veovera
+  enhanced-rtmp-v1 §"Defining Additional Video Codecs" + enhanced-rtmp-v2
+  §"Enhanced Video" / §"Enhanced Audio"). The FourCc-mode wire format
+  now round-trips through writer → demuxer for every spec-defined codec:
+  - `ExVideoTagHeader::to_bytes` / `ExAudioTagHeader::to_bytes` —
+    wire-byte inverses of the existing `parse` constructors, sharing
+    one encoding source of truth with the demuxer. ExVideo supports
+    single-track + multitrack (`OneTrack` / `ManyTracks` /
+    `ManyTracksManyCodecs`) including the SI24
+    `CompositionTimeOffset` slot for HEVC / VVC / AVC `CodedFrames`
+    and the trailing `VideoCommand` UI8 for FrameType=5 (Command)
+    non-Metadata. ExAudio covers single-track for this slice.
+    Multitrack on the audio side is deferred until the parser
+    surfaces the inner `AudioPacketType` (today only the outer
+    Multitrack marker survives). ModEx prefix emission is deferred
+    on both sides — `to_bytes` returns `Error::InvalidData` rather
+    than emit incorrect bytes.
+  - `ExFrameType::to_u8` / `ExPacketType::to_u8` /
+    `ExAudioPacketType::to_u8` / `AvMultitrackType::to_u8` — inverses
+    of the existing `from_u8` constructors so the writer and the
+    parser share one nibble-encoding source of truth.
+  - `tag::write_ex_video_tag(w, ts_ms, &ExVideoTagHeader, payload)`
+    and `tag::write_ex_audio_tag(w, ts_ms, &ExAudioTagHeader, payload)`
+    — generic ExHeader-then-payload writers.
+  - Per-codec convenience writers covering every Enhanced-RTMP
+    FourCc the demuxer accepts:
+    - Video: `write_av1_sequence_start`,
+      `write_av1_coded_frames`, `write_vp9_sequence_start`,
+      `write_vp9_coded_frames`, `write_hevc_sequence_start`,
+      `write_hevc_coded_frames` (with SI24 CTO),
+      `write_hevc_coded_frames_x` (implicit zero CTO),
+      `write_vvc_sequence_start`, `write_vvc_coded_frames`,
+      `write_ex_video_sequence_end`, `write_ex_video_metadata`
+      (HDR `colorInfo` AMF blob).
+    - Audio: `write_opus_sequence_start`, `write_opus_coded_frames`,
+      `write_flac_sequence_start`, `write_flac_coded_frames`,
+      `write_ac3_coded_frames`, `write_eac3_coded_frames`,
+      `write_mp3_ex_coded_frames` (FourCc `.mp3` path; distinct from
+      the legacy `SoundFormat=2` writer), `write_aac_ex_sequence_start`
+      / `write_aac_ex_coded_frames` (FourCc `mp4a` path),
+      `write_ex_audio_sequence_end`.
+  - `tests/roundtrip_muxer.rs` — 14 new tests assert the writer →
+    demuxer round-trip for `av1` / `vp9` / `h265` (CodedFrames +
+    CodedFramesX) / `h266` / `opus` / `flac` / `ac3` / `eac3` /
+    `aac` / `mp3` (FourCc) plus `Metadata` (header+discard) and
+    `SequenceEnd` (empty body). Each test asserts the demuxer's
+    `params.codec_id` resolves to the canonical short id and that
+    `SequenceStart` config records land in `params.extradata`
+    verbatim. HEVC `CodedFrames` validates the SI24 CTO carries
+    positive + zero + negative composition-time offsets through to
+    `pts = dts + CTO`.
+  - Unit `to_bytes` tests in `src/ex_video.rs` + `src/ex_audio.rs`
+    cover the "parse → emit → re-parse" path for every header
+    combination supported by this slice and assert byte-for-byte
+    equality on the canonical wire shapes (lead byte + FourCc +
+    optional CTO + optional VideoCommand). Negative tests cover
+    every spec-invalid combination the writer must reject
+    (out-of-range CTO, missing CTO, CTO on non-HEVC codec,
+    missing FourCc, mismatched multitrack codec slot, ModEx
+    emission with a non-empty `mod_ex_entries`).
+
 - Legacy video tag muxer slice (spec §E.4.3 / §E.4.3.1). The audio-only
   first muxer slice now extends to H.263 / VP6 / VP6A / AVC video, so a
   full audio+video FLV writes through the same writer family and the

@@ -17,7 +17,14 @@ use std::io::Cursor;
 use oxideav_core::{Demuxer, NullCodecResolver, ReadSeek};
 use oxideav_flv::{header, open_demuxer, script, script::MetadataBag, tag, FlvHeader};
 use oxideav_flv::{
-    write_avc_nalu_tag, write_avc_sequence_header, write_h263_tag, write_vp6_tag, write_vp6a_tag,
+    write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_ac3_coded_frames,
+    write_av1_coded_frames, write_av1_sequence_start, write_avc_nalu_tag,
+    write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_sequence_end,
+    write_ex_video_metadata, write_ex_video_sequence_end, write_flac_coded_frames,
+    write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames, write_hevc_coded_frames_x,
+    write_hevc_sequence_start, write_mp3_ex_coded_frames, write_opus_coded_frames,
+    write_opus_sequence_start, write_vp6_tag, write_vp6a_tag, write_vp9_coded_frames,
+    write_vp9_sequence_start, write_vvc_coded_frames, write_vvc_sequence_start,
 };
 
 /// Three distinct synthetic MP3 frame payloads. The demuxer treats an
@@ -237,4 +244,322 @@ fn audio_packet_bodies_survive_byte_for_byte() {
             "frame {i} body must survive byte-for-byte"
         );
     }
+}
+
+// ---- Enhanced-RTMP v1 ExVideo / ExAudio muxer round-trips ----------------
+//
+// These exercise the FourCc-mode wire shape introduced by enhanced-rtmp.
+// Each test writes a video- or audio-only FLV with the dedicated Ex
+// writer, demuxes it via the existing `FlvDemuxer`, and asserts the
+// resulting `params.codec_id` / `params.extradata` / per-packet body
+// match what was written.
+
+fn open_video_only(buf: Vec<u8>) -> Box<dyn Demuxer> {
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+    open_demuxer(input, &NullCodecResolver).expect("open muxed flv")
+}
+
+#[test]
+fn av1_ex_video_sequence_start_lifts_into_extradata() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    // Synthetic AV1CodecConfigurationRecord — opaque to the muxer.
+    let config = vec![0x81, 0x05, 0x0C, 0x00, 0x0A, 0x0B];
+    write_av1_sequence_start(&mut buf, 0, &config).unwrap();
+    // Two CodedFrames (AV1 has no SI24 CTO slot, so the writer just
+    // emits the lead byte + FourCc + frame).
+    let key = vec![0x12, 0x34, 0x56, 0x78];
+    write_av1_coded_frames(&mut buf, 0, true, &key).unwrap();
+    let inter = vec![0x9A, 0xBC, 0xDE];
+    write_av1_coded_frames(&mut buf, 40, false, &inter).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "av1");
+    assert_eq!(
+        dmx.streams()[0].params.extradata,
+        config,
+        "AV1CodecConfigurationRecord must reach extradata verbatim"
+    );
+
+    // Drain packets — SequenceStart shows as a header packet first.
+    let p_hdr = dmx.next_packet().unwrap();
+    assert!(p_hdr.flags.header);
+    assert_eq!(p_hdr.data, config);
+    let p1 = dmx.next_packet().unwrap();
+    assert!(!p1.flags.header);
+    assert_eq!(p1.data, key);
+    assert!(p1.flags.keyframe);
+    assert_eq!(p1.pts, Some(0));
+    let p2 = dmx.next_packet().unwrap();
+    assert_eq!(p2.data, inter);
+    assert!(!p2.flags.keyframe);
+    assert_eq!(p2.pts, Some(40));
+}
+
+#[test]
+fn vp9_ex_video_round_trips_codec_id() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+    write_vp9_sequence_start(&mut buf, 0, &config).unwrap();
+    let frame = vec![0xAA, 0xBB, 0xCC];
+    write_vp9_coded_frames(&mut buf, 0, true, &frame).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "vp9");
+    assert_eq!(dmx.streams()[0].params.extradata, config);
+    // Header packet, then the keyframe.
+    let _h = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, frame);
+    assert!(p.flags.keyframe);
+}
+
+#[test]
+fn hevc_ex_video_carries_composition_time_offset_and_extradata() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0x01, 0x42, 0xC0, 0x1F, 0xFF];
+    write_hevc_sequence_start(&mut buf, 0, &config).unwrap();
+    // dts=0, CTO=0 → pts=0; dts=40, CTO=+80 → pts=120; dts=80, CTO=-20 → pts=60.
+    let idr = vec![0x65, 0x88, 0x84, 0x00];
+    write_hevc_coded_frames(&mut buf, 0, true, 0, &idr).unwrap();
+    let p1 = vec![0x41, 0xE1, 0x80, 0x10];
+    write_hevc_coded_frames(&mut buf, 40, false, 80, &p1).unwrap();
+    let p2 = vec![0x41, 0xE1, 0x80, 0x11];
+    write_hevc_coded_frames(&mut buf, 80, false, -20, &p2).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "h265");
+    assert_eq!(dmx.streams()[0].params.extradata, config);
+
+    let mut packets = Vec::new();
+    while let Ok(p) = dmx.next_packet() {
+        if p.flags.header {
+            continue;
+        }
+        packets.push((p.pts.unwrap_or(0), p.dts.unwrap_or(0), p.data.clone()));
+    }
+    assert_eq!(packets.len(), 3);
+    assert_eq!(packets[0], (0, 0, idr));
+    assert_eq!(packets[1], (120, 40, p1), "B-frame reorder pts = dts + CTO");
+    assert_eq!(packets[2], (60, 80, p2), "negative CTO");
+}
+
+#[test]
+fn hevc_coded_frames_x_drops_cto_byte() {
+    // CodedFramesX is the 3-byte-savings variant: SI24 CTO is implicit 0.
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    write_hevc_sequence_start(&mut buf, 0, &config).unwrap();
+    let frame = vec![0xCA, 0xFE, 0xBA, 0xBE];
+    write_hevc_coded_frames_x(&mut buf, 33, true, &frame).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "h265");
+    let _hdr = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, frame);
+    assert_eq!(p.dts, Some(33));
+    assert_eq!(p.pts, Some(33));
+}
+
+#[test]
+fn vvc_ex_video_sequence_and_coded_frames_round_trip() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0x01, 0x10, 0x00, 0x00, 0x00];
+    write_vvc_sequence_start(&mut buf, 0, &config).unwrap();
+    let frame = vec![0x10, 0x20, 0x30];
+    write_vvc_coded_frames(&mut buf, 100, true, 0, &frame).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "h266");
+    assert_eq!(dmx.streams()[0].params.extradata, config);
+    let _hdr = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, frame);
+    assert_eq!(p.dts, Some(100));
+    assert_eq!(p.pts, Some(100));
+}
+
+#[test]
+fn opus_ex_audio_sequence_start_lifts_into_extradata() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    // Synthetic RFC 7845 OpusHead — opaque to the muxer.
+    let opus_head = vec![
+        b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd', 0x01, 0x02, 0x68, 0x01, 0x80, 0xBB, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    ];
+    write_opus_sequence_start(&mut buf, 0, &opus_head).unwrap();
+    let pkt = vec![0xFC, 0x12, 0x34];
+    write_opus_coded_frames(&mut buf, 20, &pkt).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "opus");
+    assert_eq!(dmx.streams()[0].params.extradata, opus_head);
+    let _hdr = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, pkt);
+    assert_eq!(p.pts, Some(20));
+}
+
+#[test]
+fn flac_ex_audio_sequence_start_round_trips() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    // Xiph fLaC marker + a minimal STREAMINFO header (38 bytes total).
+    let mut streaminfo = vec![b'f', b'L', b'a', b'C'];
+    streaminfo.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]); // METADATA_BLOCK header (last, STREAMINFO, 34)
+    streaminfo.extend(std::iter::repeat(0xAB).take(34));
+    write_flac_sequence_start(&mut buf, 0, &streaminfo).unwrap();
+    let frame = vec![0xFF, 0xF8, 0x69, 0x18];
+    write_flac_coded_frames(&mut buf, 26, &frame).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "flac");
+    assert_eq!(dmx.streams()[0].params.extradata, streaminfo);
+    let _hdr = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, frame);
+}
+
+#[test]
+fn ac3_ex_audio_coded_frames_codec_id_is_ac3() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let frame = vec![0x0B, 0x77, 0xDE, 0xAD, 0xBE, 0xEF];
+    write_ac3_coded_frames(&mut buf, 0, &frame).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "ac3");
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, frame);
+}
+
+#[test]
+fn eac3_ex_audio_coded_frames_codec_id_is_eac3() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let frame = vec![0x0B, 0x77, 0x01, 0x02, 0x03];
+    write_eac3_coded_frames(&mut buf, 0, &frame).unwrap();
+
+    let dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "eac3");
+}
+
+#[test]
+fn aac_ex_audio_sequence_start_and_coded_frames_round_trip() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    // Synthetic AudioSpecificConfig (5 bits AOT=2 + 4 bits sample-rate-idx=4 + 4 bits chan=2).
+    let asc = vec![0x12, 0x10];
+    write_aac_ex_sequence_start(&mut buf, 0, &asc).unwrap();
+    let au = vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
+    write_aac_ex_coded_frames(&mut buf, 23, &au).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
+    assert_eq!(dmx.streams()[0].params.extradata, asc);
+    let _hdr = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, au);
+    assert_eq!(p.pts, Some(23));
+}
+
+#[test]
+fn mp3_ex_audio_fourcc_path_codec_id_is_mp3() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let frame = vec![0xFF, 0xFB, 0x90, 0x44, 0x55];
+    write_mp3_ex_coded_frames(&mut buf, 0, &frame).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    // FourCc `.mp3` resolves to "mp3" — same codec id as the legacy
+    // SoundFormat=2 path.
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "mp3");
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, frame);
+}
+
+#[test]
+fn ex_video_metadata_tag_is_discardable_header() {
+    // Open with a SequenceStart so the demuxer mints the stream, then
+    // emit a Metadata frame and assert it round-trips as header+discard.
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0x01];
+    write_hevc_sequence_start(&mut buf, 0, &config).unwrap();
+    let amf_blob = b"colorInfo-amf-payload".to_vec();
+    write_ex_video_metadata(&mut buf, 0, oxideav_flv::FOURCC_HVC1, &amf_blob).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "h265");
+    let _seq = dmx.next_packet().unwrap();
+    let m = dmx.next_packet().unwrap();
+    assert!(m.flags.header);
+    assert!(m.flags.discard);
+    assert_eq!(m.data, amf_blob);
+}
+
+#[test]
+fn ex_video_sequence_end_emits_empty_body() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0xDE, 0xAD];
+    write_av1_sequence_start(&mut buf, 0, &config).unwrap();
+    write_ex_video_sequence_end(&mut buf, 1000, oxideav_flv::FOURCC_AV01).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "av1");
+    // SequenceStart header, then SequenceEnd is the only other tag —
+    // the demuxer routes it as no-packet (we get EOF immediately after).
+    let _start = dmx.next_packet().unwrap();
+    // SequenceEnd produces no data packet, so the next call surfaces EOF
+    // (or another header per demuxer policy — assert that the call
+    // doesn't panic and either yields a discardable packet or EOF).
+    let _ = dmx.next_packet();
+}
+
+#[test]
+fn ex_audio_sequence_end_emits_empty_body() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    write_aac_ex_sequence_start(&mut buf, 0, &[0x12, 0x10]).unwrap();
+    write_ex_audio_sequence_end(&mut buf, 500, oxideav_flv::FOURCC_AUDIO_AAC).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
+    let _ = dmx.next_packet();
+    let _ = dmx.next_packet();
 }

@@ -77,6 +77,18 @@ impl AvMultitrackType {
         }
     }
 
+    /// 4-bit wire value (the high nibble of the multitrack header byte
+    /// per enhanced-rtmp-v2 §`ExVideoTagHeader` / §`ExAudioTagHeader`).
+    /// Inverse of [`Self::from_u8`]. `Reserved(n)` is masked to 4 bits.
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::OneTrack => 0,
+            Self::ManyTracks => 1,
+            Self::ManyTracksManyCodecs => 2,
+            Self::Reserved(n) => n & 0x0F,
+        }
+    }
+
     /// `true` for `OneTrack` — the degenerate mode with no per-track
     /// `sizeOfTrack` field.
     pub fn is_one_track(self) -> bool {
