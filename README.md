@@ -286,12 +286,25 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | Ex-audio sequence end | `tag::write_ex_audio_sequence_end` | enhanced-rtmp v2 |
 | AMF0 writers | `amf0::{write_number, write_boolean, write_string, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 |
 | `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |
+| `onMetaData.keyframes` seek-table composite | `MetadataBag::keyframes(file_positions, times_seconds)` + AMF0 `write_strict_array_number` | §E.4.4.7 / §E.4.4.9 |
 
 `write_tag` returns the total bytes written (`11 + body.len() + 4`) and
 emits the trailing `PreviousTagSize = 11 + DataSize` back-pointer.
 `MetadataBag` is an ordered bag of the three AMF0 scalar property types
-(Number / Boolean / String); insertion order is preserved on the wire so
-the output is deterministic.
+(Number / Boolean / String) plus the `keyframes` seek-table composite
+(`MetaValue::Keyframes { file_positions: Vec<u64>, times_seconds:
+Vec<f64> }`, emitted as an anonymous AMF0 Object carrying two parallel
+SCRIPTDATASTRICTARRAY properties `filepositions` and `times`); insertion
+order is preserved on the wire so the output is deterministic. The
+`keyframes` writer validates the toc invariants the demuxer enforces on
+the read side (non-empty, parallel-length, ascending finite `times`,
+`filepositions` ≤ `2^53` so they survive the AMF0 Number round-trip)
+and round-trips through `FlvDemuxer::seek_to` via the O(log n) bisect
+path rather than the scan-forward fallback. Producers that need
+correct offsets in the toc typically reserve a fixed-size `onMetaData`
+slot up front, mux the body to learn the keyframe positions, and
+rewrite the slot in-place with the populated toc — the writer is
+agnostic of that strategy.
 
 The video tag writers all share the same `VideoTagHeader` / `FrameType`
 model the demuxer uses; `write_avc_nalu_tag` packs `pts - dts` as the
@@ -335,10 +348,10 @@ tag::write_mp3_tag(&mut flv, 0, 3, true, true, &mp3_frame)?;
 # Ok::<(), oxideav_core::Error>(())
 ```
 
-Still out of scope (followups): the `keyframes` seek-table writer, the
-ExAudio multitrack emit path (waiting on the parser to surface the inner
-`AudioPacketType`), and ExVideo / ExAudio ModEx prefix emission
-(`TimestampOffsetNano` and reserved-subtype passthrough).
+Still out of scope (followups): the ExAudio multitrack emit path
+(waiting on the parser to surface the inner `AudioPacketType`), and
+ExVideo / ExAudio ModEx prefix emission (`TimestampOffsetNano` and
+reserved-subtype passthrough).
 
 ## Quick use
 

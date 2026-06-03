@@ -563,3 +563,166 @@ fn ex_audio_sequence_end_emits_empty_body() {
     let _ = dmx.next_packet();
     let _ = dmx.next_packet();
 }
+
+// ---- onMetaData.keyframes seek-table writer round-trip ------------------
+//
+// Builds an FLV with the `keyframes` toc populated up-front so the
+// muxer → demuxer round-trip exercises the same O(log n) bisect path
+// that the legacy `tests/seek.rs` fixture file (cooked by `ffmpeg
+// -flvflags add_keyframe_index`) covers. Two strategies are used:
+//
+// 1. **Two-pass mux**: serialise the metadata tag once with the planned
+//    toc to learn its on-wire size, then mux the file with the actual
+//    keyframe offsets known up-front. The metadata bag values (and
+//    therefore the tag size) are unchanged between passes because the
+//    `filepositions[]` slots are sized as fixed AMF0 Numbers; the only
+//    thing that varies between pass 1 and pass 2 is the *numeric value*
+//    of each filepositions entry, which is irrelevant to the wire size.
+// 2. The video stream is three H.263 (`flv1`) frames at 40 ms each;
+//    every frame is marked as a keyframe so the toc references known
+//    offsets and the demuxer's `seek_to` lands on a frame whose body
+//    we can match against the muxer's input.
+
+fn h263_keyframe(byte_marker: u8) -> Vec<u8> {
+    // Synthetic body — opaque to the muxer. The first 4 bytes
+    // resemble an H.263 PSC so the bytes look plausible; the marker
+    // byte at the end disambiguates per-frame so the demuxer-side
+    // assertion can distinguish them.
+    vec![0x00, 0x00, 0x84, 0x00, byte_marker, 0xFF, 0xEE]
+}
+
+/// Produce an FLV byte buffer with three video keyframes at t=0/40/80
+/// ms and an `onMetaData` script tag at the head carrying a populated
+/// `keyframes` seek-table that points at each of the three video
+/// tags. Returns the buffer plus the three frame bodies (in mux
+/// order).
+fn build_h263_flv_with_keyframes_toc() -> (Vec<u8>, Vec<Vec<u8>>) {
+    let frames = vec![
+        h263_keyframe(0xA0),
+        h263_keyframe(0xA1),
+        h263_keyframe(0xA2),
+    ];
+    let times = vec![0.0, 0.040, 0.080];
+
+    // Pass 1 — serialise the metadata tag with placeholder offsets to
+    // learn the byte size of the header + first-previous-tag-size +
+    // metadata-tag prefix. The toc's payload shape is independent of
+    // the actual offset values (every entry is a fixed-size AMF0
+    // Number), so the placeholder run produces a byte-exact size for
+    // the real run.
+    let placeholders: Vec<u64> = vec![0, 0, 0];
+    let bag_probe = MetadataBag::new()
+        .number("duration", 0.08)
+        .keyframes(placeholders, times.clone());
+    let mut probe = Vec::new();
+    header::write(&mut probe, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut probe).unwrap();
+    script::write_on_metadata(&mut probe, &bag_probe).unwrap();
+    let first_video_tag_offset = probe.len() as u64;
+
+    // Each subsequent video tag occupies 11 (tag header) + body + 4
+    // (trailing PreviousTagSize) bytes, and `write_h263_tag` prefixes
+    // exactly 1 byte (`FrameType | CodecID`) to the body before the
+    // VIDEODATA payload.
+    let video_tag_size = |body_len: usize| 11 + 1 + body_len as u64 + 4;
+    let file_positions: Vec<u64> = {
+        let mut acc = first_video_tag_offset;
+        let mut out = Vec::with_capacity(frames.len());
+        for f in &frames {
+            out.push(acc);
+            acc += video_tag_size(f.len());
+        }
+        out
+    };
+
+    // Pass 2 — re-emit with the real offsets.
+    let bag = MetadataBag::new()
+        .number("duration", 0.08)
+        .keyframes(file_positions.clone(), times);
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+    // Sanity: the pass-1 byte-size prediction must hold.
+    assert_eq!(buf.len() as u64, first_video_tag_offset);
+
+    // Emit the three keyframes; assert each lands at the offset the
+    // toc claims.
+    for (i, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            buf.len() as u64,
+            file_positions[i],
+            "video tag {i} must land at the toc's claimed offset"
+        );
+        write_h263_tag(&mut buf, (i as u32) * 40, true, frame).unwrap();
+    }
+    (buf, frames)
+}
+
+#[test]
+fn keyframes_toc_round_trips_through_demuxer_metadata() {
+    let (bytes, _) = build_h263_flv_with_keyframes_toc();
+    let dmx = open(bytes);
+    // The demuxer exposes onMetaData scalar fields via metadata(); the
+    // `keyframes` composite is consumed internally and surfaces via
+    // the seek path rather than the metadata bag (no
+    // `metadata["keyframes"]` entry — that's a deliberate sink rather
+    // than a flatten). We assert the scalar property still parses
+    // through alongside the toc.
+    let md = dmx.metadata();
+    let lookup = |k: &str| md.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+    assert!(
+        lookup("duration").is_some(),
+        "duration must coexist with the keyframes composite"
+    );
+    // No flatten under "keyframes" — the demuxer parses it into the
+    // internal seek-table, not the metadata bag.
+    assert!(
+        md.iter().all(|(k, _)| k != "keyframes"
+            && !k.starts_with("keyframes.")
+            && !k.starts_with("filepositions")
+            && !k.starts_with("times")),
+        "keyframes composite must not leak into the metadata flatten path: \
+         {md:?}"
+    );
+}
+
+#[test]
+fn keyframes_toc_drives_seek_by_pts_bisect_path() {
+    let (bytes, frames) = build_h263_flv_with_keyframes_toc();
+    let mut dmx = open(bytes);
+    // Stream 1 is the video stream (audio absent in this synthetic FLV).
+    let stream_index = dmx
+        .streams()
+        .iter()
+        .position(|s| s.params.codec_id.as_str() == "flv1")
+        .expect("h263 stream must register") as u32;
+
+    // Seek to t=40 ms — the toc has an exact entry there, so the
+    // bisect-left lands on it and the next packet is the second
+    // keyframe (body `frames[1]`).
+    let landed = dmx.seek_to(stream_index, 40).expect("seek to 40 ms");
+    assert!(
+        landed <= 40,
+        "bisect-left toc-seek must land at or before target (landed at {landed})"
+    );
+    let p = dmx.next_packet().expect("packet after seek-to-40 ms");
+    assert!(p.flags.keyframe, "toc entries are video keyframes");
+    assert_eq!(
+        p.data, frames[1],
+        "seek-to-40 ms must surface frame index 1"
+    );
+
+    // Seek to t=70 ms — bisect-left lands at the t=40 ms entry (the
+    // largest toc entry ≤ target), so the next packet is again
+    // frames[1] (the second keyframe). This confirms the toc bisect
+    // is being walked rather than a scan-forward (a scan would land
+    // at the next keyframe ≥ 70 ms, i.e. frames[2]).
+    let landed = dmx.seek_to(stream_index, 70).expect("seek to 70 ms");
+    assert!(landed <= 70);
+    let p = dmx.next_packet().expect("packet after seek-to-70 ms");
+    assert_eq!(
+        p.data, frames[1],
+        "70 ms must bisect-left to the 40 ms entry, not scan forward to 80 ms"
+    );
+}

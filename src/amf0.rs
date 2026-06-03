@@ -359,6 +359,28 @@ pub fn write_object_end<W: Write + ?Sized>(w: &mut W) -> Result<()> {
     Ok(())
 }
 
+/// Write an AMF0 Strict-array value of Numbers — marker `0x0A`,
+/// UI32 BE `StrictArrayLength`, then `len(values)` Number values each
+/// emitted with the standard Number marker (spec §E.4.4.9
+/// SCRIPTDATASTRICTARRAY + §E.4.4.2 type 10 + Number §2.2). No
+/// terminator follows the list per the spec. Convenience helper for
+/// the `onMetaData.keyframes` toc, whose `filepositions[]` and
+/// `times[]` are both StrictArrays of Numbers.
+pub fn write_strict_array_number<W: Write + ?Sized>(w: &mut W, values: &[f64]) -> Result<()> {
+    if values.len() > u32::MAX as usize {
+        return Err(Error::invalid(format!(
+            "AMF0: strict-array length {} exceeds UI32 max",
+            values.len()
+        )));
+    }
+    w.write_all(&[0x0A])?;
+    w.write_all(&(values.len() as u32).to_be_bytes())?;
+    for n in values {
+        write_number(w, *n)?;
+    }
+    Ok(())
+}
+
 /// Shared helper: UI16 BE length + UTF-8 bytes.
 fn write_utf8_u16<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
     let bytes = s.as_bytes();

@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `onMetaData.keyframes` seek-table writer (spec §E.4.4 / §E.4.4.7 /
+  §E.4.4.9). The legacy muxer slice's `MetadataBag` only modelled the
+  three AMF0 scalar property types (Number / Boolean / String), so a
+  muxer could not emit the parallel `filepositions[]` / `times[]` toc
+  the demuxer harvests for the O(log n) bisect-seek path; producers
+  using the writer had to fall through to the scan-forward seek path.
+  Now:
+  - New `MetaValue::Keyframes { file_positions: Vec<u64>,
+    times_seconds: Vec<f64> }` variant + a `MetadataBag::keyframes`
+    builder. The wire layout matches what `FlvDemuxer` parses on the
+    read side: an anonymous AMF0 Object (`0x03`) keyed
+    `"keyframes"`, carrying two parallel SCRIPTDATASTRICTARRAY
+    (`0x0A`) properties in the spec-conventional order
+    `filepositions` then `times`, terminated by the AMF0 object-end
+    `0x00 0x00 0x09`.
+  - New `amf0::write_strict_array_number` AMF0 primitive (marker
+    `0x0A` + UI32 BE `StrictArrayLength` + N Number values, per
+    §E.4.4.9). No terminating record follows the list.
+  - Validation matches the demuxer's read-side invariants: both
+    arrays non-empty and equal length, `times` finite and sorted
+    ascending (non-decreasing — duplicate millisecond timestamps are
+    legal when two keyframes share a ms), `filepositions` ≤ `2^53`
+    so they survive the AMF0 Number lossless-integer round-trip.
+    Violations error with `Error::InvalidData` rather than emitting
+    a quietly-malformed toc.
+  - `tests/roundtrip_muxer.rs` — two new integration tests build a
+    three-keyframe H.263 FLV with the toc populated up front (via a
+    two-pass mux that learns the metadata tag size, then computes
+    the keyframe offsets, then re-emits the metadata tag with the
+    real offsets) and assert: (a) the demuxer parses the composite
+    silently into its internal seek table (no flatten leakage under
+    `metadata["keyframes.…"]`); (b) `Demuxer::seek_to(40)` /
+    `seek_to(70)` walk the bisect-left path — 40 ms lands on the
+    exact entry, 70 ms bisects-left to the 40 ms entry rather than
+    scan-forwarding to 80 ms. Seven new unit tests in
+    `src/script.rs` cover the AMF0 wire round-trip through
+    `parse_amf0_value`, length-mismatch / empty-array /
+    non-monotonic-times / non-finite-time / above-2^53-position
+    rejection, the equal-timestamp acceptance case, and the exact
+    `2^53` boundary acceptance.
+
 - Enhanced-RTMP v1 ExVideo / ExAudio muxer slice (Veovera
   enhanced-rtmp-v1 §"Defining Additional Video Codecs" + enhanced-rtmp-v2
   §"Enhanced Video" / §"Enhanced Audio"). The FourCc-mode wire format
