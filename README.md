@@ -327,9 +327,19 @@ nibble; `write_hevc_coded_frames` emits the SI24
 `HEVCDecoderConfigurationRecord`, Opus RFC 7845 OpusHead, FLAC
 STREAMINFO, AAC `AudioSpecificConfig`) reach `params.extradata`
 verbatim. Multitrack emission is supported on the video side
-(`OneTrack` / `ManyTracks` / `ManyTracksManyCodecs`); ExAudio
-multitrack and ModEx prefix emission are deferred — the writer
-returns `Error::InvalidData` rather than emit incorrect bytes.
+(`OneTrack` / `ManyTracks` / `ManyTracksManyCodecs`). ModEx prefix
+emission is supported on both the audio and video sides via the
+shared `mod_ex::emit` writer: the lead byte's low nibble flips to `7`
+(ModEx), each `mod_ex_entries[i]` lays down a size prefix + raw
+payload + trailer (`subtype << 4 | next_packet_type`), and the last
+entry's trailer carries the resolved `packet_type` — `walk ∘ emit`
+recovers the same entries + accumulator (`TimestampOffsetNano` sums
+match between writer and parser). Per-entry validation matches the
+parser's invariants (raw size in `1..=65_536`, `TimestampOffsetNano`
+raw `>= 3` bytes with UI24 BE matching `offset_ns`, `offset_ns
+<= 999_999`). ExAudio multitrack emission is still deferred — the
+writer returns `Error::InvalidData` rather than emit incorrect
+bytes.
 
 ```rust
 use oxideav_flv::{header, script, script::MetadataBag, tag};
@@ -349,9 +359,7 @@ tag::write_mp3_tag(&mut flv, 0, 3, true, true, &mp3_frame)?;
 ```
 
 Still out of scope (followups): the ExAudio multitrack emit path
-(waiting on the parser to surface the inner `AudioPacketType`), and
-ExVideo / ExAudio ModEx prefix emission (`TimestampOffsetNano` and
-reserved-subtype passthrough).
+(waiting on the parser to surface the inner `AudioPacketType`).
 
 ## Quick use
 

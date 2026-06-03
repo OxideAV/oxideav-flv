@@ -9,6 +9,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ExVideo / ExAudio ModEx prefix emission (Veovera `enhanced-rtmp-v2`
+  §`ExVideoTagHeader` / §`ExAudioTagHeader`, while
+  `packet_type == ModEx = 7`). The muxer slice landed last round with
+  `mod_ex_entries` required to be empty on emit (`Error::InvalidData`)
+  because the inverse-emission step had no canonical-ordering source of
+  truth. Now both `ExVideoTagHeader::to_bytes` and
+  `ExAudioTagHeader::to_bytes` route through a shared
+  `crate::mod_ex::emit` writer that walks the entries in order, lays
+  down each entry's size prefix + raw payload + trailer byte
+  (`(subtype_raw & 0x0F) << 4 | next_packet_type & 0x0F`), and chains
+  the next-packet-type as `7` (ModEx) on every non-final entry so the
+  parser's `walk` keeps looping. The final entry carries the resolved
+  `packet_type` in its trailer's low nibble, so the parser exits with
+  the same value the writer started with.
+
+  - **Lead byte.** When `mod_ex_entries.is_empty()` the lead byte's
+    low nibble is the resolved packet type (existing path). When
+    non-empty, the low nibble is the ModEx sentinel `7`; the resolved
+    type rides on the last trailer instead. Symmetric with how the
+    parser reads the lead byte then immediately invokes `walk`.
+  - **Multitrack interaction.** On the video side, when `multitrack`
+    is `Some`, the resolved packet type in the trailer is
+    `ExPacketType::Multitrack`. The parser's read-then-walk-then-
+    multitrack-header flow is preserved; the multitrack outer header
+    follows the ModEx chain just as it does in the no-ModEx case.
+  - **Size encoding.** `encode_size` writes the spec's UI8 path for
+    payloads of 1..=255 bytes (UI8 byte = `size - 1`, range 0..=0xFE)
+    and the UI16 escape for 256..=65_536 (sentinel `0xFF` followed by
+    UI16 BE `(size - 1)`). Sizes outside `1..=65_536` are rejected
+    with `Error::InvalidData`. Sentinel-collision corner: payload
+    length 256 cannot be expressed with a literal UI8 (would write
+    `0xFF` → escape), so the boundary is strictly `<= 255` on the UI8
+    side. The existing decoder test helper (`encode_one`) was off by
+    one at this boundary and now matches the spec.
+  - **Per-entry validation.** `mod_ex::emit` enforces the parser's
+    invariants on every entry so internally-inconsistent headers are
+    caught at emit time rather than producing wrong bytes:
+    `subtype_raw` MUST fit in UB[4]; `TimestampOffsetNano` payloads
+    MUST be `>= 3` bytes; the raw `[0..3]` UI24 BE MUST equal the
+    typed `offset_ns`; `offset_ns <= 999_999` ns (spec cap); subtype
+    `0` MUST go with the `TimestampOffsetNano` payload variant.
+    Reserved-subtype payloads are passed through opaquely (the
+    producer's bytes survive a round-trip even when neither the
+    writer nor the reader know the subtype's semantics).
+  - **`final_packet_type` contract.** `emit::<7>` rejects
+    `final_packet_type == 7` (the caller's job is to aggregate every
+    ModEx packet into the entries vector before invoking emit; a
+    final ModEx-sentinel value would leave the parser hanging in the
+    walk loop with no trailing data). Also rejects values outside
+    UB[4].
+  - **Internal-consistency guard on the headers.**
+    `ExAudioTagHeader::to_bytes` and `ExVideoTagHeader::to_bytes`
+    refuse `mod_ex_entries.is_empty() && timestamp_offset_nano != 0`
+    — a non-zero accumulator with no entries is impossible to produce
+    via the parser path and would silently lose the offset on emit.
+  - 17 new unit tests (`src/mod_ex.rs`) cover the
+    `encode_size` UI8/UI16 boundary cases, single-entry/two-entry
+    chains round-tripping through `walk`, the 256-byte payload UI16
+    path, reserved-subtype passthrough, the 999_999 ns boundary, and
+    every invalid-input rejection (zero / over-range size, empty
+    entries, out-of-nibble subtype, out-of-nibble final type,
+    final type == ModEx sentinel, mismatched raw UI24, over-cap
+    `offset_ns`, subtype-`TimestampOffsetNano` mismatch, short raw
+    payload). Two new audio-side and four new video-side unit tests
+    in `src/ex_audio.rs` / `src/ex_video.rs` cover the lead-byte
+    nibble, single-entry + chain emission, HEVC `CodedFrames` with
+    ModEx + SI24 CTO, multitrack-OneTrack with ModEx, and both
+    inconsistency-rejection paths. Three new `tests/roundtrip_muxer.rs`
+    integration tests build full FLVs through `write_ex_video_tag` /
+    `write_ex_audio_tag` with ModEx-bearing headers and assert the
+    demuxer recovers the resolved codec id, payload bytes, and pts
+    on the AV1 / AAC / reserved-subtype paths.
+
 - `onMetaData.keyframes` seek-table writer (spec §E.4.4 / §E.4.4.7 /
   §E.4.4.9). The legacy muxer slice's `MetadataBag` only modelled the
   three AMF0 scalar property types (Number / Boolean / String), so a

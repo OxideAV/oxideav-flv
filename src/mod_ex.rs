@@ -273,6 +273,144 @@ pub fn walk<const MODEX_PACKET_TYPE: u8>(
     Ok((cursor, packet_type_raw, entries, total_offset_ns))
 }
 
+/// Encode the size prefix for a single ModEx data blob.
+///
+/// Per spec the wire form is:
+///
+/// ```text
+///   modExDataSize = UI8 + 1                    // covers 1..255 directly
+///   if encoded UI8 byte == 0xFF:
+///     modExDataSize = UI16 + 1                 // covers 1..65536 via escape
+/// ```
+///
+/// A producer therefore picks the UI8 path for payloads of 1..=255
+/// bytes (UI8 byte 0..=0xFE → size 1..=255), and the UI16 escape for
+/// payloads of 256..=65_536 bytes (escape byte 0xFF followed by UI16 BE
+/// 0x00FF..=0xFFFF → size 256..=65_536). Payloads outside `1..=65_536`
+/// have no wire representation and are rejected with
+/// [`Error::InvalidData`].
+///
+/// Note: the inclusive UI8 boundary at 255 is the only correct choice —
+/// payload length 256 cannot be expressed as UI8 because `UI8 + 1 = 256`
+/// requires UI8 byte `0xFF`, which the decoder interprets as the
+/// escape sentinel rather than a literal 256.
+fn encode_size(out: &mut Vec<u8>, size: usize) -> Result<()> {
+    if size == 0 || size > 65_536 {
+        return Err(Error::invalid(
+            "FLV ModEx: modExData size must be in 1..=65_536",
+        ));
+    }
+    if size <= 255 {
+        out.push((size - 1) as u8);
+    } else {
+        // size in 256..=65_536 → escape sentinel + UI16 BE (size - 1).
+        out.push(0xFF);
+        let n16 = (size - 1) as u16;
+        out.extend_from_slice(&n16.to_be_bytes());
+    }
+    Ok(())
+}
+
+/// Emit a ModEx run as the prefix of an Ex audio / Ex video tag body.
+///
+/// `entries` is the in-order list of ModEx entries to chain (each
+/// becomes one iteration of the spec's `while packetType == ModEx`
+/// loop). `final_packet_type` is the low nibble of the trailer byte on
+/// the **last** entry — the `AudioPacketType` / `VideoPacketType` the
+/// outer parser must observe **after** the ModEx run finishes. Every
+/// non-final entry's trailer chains by writing `MODEX_PACKET_TYPE` as
+/// the next-packet-type so the parser keeps looping.
+///
+/// `MODEX_PACKET_TYPE` is `7` for both audio and video, matching
+/// [`walk`]. `final_packet_type` must not itself be the ModEx sentinel
+/// (the writer's contract is that the caller already aggregated every
+/// ModEx packet into `entries`); a `MODEX_PACKET_TYPE` final value is
+/// rejected with [`Error::InvalidData`].
+///
+/// Per-entry validation matches the parser's invariants in [`walk`]:
+///
+/// * `entries` MUST be non-empty (the caller should only invoke
+///   `emit` when emitting a ModEx prefix at all).
+/// * Each entry's `raw` size MUST be in 1..=65_536 (the wire size
+///   field range).
+/// * For `subtype_raw == 0` (`TimestampOffsetNano`), `raw` MUST be at
+///   least 3 bytes, AND the encoded UI24 BE in `raw[0..3]` MUST equal
+///   the typed payload's `offset_ns` (otherwise the entry is internally
+///   inconsistent — typical bug-detector for hand-constructed
+///   round-trips). The spec also caps `offset_ns` at 999_999 (one
+///   millisecond minus one nanosecond per-message); values outside
+///   `0..=999_999` are rejected.
+/// * `subtype_raw` MUST be in 0..=15 (the wire UB[4] range).
+///
+/// Round-tripping `walk` ∘ `emit` recovers the same entries +
+/// `total_offset_ns` accumulator, modulo the saturating-add behaviour
+/// `walk` applies to the running sum (which `emit` does not need to
+/// replicate — the spec already caps each entry at < 1 ms).
+pub fn emit<const MODEX_PACKET_TYPE: u8>(
+    out: &mut Vec<u8>,
+    entries: &[ModExEntry],
+    final_packet_type: u8,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Err(Error::invalid(
+            "FLV ModEx: emit called with no entries (use the lead byte directly)",
+        ));
+    }
+    if final_packet_type & 0x0F != final_packet_type {
+        return Err(Error::invalid(
+            "FLV ModEx: final_packet_type must fit in UB[4]",
+        ));
+    }
+    if final_packet_type == MODEX_PACKET_TYPE {
+        return Err(Error::invalid(
+            "FLV ModEx: final_packet_type cannot itself be the ModEx sentinel",
+        ));
+    }
+
+    let last_index = entries.len() - 1;
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.subtype_raw & 0x0F != entry.subtype_raw {
+            return Err(Error::invalid("FLV ModEx: subtype_raw must fit in UB[4]"));
+        }
+        // TimestampOffsetNano validation: payload >= 3 bytes, UI24 BE
+        // matches `offset_ns`, and offset_ns within spec bound.
+        if let ModExPayload::TimestampOffsetNano { offset_ns } = entry.payload {
+            if entry.raw.len() < 3 {
+                return Err(Error::invalid(
+                    "FLV ModEx: TimestampOffsetNano needs >= 3 bytes",
+                ));
+            }
+            if offset_ns > 999_999 {
+                return Err(Error::invalid(
+                    "FLV ModEx: TimestampOffsetNano offset_ns exceeds 999_999 ns",
+                ));
+            }
+            let raw_ui24 = ((entry.raw[0] as u32) << 16)
+                | ((entry.raw[1] as u32) << 8)
+                | (entry.raw[2] as u32);
+            if raw_ui24 != offset_ns {
+                return Err(Error::invalid(
+                    "FLV ModEx: TimestampOffsetNano raw[0..3] does not match offset_ns",
+                ));
+            }
+            if entry.subtype_raw != 0 {
+                return Err(Error::invalid(
+                    "FLV ModEx: TimestampOffsetNano payload requires subtype_raw == 0",
+                ));
+            }
+        }
+        encode_size(out, entry.raw.len())?;
+        out.extend_from_slice(&entry.raw);
+        let next_pt = if i == last_index {
+            final_packet_type
+        } else {
+            MODEX_PACKET_TYPE
+        };
+        out.push(((entry.subtype_raw & 0x0F) << 4) | (next_pt & 0x0F));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,11 +422,13 @@ mod tests {
     /// outer parser must continue with).
     fn encode_one(payload: &[u8], subtype: u8, next_packet_type: u8) -> Vec<u8> {
         let mut buf = Vec::new();
-        // size prefix
-        if payload.len() <= 256 {
+        // size prefix: UI8 path covers 1..=255 (UI8 byte 0..=0xFE);
+        // UI16 escape covers 256..=65_536. Encoding payload.len() == 256
+        // as UI8 would write 0xFF which the decoder treats as the escape
+        // sentinel, so the boundary is strictly `<= 255` on the UI8 side.
+        if payload.len() <= 255 {
             buf.push((payload.len() - 1) as u8);
         } else {
-            // 256 escape
             buf.push(0xFF);
             let n16 = (payload.len() - 1) as u16;
             buf.extend_from_slice(&n16.to_be_bytes());
@@ -483,6 +623,226 @@ mod tests {
         // subtype=0 (TimestampOffsetNano) but payload is only 2 bytes.
         let body = encode_one(&[0xAA, 0xBB], 0, 1);
         assert!(walk::<7>(&body, 0, 7).is_err());
+    }
+
+    // ---- emit tests ---------------------------------------------------
+
+    #[test]
+    fn encode_size_ui8_path() {
+        let mut out = Vec::new();
+        encode_size(&mut out, 1).unwrap();
+        assert_eq!(out, vec![0x00]);
+        out.clear();
+        encode_size(&mut out, 255).unwrap();
+        // 255 = 254 + 1 → UI8 byte = 0xFE (max non-escape).
+        assert_eq!(out, vec![0xFE]);
+    }
+
+    #[test]
+    fn encode_size_ui16_escape_path() {
+        let mut out = Vec::new();
+        encode_size(&mut out, 256).unwrap();
+        // 256 cannot be encoded as UI8 (would write 0xFF, the escape
+        // sentinel). UI16 path: 0xFF + UI16 BE (256 - 1 = 0x00FF).
+        assert_eq!(out, vec![0xFF, 0x00, 0xFF]);
+        out.clear();
+        encode_size(&mut out, 65_536).unwrap();
+        // UI16 BE = 0xFFFF.
+        assert_eq!(out, vec![0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn encode_size_rejects_out_of_range() {
+        let mut out = Vec::new();
+        assert!(encode_size(&mut out, 0).is_err());
+        assert!(encode_size(&mut out, 65_537).is_err());
+    }
+
+    #[test]
+    fn emit_single_entry_round_trips_through_walk() {
+        let entry = ModExEntry {
+            subtype_raw: 0,
+            payload: ModExPayload::TimestampOffsetNano { offset_ns: 1000 },
+            raw: vec![0x00, 0x03, 0xE8],
+        };
+        let mut out = Vec::new();
+        emit::<7>(&mut out, std::slice::from_ref(&entry), 1).unwrap();
+        // Round-trip: walk should recover the same entry, with the
+        // final packet type reported as 1.
+        let (cur, pt, entries, ns) = walk::<7>(&out, 0, 7).unwrap();
+        assert_eq!(cur, out.len());
+        assert_eq!(pt, 1);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], entry);
+        assert_eq!(ns, 1000);
+    }
+
+    #[test]
+    fn emit_chain_of_two_round_trips_through_walk() {
+        let entries = vec![
+            ModExEntry {
+                subtype_raw: 0,
+                payload: ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+                raw: vec![0x00, 0x00, 0x64],
+            },
+            ModExEntry {
+                subtype_raw: 0,
+                payload: ModExPayload::TimestampOffsetNano { offset_ns: 200 },
+                raw: vec![0x00, 0x00, 0xC8],
+            },
+        ];
+        let mut out = Vec::new();
+        emit::<7>(&mut out, &entries, 2).unwrap();
+        let (cur, pt, parsed, ns) = walk::<7>(&out, 0, 7).unwrap();
+        assert_eq!(cur, out.len());
+        assert_eq!(pt, 2);
+        assert_eq!(parsed, entries);
+        assert_eq!(ns, 300);
+    }
+
+    #[test]
+    fn emit_chain_then_resolves_to_modex_in_caller_would_continue() {
+        // Sanity: the final trailer carries whatever low nibble we ask
+        // for. `walk` exits as soon as the low nibble != 7, so emitting
+        // resolved=ModEx (7) is rejected (callers should aggregate
+        // every ModEx into entries before emit).
+        let entry = ModExEntry {
+            subtype_raw: 0,
+            payload: ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+            raw: vec![0x00, 0x00, 0x64],
+        };
+        let mut out = Vec::new();
+        assert!(emit::<7>(&mut out, std::slice::from_ref(&entry), 7).is_err());
+    }
+
+    #[test]
+    fn emit_reserved_subtype_round_trips() {
+        let entry = ModExEntry {
+            subtype_raw: 5,
+            payload: ModExPayload::Reserved { subtype_raw: 5 },
+            raw: vec![0xCA, 0xFE, 0xBA, 0xBE],
+        };
+        let mut out = Vec::new();
+        emit::<7>(&mut out, std::slice::from_ref(&entry), 1).unwrap();
+        let (cur, pt, parsed, ns) = walk::<7>(&out, 0, 7).unwrap();
+        assert_eq!(cur, out.len());
+        assert_eq!(pt, 1);
+        assert_eq!(parsed, vec![entry]);
+        assert_eq!(ns, 0);
+    }
+
+    #[test]
+    fn emit_handles_256_byte_payload_via_escape_round_trip() {
+        // 256-byte payload triggers the UI16 escape (UI8 cannot express
+        // 256 without colliding with the sentinel). Subtype is reserved
+        // so the parser doesn't impose UI24 validation.
+        let payload: Vec<u8> = (0..256).map(|i| (i & 0xFF) as u8).collect();
+        let entry = ModExEntry {
+            subtype_raw: 0xF,
+            payload: ModExPayload::Reserved { subtype_raw: 0xF },
+            raw: payload.clone(),
+        };
+        let mut out = Vec::new();
+        emit::<7>(&mut out, std::slice::from_ref(&entry), 1).unwrap();
+        // The first byte after the lead must be 0xFF (escape sentinel)
+        // since 256 cannot be encoded as a literal UI8.
+        assert_eq!(out[0], 0xFF);
+        let (cur, pt, parsed, _) = walk::<7>(&out, 0, 7).unwrap();
+        assert_eq!(cur, out.len());
+        assert_eq!(pt, 1);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].raw.len(), 256);
+        assert_eq!(parsed[0].raw, payload);
+    }
+
+    #[test]
+    fn emit_rejects_empty_entries() {
+        let mut out = Vec::new();
+        assert!(emit::<7>(&mut out, &[], 1).is_err());
+    }
+
+    #[test]
+    fn emit_rejects_final_packet_type_out_of_nibble_range() {
+        let entry = ModExEntry {
+            subtype_raw: 0,
+            payload: ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+            raw: vec![0x00, 0x00, 0x64],
+        };
+        let mut out = Vec::new();
+        assert!(emit::<7>(&mut out, std::slice::from_ref(&entry), 0x10).is_err());
+    }
+
+    #[test]
+    fn emit_rejects_subtype_out_of_nibble_range() {
+        let entry = ModExEntry {
+            subtype_raw: 0x10,
+            payload: ModExPayload::Reserved { subtype_raw: 0x10 },
+            raw: vec![0xAA],
+        };
+        let mut out = Vec::new();
+        assert!(emit::<7>(&mut out, std::slice::from_ref(&entry), 1).is_err());
+    }
+
+    #[test]
+    fn emit_rejects_timestamp_offset_nano_with_short_raw() {
+        let entry = ModExEntry {
+            subtype_raw: 0,
+            payload: ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+            raw: vec![0xAA, 0xBB], // < 3 bytes
+        };
+        let mut out = Vec::new();
+        assert!(emit::<7>(&mut out, std::slice::from_ref(&entry), 1).is_err());
+    }
+
+    #[test]
+    fn emit_rejects_timestamp_offset_nano_with_mismatched_raw_ui24() {
+        let entry = ModExEntry {
+            subtype_raw: 0,
+            payload: ModExPayload::TimestampOffsetNano { offset_ns: 200 },
+            raw: vec![0x00, 0x00, 0x64], // encodes 100, not 200
+        };
+        let mut out = Vec::new();
+        assert!(emit::<7>(&mut out, std::slice::from_ref(&entry), 1).is_err());
+    }
+
+    #[test]
+    fn emit_rejects_timestamp_offset_nano_above_one_million_ns() {
+        let entry = ModExEntry {
+            subtype_raw: 0,
+            payload: ModExPayload::TimestampOffsetNano {
+                offset_ns: 1_000_000,
+            },
+            raw: vec![0x0F, 0x42, 0x40], // encodes 1_000_000 BE
+        };
+        let mut out = Vec::new();
+        assert!(emit::<7>(&mut out, std::slice::from_ref(&entry), 1).is_err());
+    }
+
+    #[test]
+    fn emit_rejects_timestamp_offset_nano_subtype_not_zero() {
+        let entry = ModExEntry {
+            subtype_raw: 1,
+            payload: ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+            raw: vec![0x00, 0x00, 0x64],
+        };
+        let mut out = Vec::new();
+        assert!(emit::<7>(&mut out, std::slice::from_ref(&entry), 1).is_err());
+    }
+
+    #[test]
+    fn emit_max_ns_999_999_round_trip() {
+        // Boundary: spec cap is 999_999 ns; the writer accepts it.
+        let entry = ModExEntry {
+            subtype_raw: 0,
+            payload: ModExPayload::TimestampOffsetNano { offset_ns: 999_999 },
+            raw: vec![0x0F, 0x42, 0x3F], // 999_999 = 0x0F423F
+        };
+        let mut out = Vec::new();
+        emit::<7>(&mut out, std::slice::from_ref(&entry), 1).unwrap();
+        let (_, _, parsed, ns) = walk::<7>(&out, 0, 7).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].timestamp_offset_nano(), Some(999_999));
+        assert_eq!(ns, 999_999);
     }
 
     #[test]

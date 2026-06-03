@@ -20,11 +20,13 @@ use oxideav_flv::{
     write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_ac3_coded_frames,
     write_av1_coded_frames, write_av1_sequence_start, write_avc_nalu_tag,
     write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_sequence_end,
-    write_ex_video_metadata, write_ex_video_sequence_end, write_flac_coded_frames,
-    write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames, write_hevc_coded_frames_x,
-    write_hevc_sequence_start, write_mp3_ex_coded_frames, write_opus_coded_frames,
-    write_opus_sequence_start, write_vp6_tag, write_vp6a_tag, write_vp9_coded_frames,
-    write_vp9_sequence_start, write_vvc_coded_frames, write_vvc_sequence_start,
+    write_ex_audio_tag, write_ex_video_metadata, write_ex_video_sequence_end, write_ex_video_tag,
+    write_flac_coded_frames, write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames,
+    write_hevc_coded_frames_x, write_hevc_sequence_start, write_mp3_ex_coded_frames,
+    write_opus_coded_frames, write_opus_sequence_start, write_vp6_tag, write_vp6a_tag,
+    write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
+    write_vvc_sequence_start, ExAudioPacketType, ExAudioTagHeader, ExFrameType, ExPacketType,
+    ExVideoTagHeader, ModExEntry, ModExPayload, FOURCC_AUDIO_AAC, FOURCC_AV01,
 };
 
 /// Three distinct synthetic MP3 frame payloads. The demuxer treats an
@@ -725,4 +727,140 @@ fn keyframes_toc_drives_seek_by_pts_bisect_path() {
         p.data, frames[1],
         "70 ms must bisect-left to the 40 ms entry, not scan forward to 80 ms"
     );
+}
+
+// ---- ModEx prefix emission integration tests ------------------------------
+//
+// `ExVideoTagHeader::to_bytes` and `ExAudioTagHeader::to_bytes` accept
+// `mod_ex_entries` and chain them off the front of the tag body. These
+// integration tests build a full FLV through `write_ex_video_tag` /
+// `write_ex_audio_tag` (the generic header-then-payload writers) with a
+// ModEx-bearing header and assert the demuxer recovers the resolved
+// codec id, payload bytes, and accumulated `TimestampOffsetNano`.
+
+#[test]
+fn ex_video_modex_timestamp_offset_nano_round_trips_through_demuxer() {
+    // FLV with one AV1 SequenceStart (so the stream is minted), then a
+    // ModEx-bearing CodedFrames tag whose ModEx prefix carries a single
+    // TimestampOffsetNano = 250_000 ns (a quarter-millisecond
+    // refinement to the integer-ms RTMP timestamp).
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0x81, 0x05, 0x0C];
+    write_av1_sequence_start(&mut buf, 0, &config).unwrap();
+
+    let frame = vec![0xCA, 0xFE, 0xBA, 0xBE];
+    let header_struct = ExVideoTagHeader {
+        frame_type: ExFrameType::KeyFrame,
+        packet_type: ExPacketType::CodedFrames,
+        fourcc: Some(FOURCC_AV01),
+        multitrack: None,
+        bytes_consumed: 0,
+        composition_time_offset_ms: None,
+        timestamp_offset_nano: 250_000,
+        mod_ex_entries: vec![ModExEntry {
+            subtype_raw: 0,
+            payload: ModExPayload::TimestampOffsetNano { offset_ns: 250_000 },
+            // 250_000 = 0x03D090 in 24-bit BE.
+            raw: vec![0x03, 0xD0, 0x90],
+        }],
+        video_command: None,
+    };
+    write_ex_video_tag(&mut buf, 40, &header_struct, &frame).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "av1");
+    // Header packet (SequenceStart) first, then the ModEx-bearing
+    // CodedFrames body.
+    let _hdr = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, frame, "payload bytes must survive the ModEx prefix");
+    assert!(p.flags.keyframe, "FrameType=KeyFrame must round-trip");
+    assert_eq!(p.pts, Some(40));
+}
+
+#[test]
+fn ex_audio_modex_timestamp_offset_nano_chained_round_trips_through_demuxer() {
+    // FLV with one AAC SequenceStart, then a ModEx-bearing CodedFrames
+    // tag chaining TWO TimestampOffsetNano refinements (100 ns + 200 ns
+    // = 300 ns accumulator). Demuxer must surface the AAC payload and
+    // resolve the codec id to "aac".
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let asc = vec![0x12, 0x10];
+    write_aac_ex_sequence_start(&mut buf, 0, &asc).unwrap();
+
+    let au = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let header_struct = ExAudioTagHeader {
+        packet_type: ExAudioPacketType::CodedFrames,
+        fourcc: Some(FOURCC_AUDIO_AAC),
+        multitrack: None,
+        timestamp_offset_nano: 300,
+        mod_ex_entries: vec![
+            ModExEntry {
+                subtype_raw: 0,
+                payload: ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+                raw: vec![0x00, 0x00, 0x64],
+            },
+            ModExEntry {
+                subtype_raw: 0,
+                payload: ModExPayload::TimestampOffsetNano { offset_ns: 200 },
+                raw: vec![0x00, 0x00, 0xC8],
+            },
+        ],
+        bytes_consumed: 0,
+    };
+    write_ex_audio_tag(&mut buf, 23, &header_struct, &au).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
+    assert_eq!(dmx.streams()[0].params.extradata, asc);
+
+    let _hdr = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, au, "payload bytes must survive the ModEx chain");
+    assert_eq!(p.pts, Some(23));
+}
+
+#[test]
+fn ex_video_modex_reserved_subtype_passthrough_round_trips_through_demuxer() {
+    // Reserved-subtype ModEx blob round-trips opaquely off the front of
+    // the body: the demuxer doesn't model the reserved subtype, but the
+    // payload bytes following the FourCc still reach the packet body
+    // intact. This is the spec's "future-proof" path — new ModEx
+    // subtypes land in producers before parsers learn them.
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0x81, 0x05, 0x0C];
+    write_av1_sequence_start(&mut buf, 0, &config).unwrap();
+
+    let frame = vec![0x11, 0x22, 0x33];
+    let header_struct = ExVideoTagHeader {
+        frame_type: ExFrameType::InterFrame,
+        packet_type: ExPacketType::CodedFrames,
+        fourcc: Some(FOURCC_AV01),
+        multitrack: None,
+        bytes_consumed: 0,
+        composition_time_offset_ms: None,
+        timestamp_offset_nano: 0,
+        mod_ex_entries: vec![ModExEntry {
+            subtype_raw: 5, // reserved
+            payload: ModExPayload::Reserved { subtype_raw: 5 },
+            raw: vec![0xAA, 0xBB, 0xCC, 0xDD],
+        }],
+        video_command: None,
+    };
+    write_ex_video_tag(&mut buf, 60, &header_struct, &frame).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    let _hdr = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, frame);
+    assert_eq!(p.pts, Some(60));
 }

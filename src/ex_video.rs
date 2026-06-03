@@ -56,7 +56,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::mod_ex::{walk as mod_ex_walk, ModExEntry};
+use crate::mod_ex::{emit as mod_ex_emit, walk as mod_ex_walk, ModExEntry};
 use crate::multitrack::AvMultitrackType;
 
 /// Mask of the IsExHeader bit in the VideoTagHeader's first byte.
@@ -456,22 +456,25 @@ impl ExVideoTagHeader {
     ///   `frame_type == Command` and `packet_type != Metadata`, mirroring
     ///   the parser's spec-aligned guard. `video_command = None` on that
     ///   combination is rejected (the spec requires the byte).
-    /// * ModEx prefix emission is **not** implemented in this slice —
-    ///   `mod_ex_entries` is required to be empty. Round-tripping the
-    ///   parsed ModEx-bearing wire shape will land in a follow-up round.
+    /// * ModEx prefix emission **is** supported via the shared
+    ///   [`crate::mod_ex::emit`] writer. When `mod_ex_entries` is
+    ///   non-empty the lead byte's low nibble is `7` (ModEx) and the
+    ///   entries are chained off the front of the body, each
+    ///   contributing its size prefix + raw payload + trailer byte;
+    ///   the final trailer's low nibble carries the resolved
+    ///   `packet_type` (or `Multitrack` when multitrack mode is in
+    ///   effect) so the parser's `walk` exits with the correct
+    ///   AudioPacketType / VideoPacketType. Per-entry contracts (size
+    ///   in `1..=65_536`, `TimestampOffsetNano` payload `>= 3` bytes,
+    ///   raw UI24 matches the typed `offset_ns`, `offset_ns
+    ///   <= 999_999`) match the parser's invariants. A
+    ///   `timestamp_offset_nano != 0` with no `mod_ex_entries` is
+    ///   rejected as internally inconsistent.
     ///
     /// Returns `Err(Error::InvalidData)` for any combination that doesn't
     /// have a defined wire representation.
     pub fn to_bytes(&self, out: &mut Vec<u8>) -> Result<()> {
-        // ModEx emission is deferred to a future round. The walker
-        // already round-trips the parsed entries; the inverse-emission
-        // step needs a canonical ordering decision we haven't taken yet.
-        if !self.mod_ex_entries.is_empty() {
-            return Err(Error::invalid(
-                "ExVideoTagHeader::to_bytes: ModEx emission not yet implemented",
-            ));
-        }
-        if self.timestamp_offset_nano != 0 {
+        if self.mod_ex_entries.is_empty() && self.timestamp_offset_nano != 0 {
             return Err(Error::invalid(
                 "ExVideoTagHeader::to_bytes: nonzero timestamp_offset_nano without mod_ex_entries",
             ));
@@ -481,12 +484,25 @@ impl ExVideoTagHeader {
         // Multitrack: leading-byte PacketType is `Multitrack`; the inner
         // type goes into the multitrack header byte that follows the
         // (shared) FourCc-or-not.
-        let (lead_pt, inner_pt_for_mt) = if self.multitrack.is_some() {
+        let (resolved_pt, inner_pt_for_mt) = if self.multitrack.is_some() {
             (ExPacketType::Multitrack.to_u8(), Some(self.packet_type))
         } else {
             (self.packet_type.to_u8() & 0x0F, None)
         };
+        // When ModEx entries are present the lead byte advertises the
+        // ModEx sentinel `7`; the resolved packet type rides on the last
+        // ModEx trailer instead. Match the parser's `walk`-then-resolve
+        // layout exactly.
+        let lead_pt = if self.mod_ex_entries.is_empty() {
+            resolved_pt
+        } else {
+            7
+        };
         out.push(EX_HEADER_FLAG | (frame_bits << 4) | lead_pt);
+
+        if !self.mod_ex_entries.is_empty() {
+            mod_ex_emit::<7>(out, &self.mod_ex_entries, resolved_pt)?;
+        }
 
         if let Some(mt_type) = self.multitrack {
             // Spec layout: UB[4] AvMultitrackType | UB[4] inner PacketType.
@@ -1261,9 +1277,111 @@ mod tests {
     }
 
     #[test]
-    fn to_bytes_rejects_modex_emission() {
-        // ModEx emission is not yet implemented — the deferred case must
-        // surface a clear error rather than silently produce wrong bytes.
+    fn to_bytes_emits_modex_timestamp_offset_nano_then_resolves_to_packet_type() {
+        // One ModEx entry (TimestampOffsetNano = 100 ns), then the
+        // resolved VideoPacketType = SequenceStart (0) carries an AV1
+        // FourCc and a 2-byte payload (dummy config record). Lead byte
+        // low nibble must be `7` (ModEx); the last trailer carries the
+        // resolved type (`SequenceStart`).
+        let h = ExVideoTagHeader {
+            frame_type: ExFrameType::KeyFrame,
+            packet_type: ExPacketType::SequenceStart,
+            fourcc: Some(FOURCC_AV01),
+            multitrack: None,
+            bytes_consumed: 0,
+            composition_time_offset_ms: None,
+            timestamp_offset_nano: 100,
+            mod_ex_entries: vec![ModExEntry {
+                subtype_raw: 0,
+                payload: crate::mod_ex::ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+                raw: vec![0, 0, 0x64],
+            }],
+            video_command: None,
+        };
+        let mut out = Vec::new();
+        h.to_bytes(&mut out).unwrap();
+        // FrameType=KeyFrame (1) on bits 6..4, ModEx (7) on bits 3..0,
+        // plus EX_HEADER_FLAG → 0x80 | 0x10 | 0x07 = 0x97.
+        assert_eq!(out[0], 0x80 | (1 << 4) | 7);
+        out.extend_from_slice(&[0xDE, 0xAD]);
+        let h2 = ExVideoTagHeader::parse(&out).unwrap().unwrap();
+        assert_eq!(h2.frame_type, ExFrameType::KeyFrame);
+        assert_eq!(h2.packet_type, ExPacketType::SequenceStart);
+        assert_eq!(h2.fourcc, Some(FOURCC_AV01));
+        assert_eq!(h2.timestamp_offset_nano, 100);
+        assert_eq!(h2.mod_ex_entries.len(), 1);
+        assert_eq!(h2.mod_ex_entries[0].timestamp_offset_nano(), Some(100));
+        assert_eq!(&out[h2.bytes_consumed..], &[0xDE, 0xAD]);
+    }
+
+    #[test]
+    fn to_bytes_emits_modex_resolves_to_hevc_coded_frames_carrying_cto() {
+        // ModEx run followed by HEVC CodedFrames (single-track) — the
+        // CTO bytes follow the FourCc, matching the parser's
+        // walk → FourCc → SI24 CTO order.
+        let h = ExVideoTagHeader {
+            frame_type: ExFrameType::InterFrame,
+            packet_type: ExPacketType::CodedFrames,
+            fourcc: Some(FOURCC_HVC1),
+            multitrack: None,
+            bytes_consumed: 0,
+            composition_time_offset_ms: Some(42),
+            timestamp_offset_nano: 500,
+            mod_ex_entries: vec![ModExEntry {
+                subtype_raw: 0,
+                payload: crate::mod_ex::ModExPayload::TimestampOffsetNano { offset_ns: 500 },
+                raw: vec![0, 0x01, 0xF4],
+            }],
+            video_command: None,
+        };
+        let mut out = Vec::new();
+        h.to_bytes(&mut out).unwrap();
+        out.extend_from_slice(&[0x00, 0x00, 0x01, 0x40]); // dummy NALU
+        let h2 = ExVideoTagHeader::parse(&out).unwrap().unwrap();
+        assert_eq!(h2.frame_type, ExFrameType::InterFrame);
+        assert_eq!(h2.packet_type, ExPacketType::CodedFrames);
+        assert_eq!(h2.fourcc, Some(FOURCC_HVC1));
+        assert_eq!(h2.composition_time_offset_ms, Some(42));
+        assert_eq!(h2.timestamp_offset_nano, 500);
+        assert_eq!(h2.mod_ex_entries.len(), 1);
+    }
+
+    #[test]
+    fn to_bytes_emits_modex_resolves_to_multitrack_one_track() {
+        // ModEx → resolved packet_type = Multitrack(OneTrack) shared
+        // FourCc = AV1; per spec the per-track payload follows the
+        // multitrack header byte and shared FourCc.
+        let h = ExVideoTagHeader {
+            frame_type: ExFrameType::KeyFrame,
+            packet_type: ExPacketType::SequenceStart, // inner type
+            fourcc: Some(FOURCC_AV01),
+            multitrack: Some(AvMultitrackType::OneTrack),
+            bytes_consumed: 0,
+            composition_time_offset_ms: None,
+            timestamp_offset_nano: 250,
+            mod_ex_entries: vec![ModExEntry {
+                subtype_raw: 0,
+                payload: crate::mod_ex::ModExPayload::TimestampOffsetNano { offset_ns: 250 },
+                raw: vec![0, 0, 0xFA],
+            }],
+            video_command: None,
+        };
+        let mut out = Vec::new();
+        h.to_bytes(&mut out).unwrap();
+        out.extend_from_slice(&[0xCA, 0xFE]); // dummy track payload
+        let h2 = ExVideoTagHeader::parse(&out).unwrap().unwrap();
+        assert_eq!(h2.multitrack, Some(AvMultitrackType::OneTrack));
+        assert_eq!(h2.packet_type, ExPacketType::SequenceStart);
+        assert_eq!(h2.fourcc, Some(FOURCC_AV01));
+        assert_eq!(h2.timestamp_offset_nano, 250);
+        assert_eq!(h2.mod_ex_entries.len(), 1);
+    }
+
+    #[test]
+    fn to_bytes_rejects_internally_inconsistent_timestamp_offset_nano() {
+        // No entries but timestamp_offset_nano != 0 — internally
+        // inconsistent (the parser would always populate the field
+        // from the entries sum), so the writer must refuse.
         let h = ExVideoTagHeader {
             frame_type: ExFrameType::KeyFrame,
             packet_type: ExPacketType::CodedFrames,
@@ -1271,11 +1389,31 @@ mod tests {
             multitrack: None,
             bytes_consumed: 0,
             composition_time_offset_ms: None,
-            timestamp_offset_nano: 0,
+            timestamp_offset_nano: 100,
+            mod_ex_entries: Vec::new(),
+            video_command: None,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(h.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn to_bytes_rejects_modex_with_wrong_raw_ui24() {
+        // Internally inconsistent: typed offset_ns says 200 but the raw
+        // bytes encode 100. The writer's per-entry validation catches
+        // this so the wire output never disagrees with the model.
+        let h = ExVideoTagHeader {
+            frame_type: ExFrameType::KeyFrame,
+            packet_type: ExPacketType::CodedFrames,
+            fourcc: Some(FOURCC_AV01),
+            multitrack: None,
+            bytes_consumed: 0,
+            composition_time_offset_ms: None,
+            timestamp_offset_nano: 200,
             mod_ex_entries: vec![ModExEntry {
                 subtype_raw: 0,
-                payload: crate::mod_ex::ModExPayload::TimestampOffsetNano { offset_ns: 100 },
-                raw: vec![0, 0, 0x64],
+                payload: crate::mod_ex::ModExPayload::TimestampOffsetNano { offset_ns: 200 },
+                raw: vec![0, 0, 0x64], // encodes 100, not 200
             }],
             video_command: None,
         };

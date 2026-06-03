@@ -50,7 +50,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::mod_ex::{walk as mod_ex_walk, ModExEntry};
+use crate::mod_ex::{emit as mod_ex_emit, walk as mod_ex_walk, ModExEntry};
 
 /// `SoundFormat` value that signals the ExAudio FourCC path.
 /// Pre-2023 FLV reserved `SoundFormat = 9`; enhanced-rtmp-v2 reuses it.
@@ -305,10 +305,17 @@ impl ExAudioTagHeader {
     /// * Single-track headers are fully supported (the common case for
     ///   every Enhanced-RTMP audio FourCc — Opus / fLaC / ac-3 / ec-3 /
     ///   .mp3 / mp4a).
-    /// * ModEx prefix emission is **not** implemented in this slice —
-    ///   `mod_ex_entries` is required to be empty and
-    ///   `timestamp_offset_nano` must be `0`. Round-tripping the parsed
-    ///   ModEx-bearing wire shape will land in a follow-up round.
+    /// * ModEx prefix emission **is** supported via the shared
+    ///   [`crate::mod_ex::emit`] writer: `mod_ex_entries` are chained
+    ///   off the front of the body, each entry contributing its size
+    ///   prefix + raw payload + trailer byte, and the lead byte's low
+    ///   nibble becomes `7` (ModEx) instead of the resolved
+    ///   `packet_type`. Per-entry contracts (size in `1..=65_536`,
+    ///   `TimestampOffsetNano` payload `>= 3` bytes, raw UI24 matches
+    ///   the typed `offset_ns`, `offset_ns <= 999_999`) match the
+    ///   parser's invariants. If `mod_ex_entries.is_empty()` and
+    ///   `timestamp_offset_nano != 0` the header is internally
+    ///   inconsistent and rejected with [`Error::InvalidData`].
     /// * Multitrack emission is **not** implemented in this slice. The
     ///   audio parser stores `packet_type = Multitrack` and discards the
     ///   inner `AudioPacketType` (vs the video parser which surfaces the
@@ -319,12 +326,7 @@ impl ExAudioTagHeader {
     /// Returns `Err(Error::InvalidData)` on combinations the spec leaves
     /// no wire representation for.
     pub fn to_bytes(&self, out: &mut Vec<u8>) -> Result<()> {
-        if !self.mod_ex_entries.is_empty() {
-            return Err(Error::invalid(
-                "ExAudioTagHeader::to_bytes: ModEx emission not yet implemented",
-            ));
-        }
-        if self.timestamp_offset_nano != 0 {
+        if self.mod_ex_entries.is_empty() && self.timestamp_offset_nano != 0 {
             return Err(Error::invalid(
                 "ExAudioTagHeader::to_bytes: nonzero timestamp_offset_nano without mod_ex_entries",
             ));
@@ -334,8 +336,25 @@ impl ExAudioTagHeader {
                 "ExAudioTagHeader::to_bytes: multitrack emission not yet implemented (inner AudioPacketType is not surfaced by the parser)",
             ));
         }
-        // SoundFormat=9 (ExHeader) high nibble + AudioPacketType low nibble.
-        out.push((SOUND_FORMAT_EX_HEADER << 4) | (self.packet_type.to_u8() & 0x0F));
+        // Lead byte: SoundFormat=9 (ExHeader) high nibble + AudioPacketType
+        // low nibble. When ModEx entries are present the lead byte's low
+        // nibble is `7` (ModEx); the post-loop packet_type is encoded in
+        // the trailer of the last ModEx entry instead. Match the parser's
+        // `walk`-then-FourCc layout exactly.
+        let lead_pt = if self.mod_ex_entries.is_empty() {
+            self.packet_type.to_u8() & 0x0F
+        } else {
+            7
+        };
+        out.push((SOUND_FORMAT_EX_HEADER << 4) | lead_pt);
+
+        if !self.mod_ex_entries.is_empty() {
+            // Audio-side ModEx run; the trailer of the last entry carries
+            // the resolved `packet_type` so the parser's `walk` exits with
+            // that value and the FourCc is read next.
+            mod_ex_emit::<7>(out, &self.mod_ex_entries, self.packet_type.to_u8() & 0x0F)?;
+        }
+
         let fcc = self.fourcc.ok_or_else(|| {
             Error::invalid("ExAudioTagHeader::to_bytes: single-track header needs a FourCc")
         })?;
@@ -756,17 +775,90 @@ mod tests {
     }
 
     #[test]
-    fn to_bytes_rejects_modex_emission() {
+    fn to_bytes_emits_modex_timestamp_offset_nano_then_resolves_to_packet_type() {
+        // One ModEx entry (TimestampOffsetNano = 100 ns), then the
+        // resolved AudioPacketType = CodedFrames carries an Opus FourCc
+        // and a 2-byte payload. The writer must:
+        //   * set the lead byte's low nibble to `7` (ModEx),
+        //   * emit the size prefix + 3-byte UI24 raw + trailer byte
+        //     `(0 << 4) | 1 = 0x01` (resolved = CodedFrames),
+        //   * follow with the FourCc.
+        // After write_back we expect the parser to recover an
+        // equivalent header (entries + accumulator + resolved type).
         let h = ExAudioTagHeader {
             packet_type: ExAudioPacketType::CodedFrames,
             fourcc: Some(FOURCC_OPUS),
             multitrack: None,
-            timestamp_offset_nano: 0,
+            timestamp_offset_nano: 100,
             mod_ex_entries: vec![ModExEntry {
                 subtype_raw: 0,
                 payload: crate::mod_ex::ModExPayload::TimestampOffsetNano { offset_ns: 100 },
                 raw: vec![0, 0, 0x64],
             }],
+            bytes_consumed: 0,
+        };
+        let mut out = Vec::new();
+        h.to_bytes(&mut out).unwrap();
+        let payload_tail = [0xAA, 0xBB];
+        out.extend_from_slice(&payload_tail);
+        // Lead byte: SoundFormat=9 high nibble + ModEx (7) low nibble.
+        assert_eq!(out[0], (SOUND_FORMAT_EX_HEADER << 4) | 7);
+        let h2 = ExAudioTagHeader::parse(&out).unwrap().unwrap();
+        assert_eq!(h2.packet_type, ExAudioPacketType::CodedFrames);
+        assert_eq!(h2.fourcc, Some(FOURCC_OPUS));
+        assert_eq!(h2.timestamp_offset_nano, 100);
+        assert_eq!(h2.mod_ex_entries.len(), 1);
+        assert_eq!(h2.mod_ex_entries[0].timestamp_offset_nano(), Some(100));
+        assert_eq!(&out[h2.bytes_consumed..], &payload_tail);
+    }
+
+    #[test]
+    fn to_bytes_emits_modex_chain_of_two_then_resolves() {
+        // Two chained ModEx TimestampOffsetNano entries (100 ns + 200
+        // ns), resolved to SequenceStart (2). Both trailers but the
+        // last carry next_packet_type = 7 (ModEx); the last carries
+        // the resolved type (`SequenceStart`).
+        let h = ExAudioTagHeader {
+            packet_type: ExAudioPacketType::SequenceStart,
+            fourcc: Some(FOURCC_OPUS),
+            multitrack: None,
+            timestamp_offset_nano: 300,
+            mod_ex_entries: vec![
+                ModExEntry {
+                    subtype_raw: 0,
+                    payload: crate::mod_ex::ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+                    raw: vec![0, 0, 0x64],
+                },
+                ModExEntry {
+                    subtype_raw: 0,
+                    payload: crate::mod_ex::ModExPayload::TimestampOffsetNano { offset_ns: 200 },
+                    raw: vec![0, 0, 0xC8],
+                },
+            ],
+            bytes_consumed: 0,
+        };
+        let mut out = Vec::new();
+        h.to_bytes(&mut out).unwrap();
+        out.extend_from_slice(&[0x4F, 0x70, 0x75, 0x73]);
+        let h2 = ExAudioTagHeader::parse(&out).unwrap().unwrap();
+        assert_eq!(h2.packet_type, ExAudioPacketType::SequenceStart);
+        assert_eq!(h2.timestamp_offset_nano, 300);
+        assert_eq!(h2.mod_ex_entries.len(), 2);
+        assert_eq!(h2.mod_ex_entries[0].timestamp_offset_nano(), Some(100));
+        assert_eq!(h2.mod_ex_entries[1].timestamp_offset_nano(), Some(200));
+    }
+
+    #[test]
+    fn to_bytes_rejects_internally_inconsistent_timestamp_offset_nano() {
+        // No entries but timestamp_offset_nano != 0 — internally
+        // inconsistent (the parser would always set the field from the
+        // entries sum), so the writer must refuse.
+        let h = ExAudioTagHeader {
+            packet_type: ExAudioPacketType::CodedFrames,
+            fourcc: Some(FOURCC_OPUS),
+            multitrack: None,
+            timestamp_offset_nano: 100,
+            mod_ex_entries: Vec::new(),
             bytes_consumed: 0,
         };
         let mut out = Vec::new();
