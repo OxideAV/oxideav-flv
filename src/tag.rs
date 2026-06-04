@@ -708,6 +708,41 @@ pub fn write_ex_video_metadata<W: Write + ?Sized>(
     write_ex_video_tag(w, timestamp_ms, &header, amf_payload)
 }
 
+/// Write an Ex-video `Metadata` tag carrying an HDR `colorInfo` object
+/// (Veovera `enhanced-rtmp-v2` §"Metadata Frame"). Encodes the supplied
+/// [`crate::color_info::ColorInfo`] via the AMF0 grammar described in
+/// the spec's `ColorInfo` type block and packages it in a
+/// `videoPacketType = Metadata` tag for the given FourCC. The output
+/// is symmetric with [`crate::FlvDemuxer`]'s
+/// `harvest_video_metadata_frame` walker — every populated field
+/// surfaces under `metadata["colorinfo.<group>.<key>"]` after the
+/// round-trip.
+pub fn write_ex_video_color_info<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    fourcc: u32,
+    color_info: &crate::color_info::ColorInfo,
+) -> Result<u32> {
+    let amf = color_info.encode_amf()?;
+    write_ex_video_metadata(w, timestamp_ms, fourcc, &amf)
+}
+
+/// Write the spec-recommended colorInfo reset — an Ex-video `Metadata`
+/// tag whose payload is `["colorInfo", Undefined]` (Veovera
+/// `enhanced-rtmp-v2` §"Metadata Frame": "To reset to the original
+/// color state you can send colorInfo with a value of Undefined (the
+/// RECOMMENDED approach) or an empty object."). The demuxer drops
+/// every prior `colorinfo.*` metadata entry and leaves the
+/// `metadata["colorinfo"] = "undefined"` sentinel.
+pub fn write_ex_video_color_info_reset<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    fourcc: u32,
+) -> Result<u32> {
+    let amf = crate::color_info::encode_amf_reset();
+    write_ex_video_metadata(w, timestamp_ms, fourcc, &amf)
+}
+
 // ---- Ex-audio single-track convenience writers ----------------------------
 
 fn single_track_ex_audio_header(

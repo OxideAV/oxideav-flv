@@ -284,6 +284,9 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | MP3 (FourCc-mode) coded frames | `tag::write_mp3_ex_coded_frames` | FourCc `.mp3` |
 | AAC (FourCc-mode) sequence start / coded frames | `tag::write_aac_ex_sequence_start` / `tag::write_aac_ex_coded_frames` | FourCc `mp4a` |
 | Ex-audio sequence end | `tag::write_ex_audio_sequence_end` | enhanced-rtmp v2 |
+| Ex-video HDR `colorInfo` metadata tag | `tag::write_ex_video_color_info(w, ts_ms, fourcc, &ColorInfo)` | enhanced-rtmp v2 §"Metadata Frame" |
+| Ex-video HDR `colorInfo` reset (`Undefined`) | `tag::write_ex_video_color_info_reset(w, ts_ms, fourcc)` | enhanced-rtmp v2 §"Metadata Frame" |
+| Typed `colorInfo` AMF body encoder | `color_info::{ColorInfo, ColorConfig, HdrCll, HdrMdcv}::encode_amf()` / `encode_amf_into` / `encode_amf_reset` | enhanced-rtmp v2 §`ColorInfo` |
 | AMF0 writers | `amf0::{write_number, write_boolean, write_string, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 |
 | `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |
 | `onMetaData.keyframes` seek-table composite | `MetadataBag::keyframes(file_positions, times_seconds)` + AMF0 `write_strict_array_number` | §E.4.4.7 / §E.4.4.9 |
@@ -348,6 +351,29 @@ prefix emission stacks cleanly with multitrack mode: the lead byte
 advertises the ModEx sentinel and the final ModEx trailer carries
 the resolved outer `Multitrack` value so `walk` exits on
 `Multitrack` and the multitrack outer byte is read next.
+
+The Enhanced-RTMP-v2 HDR `colorInfo` metadata frame has a typed
+encode-side mirror of the demuxer's parser: a `color_info` module
+exposes `ColorInfo` / `ColorConfig` / `HdrCll` / `HdrMdcv` structs
+matching the spec's AMF object one-for-one (`bitDepth` + ISO 23091-4
+indices; `maxFall` / `maxCLL` content light level; chromaticity
+primaries + white point + mastering luminance per SMPTE ST 2086:2018).
+Every field is `Option<…>` so producers emit only what they signal; a
+populated struct passed to `tag::write_ex_video_color_info(w, ts,
+fourcc, &ci)` lays down a `videoPacketType = Metadata` Ex video tag
+whose AMF body matches the spec's `["colorInfo", Object]` pair shape.
+Bounds checks (`hdrCll.*` in `[0.0001, 10_000]` cd/m^2; chromaticities
+in `[0.0001, 0.7400]` for X / `[0.0001, 0.8400]` for Y; `maxLuminance`
+in `[5, 10_000]`, `minLuminance` in `[0.0001, 5]`; `bitDepth` in
+`[8, 16]`) run before any bytes reach the writer so out-of-range
+values raise `Error::invalid` and the output buffer stays untouched.
+`tag::write_ex_video_color_info_reset(w, ts, fourcc)` emits the
+spec-recommended reset shape `["colorInfo", Undefined]`. The encoded
+body is symmetric with the parser: a follow-up
+`write_ex_video_color_info` replaces the prior `colorinfo.*` metadata
+entries; a `write_ex_video_color_info_reset` drops them and leaves the
+`metadata["colorinfo"] = "undefined"` sentinel — same shape the parser
+observes when an external producer sends the same payload.
 
 ```rust
 use oxideav_flv::{header, script, script::MetadataBag, tag};

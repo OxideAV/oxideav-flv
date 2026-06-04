@@ -21,6 +21,7 @@
 
 pub mod amf0;
 pub mod amf3;
+pub mod color_info;
 pub mod demuxer;
 pub mod ex_audio;
 pub mod ex_video;
@@ -34,6 +35,7 @@ use oxideav_core::ContainerRegistry;
 
 pub use amf0::{parse_amf0_value, AmfValue};
 pub use amf3::{parse_amf3_value, Amf3Array, Amf3Object, Amf3Value};
+pub use color_info::{ColorConfig, ColorInfo, HdrCll, HdrMdcv};
 pub use demuxer::{open as open_demuxer, FlvDemuxer};
 pub use ex_audio::{
     fourcc_audio_codec_id_str, AudioPacketModExType, AvMultitrackType, ExAudioPacketType,
@@ -54,7 +56,8 @@ pub use tag::{
     write_aac_raw_tag, write_ac3_coded_frames, write_audio_tag, write_av1_coded_frames,
     write_av1_sequence_start, write_avc_end_of_sequence, write_avc_nalu_tag,
     write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_sequence_end,
-    write_ex_audio_tag, write_ex_video_metadata, write_ex_video_sequence_end, write_ex_video_tag,
+    write_ex_audio_tag, write_ex_video_color_info, write_ex_video_color_info_reset,
+    write_ex_video_metadata, write_ex_video_sequence_end, write_ex_video_tag,
     write_first_previous_tag_size, write_flac_coded_frames, write_flac_sequence_start,
     write_h263_tag, write_hevc_coded_frames, write_hevc_coded_frames_x, write_hevc_sequence_start,
     write_mp3_ex_coded_frames, write_mp3_tag, write_opus_coded_frames, write_opus_sequence_start,

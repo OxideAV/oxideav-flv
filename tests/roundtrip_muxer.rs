@@ -20,14 +20,15 @@ use oxideav_flv::{
     write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_ac3_coded_frames,
     write_av1_coded_frames, write_av1_sequence_start, write_avc_nalu_tag,
     write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_sequence_end,
-    write_ex_audio_tag, write_ex_video_metadata, write_ex_video_sequence_end, write_ex_video_tag,
+    write_ex_audio_tag, write_ex_video_color_info, write_ex_video_color_info_reset,
+    write_ex_video_metadata, write_ex_video_sequence_end, write_ex_video_tag,
     write_flac_coded_frames, write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames,
     write_hevc_coded_frames_x, write_hevc_sequence_start, write_mp3_ex_coded_frames,
     write_opus_coded_frames, write_opus_sequence_start, write_vp6_tag, write_vp6a_tag,
     write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
-    write_vvc_sequence_start, AvMultitrackType, ExAudioPacketType, ExAudioTagHeader, ExFrameType,
-    ExPacketType, ExVideoTagHeader, ModExEntry, ModExPayload, FOURCC_AUDIO_AAC, FOURCC_AV01,
-    FOURCC_OPUS,
+    write_vvc_sequence_start, AvMultitrackType, ColorConfig, ColorInfo, ExAudioPacketType,
+    ExAudioTagHeader, ExFrameType, ExPacketType, ExVideoTagHeader, HdrCll, HdrMdcv, ModExEntry,
+    ModExPayload, FOURCC_AUDIO_AAC, FOURCC_AV01, FOURCC_OPUS,
 };
 
 /// Three distinct synthetic MP3 frame payloads. The demuxer treats an
@@ -967,4 +968,192 @@ fn ex_audio_multitrack_many_tracks_round_trips_default_track() {
         "ManyTracks default-track payload (trackId 0) must surface verbatim"
     );
     assert_eq!(p.pts, Some(46));
+}
+
+// ---- HDR colorInfo encode-side wiring round-trip --------------------------
+//
+// Exercises the typed `crate::color_info::ColorInfo` encoder by muxing a
+// `videoPacketType = Metadata` tag and confirming the demuxer's
+// `harvest_video_metadata_frame` walker recovers every populated field
+// under the spec-defined `colorinfo.*` metadata keys.
+
+fn meta_lookup<'a>(md: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    md.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+fn make_hvc1_seq_start(buf: &mut Vec<u8>) {
+    let config = vec![0x01];
+    write_hevc_sequence_start(buf, 0, &config).unwrap();
+}
+
+#[test]
+fn ex_video_color_info_writer_round_trip_full_payload() {
+    // Mux a SequenceStart + a fully-populated colorInfo Metadata tag,
+    // demux it, and assert every spec-defined field reaches the
+    // metadata bag under the lowercase `colorinfo.<group>.<key>` path
+    // that `harvest_video_metadata_frame` produces.
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    make_hvc1_seq_start(&mut buf);
+
+    let ci = ColorInfo {
+        color_config: Some(ColorConfig {
+            bit_depth: Some(10),
+            color_primaries: Some(9),           // BT.2020
+            transfer_characteristics: Some(16), // SMPTE ST 2084 (PQ)
+            matrix_coefficients: Some(9),       // BT.2020 NCL
+        }),
+        hdr_cll: Some(HdrCll {
+            max_fall: Some(400.0),
+            max_cll: Some(1000.0),
+        }),
+        hdr_mdcv: Some(HdrMdcv {
+            red_x: Some(0.708),
+            red_y: Some(0.292),
+            green_x: Some(0.170),
+            green_y: Some(0.797),
+            blue_x: Some(0.131),
+            blue_y: Some(0.046),
+            white_point_x: Some(0.3127),
+            white_point_y: Some(0.3290),
+            max_luminance: Some(1000.0),
+            min_luminance: Some(0.01),
+        }),
+    };
+    write_ex_video_color_info(&mut buf, 40, oxideav_flv::FOURCC_HVC1, &ci).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "h265");
+    let _seq = dmx.next_packet().unwrap();
+    let m = dmx.next_packet().unwrap();
+    // Metadata tag remains header+discard so codec decoders skip it.
+    assert!(m.flags.header && m.flags.discard);
+
+    let md = dmx.metadata();
+    // colorConfig
+    assert_eq!(
+        meta_lookup(md, "colorinfo.colorConfig.bitDepth"),
+        Some("10")
+    );
+    assert_eq!(
+        meta_lookup(md, "colorinfo.colorConfig.colorPrimaries"),
+        Some("9")
+    );
+    assert_eq!(
+        meta_lookup(md, "colorinfo.colorConfig.transferCharacteristics"),
+        Some("16")
+    );
+    assert_eq!(
+        meta_lookup(md, "colorinfo.colorConfig.matrixCoefficients"),
+        Some("9")
+    );
+    // hdrCll
+    assert_eq!(meta_lookup(md, "colorinfo.hdrCll.maxFall"), Some("400"));
+    assert_eq!(meta_lookup(md, "colorinfo.hdrCll.maxCLL"), Some("1000"));
+    // hdrMdcv — primaries
+    assert_eq!(meta_lookup(md, "colorinfo.hdrMdcv.redX"), Some("0.708"));
+    assert_eq!(meta_lookup(md, "colorinfo.hdrMdcv.redY"), Some("0.292"));
+    assert_eq!(meta_lookup(md, "colorinfo.hdrMdcv.greenX"), Some("0.17"));
+    assert_eq!(meta_lookup(md, "colorinfo.hdrMdcv.greenY"), Some("0.797"));
+    assert_eq!(meta_lookup(md, "colorinfo.hdrMdcv.blueX"), Some("0.131"));
+    assert_eq!(meta_lookup(md, "colorinfo.hdrMdcv.blueY"), Some("0.046"));
+    assert_eq!(
+        meta_lookup(md, "colorinfo.hdrMdcv.whitePointX"),
+        Some("0.3127")
+    );
+    assert_eq!(
+        meta_lookup(md, "colorinfo.hdrMdcv.whitePointY"),
+        Some("0.329")
+    );
+    assert_eq!(
+        meta_lookup(md, "colorinfo.hdrMdcv.maxLuminance"),
+        Some("1000")
+    );
+    assert_eq!(
+        meta_lookup(md, "colorinfo.hdrMdcv.minLuminance"),
+        Some("0.01")
+    );
+}
+
+#[test]
+fn ex_video_color_info_writer_omits_absent_groups() {
+    // Populate only `colorConfig`; assert hdrCll / hdrMdcv keys do
+    // not appear in the metadata bag so producers can emit partial
+    // signalling without phantom keys.
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    make_hvc1_seq_start(&mut buf);
+
+    let ci = ColorInfo {
+        color_config: Some(ColorConfig {
+            bit_depth: Some(12),
+            ..ColorConfig::default()
+        }),
+        ..ColorInfo::default()
+    };
+    write_ex_video_color_info(&mut buf, 40, oxideav_flv::FOURCC_HVC1, &ci).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    let _seq = dmx.next_packet().unwrap();
+    let _m = dmx.next_packet().unwrap();
+
+    let md = dmx.metadata();
+    assert_eq!(
+        meta_lookup(md, "colorinfo.colorConfig.bitDepth"),
+        Some("12")
+    );
+    assert!(md.iter().all(|(k, _)| !k.starts_with("colorinfo.hdrCll")));
+    assert!(md.iter().all(|(k, _)| !k.starts_with("colorinfo.hdrMdcv")));
+    // Absent colorConfig.colorPrimaries — not emitted by the writer.
+    assert!(meta_lookup(md, "colorinfo.colorConfig.colorPrimaries").is_none());
+}
+
+#[test]
+fn ex_video_color_info_reset_clears_prior_signal() {
+    // Set then reset — the reset writer emits the spec-recommended
+    // `["colorInfo", Undefined]` payload and the demuxer drops every
+    // prior `colorinfo.*` entry, leaving the `"undefined"` sentinel.
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    make_hvc1_seq_start(&mut buf);
+
+    let ci = ColorInfo {
+        color_config: Some(ColorConfig {
+            bit_depth: Some(10),
+            ..ColorConfig::default()
+        }),
+        ..ColorInfo::default()
+    };
+    write_ex_video_color_info(&mut buf, 40, oxideav_flv::FOURCC_HVC1, &ci).unwrap();
+    write_ex_video_color_info_reset(&mut buf, 80, oxideav_flv::FOURCC_HVC1).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    while dmx.next_packet().is_ok() {}
+
+    let md = dmx.metadata();
+    assert!(meta_lookup(md, "colorinfo.colorConfig.bitDepth").is_none());
+    assert_eq!(meta_lookup(md, "colorinfo"), Some("undefined"));
+}
+
+#[test]
+fn ex_video_color_info_rejects_out_of_range_at_writer() {
+    // Writer must surface the spec-range validation error to callers,
+    // not silently emit a malformed AMF blob.
+    let mut buf = Vec::new();
+    let ci = ColorInfo {
+        hdr_cll: Some(HdrCll {
+            max_cll: Some(50_000.0), // > 10_000 cd/m^2 ceiling
+            ..HdrCll::default()
+        }),
+        ..ColorInfo::default()
+    };
+    let err = write_ex_video_color_info(&mut buf, 0, oxideav_flv::FOURCC_HVC1, &ci).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("maxCLL"));
+    // And nothing was written to the buffer (validation runs before
+    // the FLV tag header is laid down).
+    assert!(buf.is_empty());
 }

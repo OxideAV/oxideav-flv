@@ -9,6 +9,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- HDR `colorInfo` encode-side wiring (Veovera `enhanced-rtmp-v2`
+  §"Metadata Frame" / §`ColorInfo` type block). New
+  `crate::color_info` module exposes typed
+  `ColorInfo` / `ColorConfig` / `HdrCll` / `HdrMdcv` structs whose
+  fields mirror the spec's AMF object shape one-for-one
+  (`bitDepth` + ISO 23091-4 `colorPrimaries` /
+  `transferCharacteristics` / `matrixCoefficients` for the BT.2020
+  config; `maxFall` / `maxCLL` for content light level; `redX..blueY`
+  + `whitePointX` / `whitePointY` + `maxLuminance` / `minLuminance`
+  for the SMPTE ST 2086:2018 mastering-display volume). Every group
+  is optional so producers emit only what they actually signal —
+  absent fields are omitted from the AMF object and the player falls
+  back to codec-bitstream signalling.
+  - `ColorInfo::encode_amf` lays down the AMF0
+    `["colorInfo", Object]` pair that follows the Ex video tag
+    header on a `videoPacketType = Metadata` tag. Bounds-checks every
+    populated field against the spec ranges
+    (`hdrCll.*` in `[0.0001, 10_000]` cd/m^2; chromaticities in
+    `[0.0001, 0.7400]` for X / `[0.0001, 0.8400]` for Y;
+    `maxLuminance` in `[5, 10_000]`, `minLuminance` in
+    `[0.0001, 5]`; `bitDepth` in `[8, 16]`) and returns
+    `Error::invalid` on the first out-of-range value so callers
+    can't silently mux a malformed blob.
+  - `color_info::encode_amf_into(out, &ci)` appends the pair to an
+    existing buffer for producers that want to emit several pairs in
+    one Metadata tag (the spec leaves room for future pair names
+    alongside `colorInfo`).
+  - `color_info::encode_amf_reset()` builds the spec-recommended
+    reset payload `["colorInfo", Undefined]` (Veovera v2: "To reset
+    to the original color state you can send colorInfo with a value
+    of Undefined (the RECOMMENDED approach) or an empty object").
+  - `tag::write_ex_video_color_info(w, ts, fourcc, &ci)` is the
+    one-call convenience writer — encodes the typed struct, packages
+    it in a `videoPacketType = Metadata` tag with the supplied
+    FourCC, and emits the trailing `PreviousTagSize` back-pointer.
+    Validation errors surface to the caller before any bytes reach
+    the writer, so an out-of-range value leaves the output buffer
+    untouched.
+  - `tag::write_ex_video_color_info_reset(w, ts, fourcc)` emits the
+    reset shape via the same single call.
+  - **Round-trip symmetry with the parser.** The encoded body is
+    consumed verbatim by `FlvDemuxer`'s existing
+    `harvest_video_metadata_frame` walker: every populated field
+    surfaces as `metadata["colorinfo.<group>.<key>"]` (bitDepth,
+    colorPrimaries, transferCharacteristics, matrixCoefficients,
+    maxFall, maxCLL, redX..blueY, whitePointX/Y, maxLuminance,
+    minLuminance) and the spec's invalidate-and-replace semantics
+    fall out for free — a follow-up `write_ex_video_color_info`
+    replaces the prior `colorinfo.*` entries; a
+    `write_ex_video_color_info_reset` drops them and leaves the
+    `metadata["colorinfo"] = "undefined"` sentinel. Covered by
+    four new `tests/roundtrip_muxer.rs` tests
+    (`ex_video_color_info_writer_round_trip_full_payload`,
+    `_omits_absent_groups`, `_reset_clears_prior_signal`,
+    `_rejects_out_of_range_at_writer`) plus nine unit tests in
+    `src/color_info.rs` covering empty / populated / reset shapes
+    and each spec-range guard.
+
 - ExAudio multitrack emission + parser-level inner-AudioPacketType
   surfacing (Veovera `enhanced-rtmp-v2` §`ExAudioTagHeader` /
   §`ExAudioTagBody`). The audio-side `ExAudioTagHeader` parser used
