@@ -804,9 +804,12 @@ fn build_audio_packet(
     //   AudioPacketType=1 CodedFrames          → data packet
     //   AudioPacketType=2 SequenceEnd          → skip (no decoder input)
     //   AudioPacketType=4 MultichannelConfig   → header+discard
-    //   AudioPacketType=5 Multitrack           → header+discard (we
-    //                                              don't track-split)
     //   AudioPacketType=7 ModEx + reserved     → header+discard
+    // The outer `Multitrack` (=5) value never appears on
+    // `ex.packet_type`: the parser already resolves it down to the
+    // inner per-track AudioPacketType and flags the wrapper on
+    // `ex.multitrack` (mirrors the video header shape). The default
+    // track's body is selected below via `split_tracks`.
     if let Ok(Some(ex)) = ExAudioTagHeader::parse(body) {
         if ex.packet_type == ExAudioPacketType::SequenceEnd {
             return None;
@@ -841,13 +844,23 @@ fn build_audio_packet(
                 // Data packet — keyframe flag set above.
             }
             ExAudioPacketType::MultichannelConfig
-            | ExAudioPacketType::Multitrack
             | ExAudioPacketType::ModEx
             | ExAudioPacketType::Reserved3
             | ExAudioPacketType::Reserved6
             | ExAudioPacketType::Reserved(_) => {
                 pkt.flags.header = true;
                 pkt.flags.discard = true;
+            }
+            ExAudioPacketType::Multitrack => {
+                // Parser resolves the outer Multitrack down to the
+                // inner per-track AudioPacketType, so this variant
+                // never reaches the match arm. Surface the
+                // unreachable invariant loudly rather than silently
+                // discarding any future malformed input.
+                unreachable!(
+                    "ExAudioTagHeader::parse never surfaces packet_type=Multitrack \
+                     (the outer wrapper is captured on `multitrack` instead)"
+                );
             }
             ExAudioPacketType::SequenceEnd => unreachable!(),
         }

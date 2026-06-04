@@ -174,16 +174,24 @@ pub use crate::multitrack::AvMultitrackType;
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExAudioTagHeader {
-    /// `AudioPacketType` after ModEx unwrapping (and after the
-    /// `Multitrack` UB[4] re-read when applicable).
+    /// `AudioPacketType` after ModEx unwrapping. When the leading
+    /// byte's low nibble was `Multitrack` (5), this field holds the
+    /// **inner** AudioPacketType decoded off the multitrack header
+    /// byte that follows — the outer Multitrack value never appears
+    /// here. `multitrack` is the flag that signals the multitrack
+    /// outer wrapper was present (mirrors the video header shape so
+    /// the per-track packet type drives routing identically on both
+    /// sides).
     pub packet_type: ExAudioPacketType,
     /// FourCc identifying the codec. `None` only when the spec's
     /// multitrack `ManyTracksManyCodecs` mode is in effect; in that
     /// case the per-track FourCc is carried inside the body and must
     /// be parsed by the caller.
     pub fourcc: Option<u32>,
-    /// Multitrack outer descriptor when `AudioPacketType == Multitrack`,
-    /// `None` for the common single-track case.
+    /// Multitrack outer descriptor when the outer `AudioPacketType`
+    /// was `Multitrack`; `None` for the common single-track case.
+    /// When `Some(_)`, `packet_type` holds the **inner** per-track
+    /// AudioPacketType.
     pub multitrack: Option<AvMultitrackType>,
     /// Sum of TimestampOffsetNano ModEx offsets read from the header
     /// stack, in nanoseconds (0..999_999 per ModEx). Reported in
@@ -226,10 +234,14 @@ impl ExAudioTagHeader {
 
         let packet_type = ExAudioPacketType::from_u8(packet_type_raw);
 
-        let (multitrack, fourcc) = if packet_type == ExAudioPacketType::Multitrack {
+        let (multitrack, packet_type, fourcc) = if packet_type == ExAudioPacketType::Multitrack {
             // Multitrack outer header: UB[4] AvMultitrackType +
             // UB[4] inner AudioPacketType (must NOT itself be
-            // Multitrack — that would be malformed).
+            // Multitrack — that would be malformed). The inner
+            // AudioPacketType replaces the outer Multitrack value
+            // for routing purposes (mirrors the video parser's
+            // shape so the demuxer's match arm sees the resolved
+            // per-track packet type).
             if cursor >= body.len() {
                 return Err(Error::invalid(
                     "FLV Ex audio tag: truncated multitrack header byte",
@@ -239,7 +251,8 @@ impl ExAudioTagHeader {
             cursor += 1;
             let mt_type = AvMultitrackType::from_u8((mt_byte >> 4) & 0x0F);
             let inner_pt_raw = mt_byte & 0x0F;
-            if ExAudioPacketType::from_u8(inner_pt_raw) == ExAudioPacketType::Multitrack {
+            let inner_pt = ExAudioPacketType::from_u8(inner_pt_raw);
+            if inner_pt == ExAudioPacketType::Multitrack {
                 return Err(Error::invalid(
                     "FLV Ex audio tag: nested Multitrack packet type",
                 ));
@@ -265,7 +278,7 @@ impl ExAudioTagHeader {
                 cursor += 4;
                 Some(fcc)
             };
-            (Some(mt_type), fourcc)
+            (Some(mt_type), inner_pt, fourcc)
         } else {
             // Single-track: FourCc directly after the packet-type byte
             // (and any ModEx headers we already consumed).
@@ -279,7 +292,7 @@ impl ExAudioTagHeader {
                 body[cursor + 3],
             ]);
             cursor += 4;
-            (None, Some(fcc))
+            (None, packet_type, Some(fcc))
         };
 
         Ok(Some(Self {
@@ -300,28 +313,32 @@ impl ExAudioTagHeader {
     /// AAC AudioSpecificConfig for `SequenceStart`, AC-3 sync frames for
     /// `CodedFrames`, etc.).
     ///
-    /// Coverage and limitations for this slice:
+    /// Coverage and limitations:
     ///
     /// * Single-track headers are fully supported (the common case for
     ///   every Enhanced-RTMP audio FourCc — Opus / fLaC / ac-3 / ec-3 /
     ///   .mp3 / mp4a).
+    /// * Multitrack `OneTrack` / `ManyTracks` are supported (the
+    ///   shared FourCc is emitted once after the multitrack outer
+    ///   byte). `ManyTracksManyCodecs` is supported, the shared
+    ///   FourCc is omitted per spec. The leading byte's low nibble is
+    ///   set to `Multitrack` (5); the inner per-track AudioPacketType
+    ///   (held on [`Self::packet_type`]) is packed into the trailing
+    ///   multitrack outer byte. Nested multitrack
+    ///   (`packet_type == Multitrack` when `multitrack.is_some()`) is
+    ///   rejected.
     /// * ModEx prefix emission **is** supported via the shared
     ///   [`crate::mod_ex::emit`] writer: `mod_ex_entries` are chained
     ///   off the front of the body, each entry contributing its size
     ///   prefix + raw payload + trailer byte, and the lead byte's low
     ///   nibble becomes `7` (ModEx) instead of the resolved
-    ///   `packet_type`. Per-entry contracts (size in `1..=65_536`,
+    ///   AudioPacketType (or `Multitrack` when multitrack mode is in
+    ///   effect). Per-entry contracts (size in `1..=65_536`,
     ///   `TimestampOffsetNano` payload `>= 3` bytes, raw UI24 matches
     ///   the typed `offset_ns`, `offset_ns <= 999_999`) match the
     ///   parser's invariants. If `mod_ex_entries.is_empty()` and
     ///   `timestamp_offset_nano != 0` the header is internally
     ///   inconsistent and rejected with [`Error::InvalidData`].
-    /// * Multitrack emission is **not** implemented in this slice. The
-    ///   audio parser stores `packet_type = Multitrack` and discards the
-    ///   inner `AudioPacketType` (vs the video parser which surfaces the
-    ///   inner type), so faithful inversion requires a model addition
-    ///   (e.g. `inner_packet_type: Option<ExAudioPacketType>`). Deferred
-    ///   to keep this round on the wire-byte writer only.
     ///
     /// Returns `Err(Error::InvalidData)` on combinations the spec leaves
     /// no wire representation for.
@@ -331,34 +348,77 @@ impl ExAudioTagHeader {
                 "ExAudioTagHeader::to_bytes: nonzero timestamp_offset_nano without mod_ex_entries",
             ));
         }
-        if self.multitrack.is_some() {
-            return Err(Error::invalid(
-                "ExAudioTagHeader::to_bytes: multitrack emission not yet implemented (inner AudioPacketType is not surfaced by the parser)",
-            ));
-        }
-        // Lead byte: SoundFormat=9 (ExHeader) high nibble + AudioPacketType
-        // low nibble. When ModEx entries are present the lead byte's low
-        // nibble is `7` (ModEx); the post-loop packet_type is encoded in
-        // the trailer of the last ModEx entry instead. Match the parser's
-        // `walk`-then-FourCc layout exactly.
+        // Single-track: leading-byte AudioPacketType is the final
+        // packet type. Multitrack: leading-byte AudioPacketType is
+        // `Multitrack`; the inner per-track AudioPacketType goes into
+        // the multitrack outer byte that follows the (shared)
+        // FourCc-or-not. Matches the video header's shape.
+        let (resolved_pt, inner_pt_for_mt) = if self.multitrack.is_some() {
+            (
+                ExAudioPacketType::Multitrack.to_u8(),
+                Some(self.packet_type),
+            )
+        } else {
+            (self.packet_type.to_u8() & 0x0F, None)
+        };
+        // When ModEx entries are present the lead byte's low nibble
+        // is the ModEx sentinel `7`; the resolved AudioPacketType
+        // rides on the last ModEx trailer instead. Match the parser's
+        // `walk`-then-resolve layout exactly.
         let lead_pt = if self.mod_ex_entries.is_empty() {
-            self.packet_type.to_u8() & 0x0F
+            resolved_pt
         } else {
             7
         };
         out.push((SOUND_FORMAT_EX_HEADER << 4) | lead_pt);
 
         if !self.mod_ex_entries.is_empty() {
-            // Audio-side ModEx run; the trailer of the last entry carries
-            // the resolved `packet_type` so the parser's `walk` exits with
-            // that value and the FourCc is read next.
-            mod_ex_emit::<7>(out, &self.mod_ex_entries, self.packet_type.to_u8() & 0x0F)?;
+            // Audio-side ModEx run; the trailer of the last entry
+            // carries the resolved AudioPacketType (or `Multitrack`
+            // when multitrack mode is in effect) so the parser's
+            // `walk` exits with the correct value and the
+            // multitrack-outer-byte or FourCc is read next.
+            mod_ex_emit::<7>(out, &self.mod_ex_entries, resolved_pt)?;
         }
 
-        let fcc = self.fourcc.ok_or_else(|| {
-            Error::invalid("ExAudioTagHeader::to_bytes: single-track header needs a FourCc")
-        })?;
-        out.extend_from_slice(&fcc.to_be_bytes());
+        if let Some(mt_type) = self.multitrack {
+            // Spec layout: UB[4] AvMultitrackType | UB[4] inner
+            // AudioPacketType. The inner type must NOT itself be
+            // Multitrack (the parser rejects that on the read side).
+            let inner_pt = inner_pt_for_mt.expect("set when multitrack is Some");
+            if inner_pt == ExAudioPacketType::Multitrack {
+                return Err(Error::invalid(
+                    "ExAudioTagHeader::to_bytes: nested Multitrack packet type",
+                ));
+            }
+            let mt_byte = (mt_type.to_u8() << 4) | (inner_pt.to_u8() & 0x0F);
+            out.push(mt_byte);
+            // FourCc is shared except in ManyTracksManyCodecs (where
+            // the per-track FourCc rides inside each track record in
+            // the body).
+            if matches!(mt_type, AvMultitrackType::ManyTracksManyCodecs) {
+                if self.fourcc.is_some() {
+                    return Err(Error::invalid(
+                        "ExAudioTagHeader::to_bytes: ManyTracksManyCodecs must not carry a shared FourCc",
+                    ));
+                }
+            } else {
+                let fcc = self.fourcc.ok_or_else(|| {
+                    Error::invalid(
+                        "ExAudioTagHeader::to_bytes: multitrack OneTrack/ManyTracks needs a shared FourCc",
+                    )
+                })?;
+                out.extend_from_slice(&fcc.to_be_bytes());
+            }
+        } else {
+            // Single-track: FourCc immediately after the lead byte
+            // (or immediately after the last ModEx trailer when a
+            // ModEx run was emitted).
+            let fcc = self.fourcc.ok_or_else(|| {
+                Error::invalid("ExAudioTagHeader::to_bytes: single-track header needs a FourCc")
+            })?;
+            out.extend_from_slice(&fcc.to_be_bytes());
+        }
         Ok(())
     }
 }
@@ -496,13 +556,15 @@ mod tests {
     #[test]
     fn multitrack_one_track_with_fourcc() {
         // 0x95 = ExHeader + Multitrack. Inner byte 0x01 = OneTrack +
-        // inner AudioPacketType=1 (CodedFrames).
+        // inner AudioPacketType=1 (CodedFrames). The parser surfaces
+        // the inner CodedFrames as `packet_type` and signals the
+        // multitrack outer wrapper via `multitrack = Some(OneTrack)`.
         let mut body = vec![0x95];
         body.push(0x01);
         body.extend_from_slice(b"Opus");
         body.extend_from_slice(&[0xAA, 0xBB]);
         let h = ExAudioTagHeader::parse(&body).unwrap().unwrap();
-        assert_eq!(h.packet_type, ExAudioPacketType::Multitrack);
+        assert_eq!(h.packet_type, ExAudioPacketType::CodedFrames);
         assert_eq!(h.multitrack, Some(AvMultitrackType::OneTrack));
         assert_eq!(h.fourcc, Some(FOURCC_OPUS));
         assert_eq!(&body[h.bytes_consumed..], &[0xAA, 0xBB]);
@@ -510,15 +572,31 @@ mod tests {
 
     #[test]
     fn multitrack_many_tracks_many_codecs_omits_fourcc() {
-        // 0x95 + (0x21 = ManyTracksManyCodecs + CodedFrames).
+        // 0x95 + (0x21 = ManyTracksManyCodecs + inner CodedFrames).
         let mut body = vec![0x95];
         body.push(0x21);
         body.extend_from_slice(&[0xCA, 0xFE]); // per-track stuff (caller parses)
         let h = ExAudioTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.packet_type, ExAudioPacketType::CodedFrames);
         assert_eq!(h.multitrack, Some(AvMultitrackType::ManyTracksManyCodecs));
         assert_eq!(h.fourcc, None);
         // No FourCc consumed: header is just lead (1) + mt (1) = 2.
         assert_eq!(h.bytes_consumed, 2);
+    }
+
+    #[test]
+    fn multitrack_many_tracks_inner_sequence_start_recognised() {
+        // 0x95 + (0x10 = ManyTracks + inner SequenceStart). FourCc
+        // shared.
+        let mut body = vec![0x95];
+        body.push(0x10);
+        body.extend_from_slice(b"mp4a");
+        body.extend_from_slice(&[0x12, 0x10]); // first-track payload (truncated)
+        let h = ExAudioTagHeader::parse(&body).unwrap().unwrap();
+        assert_eq!(h.packet_type, ExAudioPacketType::SequenceStart);
+        assert_eq!(h.multitrack, Some(AvMultitrackType::ManyTracks));
+        assert_eq!(h.fourcc, Some(FOURCC_AAC));
+        assert_eq!(h.bytes_consumed, 6);
     }
 
     #[test]
@@ -757,11 +835,47 @@ mod tests {
     }
 
     #[test]
-    fn to_bytes_rejects_multitrack_emission() {
-        // Multitrack emission is deferred (the parser doesn't surface
-        // the inner AudioPacketType, so faithful inversion needs a
-        // model field). Until then the writer must refuse rather than
-        // silently produce wrong bytes.
+    fn to_bytes_multitrack_one_track_round_trip() {
+        // OneTrack with shared Opus FourCc + inner CodedFrames; parse
+        // → emit → re-parse recovers the same header shape and the
+        // trailing per-track payload survives byte-for-byte.
+        let mut body = vec![0x95];
+        body.push(0x01); // OneTrack | inner CodedFrames
+        body.extend_from_slice(b"Opus");
+        let payload_tail = [0xAA, 0xBB, 0xCC];
+        body.extend_from_slice(&payload_tail);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_multitrack_many_tracks_round_trip() {
+        // ManyTracks with shared mp4a FourCc + inner SequenceStart.
+        let mut body = vec![0x95];
+        body.push(0x10); // ManyTracks | inner SequenceStart
+        body.extend_from_slice(b"mp4a");
+        let payload_tail = [0x12, 0x10, 0x56, 0xE5];
+        body.extend_from_slice(&payload_tail);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_multitrack_many_tracks_many_codecs_round_trip() {
+        // ManyTracksManyCodecs omits the shared FourCc; per-track
+        // FourCc lives inside each body record (caller's problem).
+        let mut body = vec![0x95];
+        body.push(0x21); // ManyTracksManyCodecs | inner CodedFrames
+        let payload_tail = [0xDE, 0xAD, 0xBE, 0xEF];
+        body.extend_from_slice(&payload_tail);
+        let out = assert_round_trips(&body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn to_bytes_multitrack_rejects_nested() {
+        // Nested Multitrack on the inner slot — the parser rejects
+        // this on the read side; the writer must mirror.
         let h = ExAudioTagHeader {
             packet_type: ExAudioPacketType::Multitrack,
             fourcc: Some(FOURCC_OPUS),
@@ -772,6 +886,70 @@ mod tests {
         };
         let mut out = Vec::new();
         assert!(matches!(h.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn to_bytes_multitrack_one_track_rejects_missing_fourcc() {
+        let h = ExAudioTagHeader {
+            packet_type: ExAudioPacketType::CodedFrames,
+            fourcc: None,
+            multitrack: Some(AvMultitrackType::OneTrack),
+            timestamp_offset_nano: 0,
+            mod_ex_entries: Vec::new(),
+            bytes_consumed: 0,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(h.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn to_bytes_multitrack_many_tracks_many_codecs_rejects_shared_fourcc() {
+        let h = ExAudioTagHeader {
+            packet_type: ExAudioPacketType::CodedFrames,
+            fourcc: Some(FOURCC_OPUS),
+            multitrack: Some(AvMultitrackType::ManyTracksManyCodecs),
+            timestamp_offset_nano: 0,
+            mod_ex_entries: Vec::new(),
+            bytes_consumed: 0,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(h.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn to_bytes_multitrack_with_modex_round_trip() {
+        // Stack the two features: a single TimestampOffsetNano ModEx
+        // (500 ns) ahead of a OneTrack-shaped multitrack header whose
+        // inner type is CodedFrames. After the chain the parser's
+        // `walk` must exit with the resolved value `Multitrack` so the
+        // multitrack outer byte (and shared FourCc) are read next; the
+        // re-parsed header surfaces the inner CodedFrames in
+        // `packet_type` and the OneTrack flag in `multitrack`.
+        let h = ExAudioTagHeader {
+            packet_type: ExAudioPacketType::CodedFrames,
+            fourcc: Some(FOURCC_OPUS),
+            multitrack: Some(AvMultitrackType::OneTrack),
+            timestamp_offset_nano: 500,
+            mod_ex_entries: vec![ModExEntry {
+                subtype_raw: 0,
+                payload: crate::mod_ex::ModExPayload::TimestampOffsetNano { offset_ns: 500 },
+                raw: vec![0x00, 0x01, 0xF4],
+            }],
+            bytes_consumed: 0,
+        };
+        let mut out = Vec::new();
+        h.to_bytes(&mut out).unwrap();
+        let payload_tail = [0x11, 0x22, 0x33];
+        out.extend_from_slice(&payload_tail);
+        // Lead byte advertises the ModEx sentinel.
+        assert_eq!(out[0], (SOUND_FORMAT_EX_HEADER << 4) | 7);
+        let h2 = ExAudioTagHeader::parse(&out).unwrap().unwrap();
+        assert_eq!(h2.packet_type, ExAudioPacketType::CodedFrames);
+        assert_eq!(h2.multitrack, Some(AvMultitrackType::OneTrack));
+        assert_eq!(h2.fourcc, Some(FOURCC_OPUS));
+        assert_eq!(h2.timestamp_offset_nano, 500);
+        assert_eq!(h2.mod_ex_entries.len(), 1);
+        assert_eq!(&out[h2.bytes_consumed..], &payload_tail);
     }
 
     #[test]

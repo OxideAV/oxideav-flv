@@ -337,9 +337,17 @@ recovers the same entries + accumulator (`TimestampOffsetNano` sums
 match between writer and parser). Per-entry validation matches the
 parser's invariants (raw size in `1..=65_536`, `TimestampOffsetNano`
 raw `>= 3` bytes with UI24 BE matching `offset_ns`, `offset_ns
-<= 999_999`). ExAudio multitrack emission is still deferred — the
-writer returns `Error::InvalidData` rather than emit incorrect
-bytes.
+<= 999_999`). Multitrack emission is now supported on both the audio
+and video sides for the spec's three `AvMultitrackType` variants
+(`OneTrack` / `ManyTracks` / `ManyTracksManyCodecs`); the audio
+parser surfaces the **inner** per-track `AudioPacketType` on
+`ExAudioTagHeader::packet_type` (the outer `Multitrack` wrapper rides
+on `multitrack` instead, mirroring the video header's shape), and
+`to_bytes` lays the inner type into the multitrack outer byte. ModEx
+prefix emission stacks cleanly with multitrack mode: the lead byte
+advertises the ModEx sentinel and the final ModEx trailer carries
+the resolved outer `Multitrack` value so `walk` exits on
+`Multitrack` and the multitrack outer byte is read next.
 
 ```rust
 use oxideav_flv::{header, script, script::MetadataBag, tag};
@@ -357,9 +365,6 @@ script::write_on_metadata(&mut flv, &meta)?;
 tag::write_mp3_tag(&mut flv, 0, 3, true, true, &mp3_frame)?;
 # Ok::<(), oxideav_core::Error>(())
 ```
-
-Still out of scope (followups): the ExAudio multitrack emit path
-(waiting on the parser to surface the inner `AudioPacketType`).
 
 ## Quick use
 

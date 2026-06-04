@@ -25,8 +25,9 @@ use oxideav_flv::{
     write_hevc_coded_frames_x, write_hevc_sequence_start, write_mp3_ex_coded_frames,
     write_opus_coded_frames, write_opus_sequence_start, write_vp6_tag, write_vp6a_tag,
     write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
-    write_vvc_sequence_start, ExAudioPacketType, ExAudioTagHeader, ExFrameType, ExPacketType,
-    ExVideoTagHeader, ModExEntry, ModExPayload, FOURCC_AUDIO_AAC, FOURCC_AV01,
+    write_vvc_sequence_start, AvMultitrackType, ExAudioPacketType, ExAudioTagHeader, ExFrameType,
+    ExPacketType, ExVideoTagHeader, ModExEntry, ModExPayload, FOURCC_AUDIO_AAC, FOURCC_AV01,
+    FOURCC_OPUS,
 };
 
 /// Three distinct synthetic MP3 frame payloads. The demuxer treats an
@@ -863,4 +864,107 @@ fn ex_video_modex_reserved_subtype_passthrough_round_trips_through_demuxer() {
     let p = dmx.next_packet().unwrap();
     assert_eq!(p.data, frame);
     assert_eq!(p.pts, Some(60));
+}
+
+#[test]
+fn ex_audio_multitrack_one_track_round_trips_through_demuxer() {
+    // OneTrack multitrack audio: the body after the Ex header carries
+    // `trackId UI8` then the per-track payload running to the end of
+    // the body. Build a OneTrack Opus stream whose default track
+    // (trackId 0) carries a single coded-frame body. The writer must
+    // produce a tag the demuxer recovers as the default-track Opus
+    // packet, with the codec id resolved to `opus` and the per-track
+    // payload bytes surfaced verbatim.
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    // SequenceStart so the stream is minted with the right codec id +
+    // extradata. Drive it through the single-track path first; the
+    // multitrack CodedFrames tag follows.
+    let opus_head = vec![b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd'];
+    write_opus_sequence_start(&mut buf, 0, &opus_head).unwrap();
+
+    // OneTrack CodedFrames body: `trackId(0)` + Opus packet.
+    let opus_packet = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+    let mut mt_body = vec![0u8]; // trackId 0
+    mt_body.extend_from_slice(&opus_packet);
+
+    let header_struct = ExAudioTagHeader {
+        packet_type: ExAudioPacketType::CodedFrames,
+        fourcc: Some(FOURCC_OPUS),
+        multitrack: Some(AvMultitrackType::OneTrack),
+        timestamp_offset_nano: 0,
+        mod_ex_entries: Vec::new(),
+        bytes_consumed: 0,
+    };
+    write_ex_audio_tag(&mut buf, 23, &header_struct, &mt_body).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "opus");
+    assert_eq!(dmx.streams()[0].params.extradata, opus_head);
+
+    let _hdr = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(
+        p.data, opus_packet,
+        "default-track payload must reach the demuxer verbatim"
+    );
+    assert_eq!(p.pts, Some(23));
+    assert!(
+        !p.flags.discard,
+        "Multitrack outer wrapper resolves to CodedFrames → data packet, not discard"
+    );
+}
+
+#[test]
+fn ex_audio_multitrack_many_tracks_round_trips_default_track() {
+    // ManyTracks: two AAC tracks. trackId 0 is the default; trackId 1
+    // is the alternate. Each track is prefixed with `trackId UI8+
+    // sizeOfTrack UI24` followed by `sizeOfTrack` payload bytes. The
+    // demuxer surfaces the default track's payload as the packet
+    // body; the alternate track survives in the wire bytes but is not
+    // emitted (the demuxer is single-stream-per-tag).
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let asc = vec![0x12, 0x10];
+    write_aac_ex_sequence_start(&mut buf, 0, &asc).unwrap();
+
+    let default_au = vec![0x11, 0x22, 0x33, 0x44];
+    let alt_au = vec![0x55, 0x66, 0x77, 0x88, 0x99];
+
+    let mut mt_body = Vec::new();
+    // Track 0 (default).
+    mt_body.push(0u8); // trackId
+    let s = default_au.len();
+    mt_body.extend_from_slice(&[(s >> 16) as u8, (s >> 8) as u8, s as u8]);
+    mt_body.extend_from_slice(&default_au);
+    // Track 1 (alternate).
+    mt_body.push(1u8);
+    let s = alt_au.len();
+    mt_body.extend_from_slice(&[(s >> 16) as u8, (s >> 8) as u8, s as u8]);
+    mt_body.extend_from_slice(&alt_au);
+
+    let header_struct = ExAudioTagHeader {
+        packet_type: ExAudioPacketType::CodedFrames,
+        fourcc: Some(FOURCC_AUDIO_AAC),
+        multitrack: Some(AvMultitrackType::ManyTracks),
+        timestamp_offset_nano: 0,
+        mod_ex_entries: Vec::new(),
+        bytes_consumed: 0,
+    };
+    write_ex_audio_tag(&mut buf, 46, &header_struct, &mt_body).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
+
+    let _hdr = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(
+        p.data, default_au,
+        "ManyTracks default-track payload (trackId 0) must surface verbatim"
+    );
+    assert_eq!(p.pts, Some(46));
 }

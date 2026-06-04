@@ -9,6 +9,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ExAudio multitrack emission + parser-level inner-AudioPacketType
+  surfacing (Veovera `enhanced-rtmp-v2` §`ExAudioTagHeader` /
+  §`ExAudioTagBody`). The audio-side `ExAudioTagHeader` parser used
+  to set `packet_type = Multitrack` and silently drop the inner
+  per-track `AudioPacketType` byte; that left no way for the inverse
+  `to_bytes` writer to recover the wire shape, so multitrack
+  emission was rejected with `Error::InvalidData`. The asymmetry
+  also forced the demuxer's match arm to discard the wrapper
+  altogether (and the discarded default-track payload never
+  reached callers). The parser now decodes the multitrack outer
+  byte's two nibbles into `multitrack: Some(AvMultitrackType)` and
+  `packet_type: ExAudioPacketType` — the inner per-track packet
+  type — mirroring the shape the video-side `ExVideoTagHeader`
+  parser has carried since the multitrack slice landed.
+  - **Parser.** When the leading byte's low nibble is `Multitrack`
+    (5), the next byte packs `AvMultitrackType UB[4] | inner
+    AudioPacketType UB[4]`. The inner type must NOT itself be
+    `Multitrack` (rejected with `Error::InvalidData`). The shared
+    FourCc is read for `OneTrack` / `ManyTracks` and skipped for
+    `ManyTracksManyCodecs` (where the per-track FourCc rides
+    inside each body record). `bytes_consumed` advances past the
+    multitrack outer byte and optional shared FourCc so the body
+    splitter (`crate::multitrack::split_tracks`) can walk the
+    per-track records off `body[bytes_consumed..]`.
+  - **Writer.** `ExAudioTagHeader::to_bytes` mirrors the video
+    writer: when `multitrack.is_some()` the leading byte's low
+    nibble is `Multitrack` (5), the multitrack outer byte packs
+    `AvMultitrackType.to_u8() << 4 | inner_packet_type.to_u8()`,
+    and the shared FourCc is emitted exactly when the variant
+    isn't `ManyTracksManyCodecs`. Nested multitrack
+    (`packet_type == Multitrack` with `multitrack.is_some()`)
+    is rejected, mirroring the parser's read-side rejection.
+    `ManyTracksManyCodecs` with a `Some(fourcc)` is rejected
+    (the spec leaves no slot for a shared FourCc in that mode);
+    `OneTrack` / `ManyTracks` with `None` is rejected (the spec
+    requires the shared FourCc on those variants). ModEx prefix
+    emission stacks with multitrack mode: the lead byte
+    advertises the ModEx sentinel `7` and the final ModEx
+    trailer's low nibble carries the resolved outer `Multitrack`
+    value so the parser's `walk` exits on `Multitrack` and the
+    multitrack outer byte is read next.
+  - **Demuxer routing.** The match arm that classified ExAudio
+    packets dropped `ExAudioPacketType::Multitrack` into the
+    `header + discard` bucket; that path silently discarded the
+    default-track audio body even when the multitrack outer was
+    wrapping a perfectly decodable inner `CodedFrames`. With the
+    parser now resolving the outer wrapper, the match arm's
+    `Multitrack` variant is unreachable and is replaced with an
+    explicit `unreachable!()` that documents the invariant. The
+    default-track selection (`split_tracks` → trackId 0 → first
+    track in wire order) already lived inside the same code path
+    and continues to drive the packet body for both video and
+    audio multitrack tags.
+  - **Tests.** Five new `src/ex_audio.rs` unit tests exercise the
+    OneTrack / ManyTracks / ManyTracksManyCodecs `to_bytes`
+    round-trips, the multitrack-with-ModEx stack, and the writer
+    rejections (nested multitrack, missing shared FourCc on
+    `OneTrack` / `ManyTracks`, present shared FourCc on
+    `ManyTracksManyCodecs`). One new parser test asserts the inner
+    `SequenceStart` is surfaced through a `ManyTracks` wrapper.
+    Two new `tests/roundtrip_muxer.rs` integration tests build
+    full FLVs through `write_ex_audio_tag` (OneTrack-Opus +
+    ManyTracks-AAC) and assert the demuxer surfaces the
+    default-track payload verbatim with the right pts and codec
+    id, with no `discard` flag set on the resolved `CodedFrames`
+    routing.
+
 - ExVideo / ExAudio ModEx prefix emission (Veovera `enhanced-rtmp-v2`
   §`ExVideoTagHeader` / §`ExAudioTagHeader`, while
   `packet_type == ModEx = 7`). The muxer slice landed last round with
