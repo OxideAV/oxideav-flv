@@ -235,6 +235,39 @@ oxideav-flv = "0.0"
     `ManyTracksManyCodecs` (no shared FourCc) maps the stream to the
     `flv:exaudio:multicodec` / `flv:exvideo:multicodec` sentinel.
 
+### Typed `onMetaData` accessors
+
+[`oxideav_flv::TypedMetadata`] (module `typed_meta`) is a borrowed view
+over `Demuxer::metadata()` that re-types the spec-defined fifteen
+`onMetaData` properties of Annex E.5 back into their declared AMF
+types — Number / Boolean / String — so callers don't have to parse
+strings out of the bag themselves:
+
+```rust
+use oxideav_flv::TypedMetadata;
+let typed = TypedMetadata::new(dmx.metadata());
+let dur = typed.duration();                 // Option<f64>     — seconds
+let w   = typed.width();                    // Option<u32>     — pixels
+let h   = typed.height();                   // Option<u32>     — pixels
+let fps = typed.framerate();                // Option<f64>     — fps
+let st  = typed.stereo();                   // Option<bool>
+let cse = typed.can_seek_to_end();          // Option<bool>
+let cd  = typed.creationdate();             // Option<&str>    — free-form
+let cdd = typed.creationdate_as_date();     // Option<(f64, i16)> — ms + tz min
+let vid = typed.video_codec_id_str();       // Option<String>  — "h264", "vp6f", …
+```
+
+Per-property accessors: `duration` / `filesize` / `width` / `height` /
+`framerate` / `video_data_rate_kbps` / `audio_data_rate_kbps` /
+`audio_sample_rate` / `audio_sample_size` / `audio_delay_seconds` /
+`video_codec_id` / `audio_codec_id` (+ string forms via
+[`tag::video_codec_id_str`] / [`tag::audio_codec_id_str`]) / `stereo` /
+`can_seek_to_end` / `creationdate` (+ a structured
+`creationdate_as_date` accessor that decodes the
+`"date:<ms>tz:<offset>"` carrier the demuxer uses when the producer
+stamped the field as an AMF0 `Date`). Missing or malformed entries
+return `None`; the accessor never panics on bag contents.
+
 ### Robustness
 
 The demuxer is fuzz-shaped by a hand-crafted adversarial-input suite

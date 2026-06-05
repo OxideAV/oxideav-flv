@@ -30,6 +30,7 @@ pub mod mod_ex;
 pub mod multitrack;
 pub mod script;
 pub mod tag;
+pub mod typed_meta;
 
 use oxideav_core::ContainerRegistry;
 
@@ -67,6 +68,7 @@ pub use tag::{
     VideoInfoCommand, VideoTagHeader, AUDIO_CODEC_AAC, AUDIO_CODEC_MP3, AUDIO_CODEC_MP3_8K,
     VIDEO_CODEC_FLV1, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A, VIDEO_CODEC_VP6F,
 };
+pub use typed_meta::TypedMetadata;
 
 /// Register the demuxer, its probe, and the `.flv` extension with a
 /// [`ContainerRegistry`].

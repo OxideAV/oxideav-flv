@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed read-side accessor for the spec-defined fifteen `onMetaData`
+  properties of Annex E.5 (`duration`, `filesize`, `width`, `height`,
+  `framerate`, `videodatarate`, `audiodatarate`, `audiosamplerate`,
+  `audiosamplesize`, `audiodelay`, `videocodecid`, `audiocodecid`,
+  `stereo`, `canSeekToEnd`, `creationdate`). New `crate::typed_meta`
+  module exposes `TypedMetadata`, a borrowed view over
+  `Demuxer::metadata()` that re-types each property back into its
+  declared AMF type (Number / Boolean / String) so callers don't
+  have to parse strings out of the bag themselves. Missing or
+  malformed entries return `None`; the accessor never panics. A
+  structured `creationdate_as_date` accessor decodes the
+  `"date:<ms>tz:<offset>"` carrier the demuxer uses when the
+  producer stamped the field as an AMF0 `Date` rather than a
+  free-form `String`. Convenience helpers
+  `video_codec_id_str` / `audio_codec_id_str` lower the integer
+  codec id through the stable per-id string table
+  (`"h264"`, `"vp6f"`, `"aac"`, `"speex"`, …).
+
 - HDR `colorInfo` encode-side wiring (Veovera `enhanced-rtmp-v2`
   §"Metadata Frame" / §`ColorInfo` type block). New
   `crate::color_info` module exposes typed
