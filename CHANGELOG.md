@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Fuzz-target crate `fuzz/` exercising the parser surface against
+  libfuzzer. Four targets land: `demuxer_open_next` (feed arbitrary
+  bytes to `open_demuxer`, drain `next_packet` until error / EOF,
+  bound the per-iteration step count so a forged input cannot wedge
+  the harness — the 24-bit `DataSize` lever and the `read_body`
+  remaining-bytes guard are exercised here); `amf0_parse` and
+  `amf3_parse` (feed arbitrary bytes through the AMF0 / AMF3 entry
+  points — covers `LongString` `u32::MAX`-length, unterminated
+  Object body, AVM+ switch into AMF3, U29 4-byte form, UTF-8-vr
+  reference tables, traits chains, and circular complex-object
+  references); and `script_metadata_roundtrip` (synthesise a
+  minimal FLV from fuzz-controlled scalar `onMetaData` properties
+  using the muxer slice, re-parse with `open_demuxer`, assert every
+  property the muxer emitted survives in `metadata()` — surfaces
+  any writer/parser disagreement where the writer happily emits
+  bytes the parser refuses or silently drops). The fuzz crate uses
+  an isolated `[workspace]` table so it does not pull into the
+  umbrella; its `Cargo.lock` is gitignored per workspace policy.
+
 - Typed read-side accessor for the spec-defined fifteen `onMetaData`
   properties of Annex E.5 (`duration`, `filesize`, `width`, `height`,
   `framerate`, `videodatarate`, `audiodatarate`, `audiosamplerate`,

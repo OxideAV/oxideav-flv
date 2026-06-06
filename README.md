@@ -284,6 +284,26 @@ A pre-allocation guard in `read_body` rejects any tag whose `DataSize`
 exceeds the remaining bytes of the underlying `Read + Seek` stream
 *before* committing the `Vec`.
 
+A `fuzz/` sub-crate (cargo-fuzz / libfuzzer) backs the hand-crafted
+suite with four targets:
+
+* `demuxer_open_next` — arbitrary bytes through `open_demuxer` and
+  drain `next_packet` until error or EOF, with a per-iteration step
+  cap so a forged input cannot wedge the harness.
+* `amf0_parse` / `amf3_parse` — arbitrary bytes through
+  `parse_amf0_value` / `parse_amf3_value` directly, exercising the
+  `LongString` `u32::MAX` lever, unterminated Object bodies, the
+  AMF0→AMF3 `0x11` AVM+ switch, U29 4-byte form, UTF-8-vr reference
+  tables, traits chains, and circular complex-object references.
+* `script_metadata_roundtrip` — synthesise a minimal FLV from
+  fuzz-controlled scalar `onMetaData` properties using the muxer
+  slice, re-parse with `open_demuxer`, assert every property the
+  muxer emitted survives in `metadata()`; surfaces any
+  writer/parser disagreement.
+
+The fuzz crate carries its own `[workspace]` table so the umbrella
+build is unaffected; `Cargo.lock` is gitignored.
+
 ### Muxer
 
 A first muxer slice is implemented: enough to write a playable

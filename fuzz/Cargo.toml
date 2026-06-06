@@ -1,0 +1,82 @@
+[package]
+name = "oxideav-flv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# FLV's attack surface is wide because the format has so many embedded
+# sub-grammars: a 9-byte file header, a per-tag 11-byte header carrying
+# a 24-bit DataSize, AMF0 + AMF3 sub-streams in script tags, AVC /
+# HEVC / VVC decoder-config records, an enhanced-rtmp-v2 ExVideo /
+# ExAudio ModEx loop, multitrack-track splitting, and an FLV-encryption
+# preamble. Each one is a place a malformed input can drive the parser
+# into an unbounded read, a gigabyte allocation, or an integer over-
+# flow. The fuzz targets below cover the major entry points:
+#
+#  * `demuxer_open_next` — feed arbitrary bytes to `open_demuxer` and
+#                          drain `next_packet` until it errors. Must
+#                          never panic, OOM, or spin. The 16 MB
+#                          `DataSize` lever and the `read_body`
+#                          remaining-bytes guard are exercised here.
+#  * `amf0_parse`        — feed arbitrary bytes to `parse_amf0_value`.
+#                          Covers `LongString` u32::MAX-length, unknown
+#                          markers, unterminated Object body,
+#                          `TypedObject` class-alias parsing.
+#  * `amf3_parse`        — feed arbitrary bytes to `parse_amf3_value`.
+#                          Covers U29 4-byte form, UTF-8-vr reference
+#                          tables, Object trait chains (inline /
+#                          traits-ref / traits-ext), circular object
+#                          references.
+#  * `script_metadata_roundtrip` — synthesise a minimal FLV (header +
+#                          `onMetaData` with fuzz-controlled scalar
+#                          properties + zero or more empty tags),
+#                          re-parse, assert the file at least opens
+#                          and that any property the fuzzer put into
+#                          the bag survives in `metadata()` or is
+#                          dropped cleanly (no panic).
+#
+# The fuzz crate links `oxideav-flv` via path-dep with default features
+# and depends on `oxideav-core` only transitively. No external codec
+# oracle: FLV is a clean container format and the per-codec interop is
+# already covered by sibling crates' own fuzz targets.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-flv]
+path = ".."
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "demuxer_open_next"
+path = "fuzz_targets/demuxer_open_next.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "amf0_parse"
+path = "fuzz_targets/amf0_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "amf3_parse"
+path = "fuzz_targets/amf3_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "script_metadata_roundtrip"
+path = "fuzz_targets/script_metadata_roundtrip.rs"
+test = false
+doc = false
