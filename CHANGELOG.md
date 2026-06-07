@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `onCuePoint` (Annex A) and `onXMPData` (§E.6) script-data tag
+  writers — completing the muxer's coverage of the four spec-defined
+  script names (the other two being `onMetaData` E.5 and the
+  encryption `|AdditionalHeader` F.2). New
+  `script::write_on_cue_point(w, ts_ms, &CuePointParams)` lays down
+  the AMF0 method-name + cue-object pair under the four
+  long-standing Flash-runtime property keys: `name` (producer
+  identifier, AMF0 String), `time` (Number; validated finite —
+  NaN / ±∞ rejected as the demuxer treats `time` as seconds and a
+  non-finite value would corrupt the metadata bag), `type` (String;
+  `"event"` for playhead-pass dispatch, `"navigation"` for cues that
+  additionally surface as seek targets — exposed through
+  `CuePointType::Event` / `CuePointType::Navigation`), and
+  `parameters` (anonymous Object of user-defined `(name, String)`
+  pairs the demuxer flattens under
+  `metadata["cuepoint.<n>.parameters.<key>"]`). `timestamp_ms` is
+  the cue's playback alignment timestamp — Annex A.4 specifies the
+  AMF data track is interleaved at the right time alongside audio
+  and video so the runtime dispatches the cue when the playhead
+  reaches it. `script::write_on_xmp_data(w, ts_ms, live_xml)` emits
+  the §E.6 anonymous Object carrying the single `liveXML` String
+  property — exactly the shape the demuxer's `xmp_liveXML` accessor
+  walks to surface the payload under `metadata["xmp"]`. Both
+  writers round-trip bit-exactly through `FlvDemuxer` and may be
+  interleaved freely between media tags. Three new
+  `tests/roundtrip_muxer.rs` tests cover both writers
+  end-to-end (XMP packet body surfaces verbatim under
+  `metadata["xmp"]`; per-cue `name` / `time` / `type` / `parameters`
+  round-trip under `metadata["cuepoint.<n>.<key>"]`; interleaving
+  cuepoint / XMP tags between MP3 audio tags leaves the audio
+  packet stream undisturbed) and eight new `script::tests::*` unit
+  tests cover the body-layout, `event` vs `navigation` wire
+  spelling, empty-parameters Object, non-finite-time rejection, and
+  full-tag header layout (TagType `0x12`, UI24 + UI8 timestamp,
+  matching DataSize) for each writer. `CuePointParams`,
+  `CuePointType`, `write_on_cue_point` / `write_on_cue_point_body`,
+  and `write_on_xmp_data` / `write_on_xmp_data_body` are re-exported
+  from the crate root.
+
 - Fuzz-target crate `fuzz/` exercising the parser surface against
   libfuzzer. Four targets land: `demuxer_open_next` (feed arbitrary
   bytes to `open_demuxer`, drain `next_packet` until error / EOF,

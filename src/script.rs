@@ -1,5 +1,5 @@
-//! FLV `onMetaData` script-data tag writer (spec §E.4.1 / §E.4.4 /
-//! §E.5).
+//! FLV script-data tag writers (spec §E.4.1 / §E.4.4 / §E.5 / §E.6 /
+//! Annex A).
 //!
 //! A `ScriptTagBody` is two AMF0 values: a String *name* and a value
 //! payload. For `onMetaData` the name is the literal `"onMetaData"` and
@@ -8,6 +8,15 @@
 //! the small typed bag of scalar properties and serialises it into a
 //! complete script tag (TagType `0x12`) via the AMF0 writers in
 //! [`crate::amf0`] and the tag framing in [`crate::tag`].
+//!
+//! Two further script-data tag flavours land here:
+//! [`write_on_cue_point`] emits an Annex A embedded cue point from a
+//! [`CuePointParams`] (the four conventional `name` / `time` / `type` /
+//! `parameters` properties), and [`write_on_xmp_data`] emits an
+//! §E.6 XMP metadata tag carrying the `liveXML` string. Both
+//! round-trip bit-exactly through [`crate::FlvDemuxer`] under the
+//! existing `metadata["cuepoint.<n>.<key>"]` / `metadata["xmp"]`
+//! bag layouts.
 //!
 //! The spec does not mandate property ordering; [`MetadataBag`]
 //! preserves insertion order so the emitted bytes are deterministic and
@@ -272,6 +281,186 @@ pub fn write_on_metadata<W: Write + ?Sized>(w: &mut W, bag: &MetadataBag) -> Res
     tag::write_tag(w, TagType::ScriptData, 0, 0, &body)
 }
 
+/// Kind tag for an embedded cue point — wire-serialised under the
+/// conventional `type` property (Annex A.2: "The first value shall be a
+/// string that represents the name of the AMF sample"; the per-cue
+/// properties layout is fixed by long-standing Flash convention).
+///
+/// `Event` cue points are dispatched whenever the playhead passes the
+/// cue timestamp during normal playback. `Navigation` cue points
+/// additionally land at the closest preceding video keyframe so
+/// the runtime can offer them as seek targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CuePointType {
+    /// Dispatched on playhead pass-through. Wire form: `"event"`.
+    Event,
+    /// Dispatched on playhead pass-through; additionally surfaced as a
+    /// seek target on the closest preceding video keyframe. Wire form:
+    /// `"navigation"`.
+    Navigation,
+}
+
+impl CuePointType {
+    /// Lower-case wire spelling exactly matching the spec convention.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CuePointType::Event => "event",
+            CuePointType::Navigation => "navigation",
+        }
+    }
+}
+
+/// Typed cue-point parameter pack for [`write_on_cue_point`] (Annex A).
+///
+/// Each cue point is a single AMF0 object carrying four well-known
+/// properties:
+///
+/// * `name` — opaque identifier the producer assigns to this cue.
+/// * `time` — wall-clock time in **seconds**, as an AMF0 Number.
+/// * `type` — `"event"` or `"navigation"` (see [`CuePointType`]).
+/// * `parameters` — an anonymous Object of user-defined name → string
+///   pairs (Annex A models cue parameters as a free-form bag; the
+///   demuxer surfaces them under `cuepoint.<n>.parameters.<key>`).
+///
+/// The parameter bag is intentionally limited to `(name, String)`
+/// pairs because that is what the existing demuxer
+/// (`flatten_amf_value` → `metadata["cuepoint.N.parameters.<key>"]`)
+/// already round-trips through. Producers needing richer typed
+/// parameters can stitch them in at the AMF0 level themselves — this
+/// helper covers the common case (chapter markers, ad-insertion
+/// triggers, captions) without dragging an AMF builder API into the
+/// public surface.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CuePointParams {
+    /// Producer-assigned identifier (`name` property).
+    pub name: String,
+    /// Cue time in seconds (`time` property).
+    pub time_seconds: f64,
+    /// Event / Navigation (`type` property).
+    pub kind: CuePointType,
+    /// User-defined name → string parameter pairs (`parameters`
+    /// property). Empty when the cue carries no extra parameters.
+    pub parameters: Vec<(String, String)>,
+}
+
+impl CuePointParams {
+    /// Construct a parameter-less cue at `time_seconds`.
+    pub fn new(name: &str, time_seconds: f64, kind: CuePointType) -> Self {
+        Self {
+            name: name.to_string(),
+            time_seconds,
+            kind,
+            parameters: Vec::new(),
+        }
+    }
+
+    /// Append a user parameter `(name, value)` pair.
+    pub fn parameter(mut self, name: &str, value: &str) -> Self {
+        self.parameters.push((name.to_string(), value.to_string()));
+        self
+    }
+}
+
+/// Serialise an `onCuePoint` `ScriptTagBody` (no tag framing) into
+/// `out` — the AMF0 String name `"onCuePoint"` followed by the cue
+/// object whose four properties (`name`, `time`, `type`,
+/// `parameters`) the demuxer harvests under
+/// `metadata["cuepoint.<n>.<key>"]`.
+///
+/// Validates that `time_seconds` is finite (the demuxer treats
+/// per-cue `time` as a wall-clock seconds value; NaN / ±∞ would
+/// silently corrupt the metadata bag).
+pub fn write_on_cue_point_body(out: &mut Vec<u8>, params: &CuePointParams) -> Result<()> {
+    if !params.time_seconds.is_finite() {
+        return Err(Error::invalid(
+            "FLV onCuePoint: time_seconds must be finite",
+        ));
+    }
+    // Method name.
+    amf0::write_string(out, "onCuePoint")?;
+    // Cue object.
+    amf0::write_object_start(out)?;
+    amf0::write_property_name(out, "name")?;
+    amf0::write_string(out, &params.name)?;
+    amf0::write_property_name(out, "time")?;
+    amf0::write_number(out, params.time_seconds)?;
+    amf0::write_property_name(out, "type")?;
+    amf0::write_string(out, params.kind.as_str())?;
+    amf0::write_property_name(out, "parameters")?;
+    // `parameters` is an anonymous Object — even when empty (the spec
+    // makes no statement either way; the demuxer's flatten walker
+    // handles either shape, but emitting an empty Object keeps the
+    // wire payload self-describing).
+    amf0::write_object_start(out)?;
+    for (k, v) in &params.parameters {
+        amf0::write_property_name(out, k)?;
+        amf0::write_string(out, v)?;
+    }
+    amf0::write_object_end(out)?;
+    amf0::write_object_end(out)?;
+    Ok(())
+}
+
+/// Write a complete `onCuePoint` script tag — tag header (TagType
+/// `0x12`, `timestamp_ms`, StreamID `0`), the serialised
+/// `ScriptTagBody`, and the trailing `PreviousTagSize` (spec §E.3 /
+/// §E.4.1, Annex A.2 — cue-point sample format).
+///
+/// Unlike `onMetaData`, an `onCuePoint` tag carries a non-zero
+/// timestamp aligned with the cue's playback time — the Flash runtime
+/// dispatches the cue when the playhead passes the tag (Annex A.4
+/// "AMF content should be interleaved at the right time along with the
+/// audio and video content"). Returns the total number of bytes
+/// written.
+pub fn write_on_cue_point<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    params: &CuePointParams,
+) -> Result<u32> {
+    let mut body = Vec::new();
+    write_on_cue_point_body(&mut body, params)?;
+    tag::write_tag(w, TagType::ScriptData, timestamp_ms, 0, &body)
+}
+
+/// Serialise an `onXMPData` `ScriptTagBody` (no tag framing) into
+/// `out` — the AMF0 String name `"onXMPData"` followed by an
+/// anonymous Object carrying the single `liveXML` String property
+/// (spec §E.6). The demuxer's `xmp_liveXML` accessor parses this
+/// exact shape and surfaces the payload under `metadata["xmp"]`.
+pub fn write_on_xmp_data_body(out: &mut Vec<u8>, live_xml: &str) -> Result<()> {
+    amf0::write_string(out, "onXMPData")?;
+    amf0::write_object_start(out)?;
+    amf0::write_property_name(out, "liveXML")?;
+    amf0::write_string(out, live_xml)?;
+    amf0::write_object_end(out)?;
+    Ok(())
+}
+
+/// Write a complete `onXMPData` script tag — tag header (TagType
+/// `0x12`, `timestamp_ms`, StreamID `0`), the serialised
+/// `ScriptTagBody`, and the trailing `PreviousTagSize` (spec §E.3 /
+/// §E.4.1 / §E.6). `live_xml` is the XMP packet bytes (typically the
+/// `<x:xmpmeta ...>` envelope a producer hands to the runtime); the
+/// demuxer round-trips it byte-for-byte under `metadata["xmp"]`.
+///
+/// The AMF0 String wire form caps each value at 65535 bytes; XMP
+/// packets near that ceiling should be emitted as their own tag, or
+/// the AMF0 LongString writer (`0x0C`) reused — that path is left to
+/// callers who need it.
+///
+/// `timestamp_ms` is the cue-style alignment timestamp. Producers
+/// typically place an XMP header tag at the head of the file with
+/// `timestamp_ms = 0`.
+pub fn write_on_xmp_data<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    live_xml: &str,
+) -> Result<u32> {
+    let mut body = Vec::new();
+    write_on_xmp_data_body(&mut body, live_xml)?;
+    tag::write_tag(w, TagType::ScriptData, timestamp_ms, 0, &body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +636,139 @@ mod tests {
             out[out.len() - 1],
         ]);
         assert_eq!(trailer, 11 + data_size);
+    }
+
+    #[test]
+    fn on_cue_point_body_round_trips_through_parser() {
+        let cue = CuePointParams::new("chapter-1", 12.5, CuePointType::Navigation)
+            .parameter("title", "Intro")
+            .parameter("section", "A");
+        let mut body = Vec::new();
+        write_on_cue_point_body(&mut body, &cue).unwrap();
+
+        // First value: the method name string.
+        let (name, p) = parse_amf0_value(&body, 0).unwrap();
+        assert_eq!(name, AmfValue::String("onCuePoint".into()));
+        // Second value: the cue object, consuming the rest exactly.
+        let (value, np) = parse_amf0_value(&body, p).unwrap();
+        assert_eq!(np, body.len());
+        let entries = match value {
+            AmfValue::Object(b) => b,
+            other => panic!("expected anonymous object, got {other:?}"),
+        };
+        // Four spec-conventional properties in canonical order.
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            entries[0],
+            ("name".into(), AmfValue::String("chapter-1".into()))
+        );
+        assert_eq!(entries[1], ("time".into(), AmfValue::Number(12.5)));
+        assert_eq!(
+            entries[2],
+            ("type".into(), AmfValue::String("navigation".into()))
+        );
+        let params = match &entries[3].1 {
+            AmfValue::Object(b) => b,
+            other => panic!("parameters: expected anonymous object, got {other:?}"),
+        };
+        assert_eq!(entries[3].0, "parameters");
+        assert_eq!(params.len(), 2);
+        assert_eq!(
+            params[0],
+            ("title".into(), AmfValue::String("Intro".into()))
+        );
+        assert_eq!(params[1], ("section".into(), AmfValue::String("A".into())));
+    }
+
+    #[test]
+    fn on_cue_point_event_emits_event_string() {
+        let cue = CuePointParams::new("ad-1", 30.0, CuePointType::Event);
+        let mut body = Vec::new();
+        write_on_cue_point_body(&mut body, &cue).unwrap();
+        let (_, p) = parse_amf0_value(&body, 0).unwrap();
+        let (value, _) = parse_amf0_value(&body, p).unwrap();
+        let entries = match value {
+            AmfValue::Object(b) => b,
+            other => panic!("expected object, got {other:?}"),
+        };
+        assert_eq!(entries[2].0, "type");
+        assert_eq!(entries[2].1, AmfValue::String("event".into()));
+    }
+
+    #[test]
+    fn on_cue_point_empty_parameters_round_trip() {
+        let cue = CuePointParams::new("mark", 0.0, CuePointType::Event);
+        let mut body = Vec::new();
+        write_on_cue_point_body(&mut body, &cue).unwrap();
+        let (_, p) = parse_amf0_value(&body, 0).unwrap();
+        let (value, np) = parse_amf0_value(&body, p).unwrap();
+        assert_eq!(np, body.len());
+        let entries = match value {
+            AmfValue::Object(b) => b,
+            other => panic!("expected object, got {other:?}"),
+        };
+        let params = match &entries[3].1 {
+            AmfValue::Object(b) => b,
+            other => panic!("expected object, got {other:?}"),
+        };
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn on_cue_point_rejects_non_finite_time() {
+        let cue = CuePointParams::new("nan", f64::NAN, CuePointType::Event);
+        let err = write_on_cue_point_body(&mut Vec::new(), &cue).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("finite"), "got {msg}");
+    }
+
+    #[test]
+    fn on_cue_point_full_tag_has_correct_timestamp_and_size() {
+        let cue = CuePointParams::new("c", 1.0, CuePointType::Event);
+        let mut out = Vec::new();
+        let total = write_on_cue_point(&mut out, 1_000, &cue).unwrap();
+        assert_eq!(total as usize, out.len());
+        // TagType byte = 0x12 (script data).
+        assert_eq!(out[0], 0x12);
+        // Timestamp UI24 + TimestampExtended UI8 = 1000.
+        let ts = ((out[4] as u32) << 16) | ((out[5] as u32) << 8) | (out[6] as u32);
+        assert_eq!(ts, 1_000);
+        assert_eq!(out[7], 0);
+        // DataSize matches body length.
+        let data_size = ((out[1] as u32) << 16) | ((out[2] as u32) << 8) | (out[3] as u32);
+        assert_eq!(data_size, total - 15);
+    }
+
+    #[test]
+    fn on_xmp_data_body_round_trips_through_parser() {
+        let xml = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">hi</x:xmpmeta>";
+        let mut body = Vec::new();
+        write_on_xmp_data_body(&mut body, xml).unwrap();
+
+        let (name, p) = parse_amf0_value(&body, 0).unwrap();
+        assert_eq!(name, AmfValue::String("onXMPData".into()));
+        let (value, np) = parse_amf0_value(&body, p).unwrap();
+        assert_eq!(np, body.len());
+        let entries = match value {
+            AmfValue::Object(b) => b,
+            other => panic!("expected anonymous object, got {other:?}"),
+        };
+        // Exactly one property: liveXML String.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], ("liveXML".into(), AmfValue::String(xml.into())));
+    }
+
+    #[test]
+    fn on_xmp_data_full_tag_has_script_tagtype() {
+        let mut out = Vec::new();
+        write_on_xmp_data(&mut out, 0, "<x>x</x>").unwrap();
+        // TagType byte = 0x12 (script data).
+        assert_eq!(out[0], 0x12);
+    }
+
+    #[test]
+    fn cue_point_type_wire_strings_match_demuxer_expectation() {
+        assert_eq!(CuePointType::Event.as_str(), "event");
+        assert_eq!(CuePointType::Navigation.as_str(), "navigation");
     }
 }

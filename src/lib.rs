@@ -12,9 +12,12 @@
 //! [`tag::write_tag`] / [`tag::write_mp3_tag`] / [`tag::write_aac_raw_tag`]
 //! write audio tags, [`tag::write_h263_tag`] / [`tag::write_vp6_tag`] /
 //! [`tag::write_vp6a_tag`] / [`tag::write_avc_sequence_header`] /
-//! [`tag::write_avc_nalu_tag`] write the legacy video tags, and
+//! [`tag::write_avc_nalu_tag`] write the legacy video tags,
 //! [`script::write_on_metadata`] serialises an `onMetaData` script tag
-//! from a [`script::MetadataBag`]. The output round-trips bit-exactly
+//! from a [`script::MetadataBag`], [`script::write_on_cue_point`]
+//! emits an Annex A embedded cue point from a
+//! [`script::CuePointParams`], and [`script::write_on_xmp_data`]
+//! emits an §E.6 XMP metadata tag. The output round-trips bit-exactly
 //! through [`FlvDemuxer`].
 
 #![deny(missing_debug_implementations)]
@@ -51,7 +54,11 @@ pub use ex_video::{
 pub use header::{FlvHeader, FLV_SIGNATURE};
 pub use mod_ex::{ModExEntry, ModExPayload};
 pub use multitrack::{split_tracks, MultitrackTrack};
-pub use script::{write_on_metadata, write_on_metadata_body, MetaValue, MetadataBag};
+pub use script::{
+    write_on_cue_point, write_on_cue_point_body, write_on_metadata, write_on_metadata_body,
+    write_on_xmp_data, write_on_xmp_data_body, CuePointParams, CuePointType, MetaValue,
+    MetadataBag,
+};
 pub use tag::{
     audio_codec_id_str, video_codec_id_str, write_aac_ex_coded_frames, write_aac_ex_sequence_start,
     write_aac_raw_tag, write_ac3_coded_frames, write_audio_tag, write_av1_coded_frames,

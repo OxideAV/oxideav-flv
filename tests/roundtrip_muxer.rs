@@ -15,7 +15,11 @@
 use std::io::Cursor;
 
 use oxideav_core::{Demuxer, NullCodecResolver, ReadSeek};
-use oxideav_flv::{header, open_demuxer, script, script::MetadataBag, tag, FlvHeader};
+use oxideav_flv::{
+    header, open_demuxer, script,
+    script::{CuePointParams, CuePointType, MetadataBag},
+    tag, FlvHeader,
+};
 use oxideav_flv::{
     write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_ac3_coded_frames,
     write_av1_coded_frames, write_av1_sequence_start, write_avc_nalu_tag,
@@ -1156,4 +1160,101 @@ fn ex_video_color_info_rejects_out_of_range_at_writer() {
     // And nothing was written to the buffer (validation runs before
     // the FLV tag header is laid down).
     assert!(buf.is_empty());
+}
+
+/// Build a minimal audio FLV that includes one `onXMPData` tag at the
+/// head and two `onCuePoint` tags interleaved with MP3 frames.
+fn build_flv_with_cue_and_xmp() -> Vec<u8> {
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let bag = MetadataBag::new()
+        .number("duration", 0.078)
+        .number("audiosamplerate", 44_100.0)
+        .string("encoder", "oxideav-flv muxer");
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+
+    // XMP packet at t=0 — producer-style XMP envelope.
+    let xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF/></x:xmpmeta>";
+    script::write_on_xmp_data(&mut buf, 0, xmp).unwrap();
+
+    // First cue at t=0 ms — navigation marker.
+    let cue0 = CuePointParams::new("chapter-1", 0.0, CuePointType::Navigation)
+        .parameter("title", "Intro")
+        .parameter("section", "A");
+    script::write_on_cue_point(&mut buf, 0, &cue0).unwrap();
+
+    // One MP3 frame at t=0.
+    tag::write_mp3_tag(&mut buf, 0, 3, true, true, &[0xFF, 0xFB, 0x90, 0x00]).unwrap();
+
+    // Second cue at t=26 ms — event marker, no parameters.
+    let cue1 = CuePointParams::new("ad-mark", 0.026, CuePointType::Event);
+    script::write_on_cue_point(&mut buf, 26, &cue1).unwrap();
+
+    tag::write_mp3_tag(&mut buf, 26, 3, true, true, &[0xFF, 0xFB, 0x90, 0x44]).unwrap();
+
+    buf
+}
+
+#[test]
+fn on_xmp_data_writer_round_trips_through_demuxer() {
+    let bytes = build_flv_with_cue_and_xmp();
+    let dmx = open(bytes);
+    let md = dmx.metadata();
+    // The XMP packet body surfaces verbatim under `metadata["xmp"]`.
+    let xmp = md.iter().find(|(k, _)| k == "xmp").map(|(_, v)| v.as_str());
+    assert_eq!(
+        xmp,
+        Some("<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF/></x:xmpmeta>")
+    );
+}
+
+#[test]
+fn on_cue_point_writer_round_trips_per_cue_fields() {
+    let bytes = build_flv_with_cue_and_xmp();
+    let dmx = open(bytes);
+    let md = dmx.metadata();
+
+    // The demuxer indexes cues by occurrence under
+    // `cuepoint.<n>.<key>`. Walk the bag and assert each cue's four
+    // spec properties round-tripped.
+    let lookup = |k: &str| md.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+    assert_eq!(lookup("cuepoint.0.name"), Some("chapter-1"));
+    assert_eq!(lookup("cuepoint.0.time"), Some("0"));
+    assert_eq!(lookup("cuepoint.0.type"), Some("navigation"));
+    assert_eq!(lookup("cuepoint.0.parameters.title"), Some("Intro"));
+    assert_eq!(lookup("cuepoint.0.parameters.section"), Some("A"));
+
+    assert_eq!(lookup("cuepoint.1.name"), Some("ad-mark"));
+    assert_eq!(lookup("cuepoint.1.time"), Some("0.026"));
+    assert_eq!(lookup("cuepoint.1.type"), Some("event"));
+    // No `parameters.<key>` entries on cue 1 — it was constructed
+    // without any user parameters.
+    assert!(md
+        .iter()
+        .all(|(k, _)| !k.starts_with("cuepoint.1.parameters.")));
+}
+
+#[test]
+fn cue_point_and_xmp_tags_do_not_disturb_audio_packets() {
+    // Inserting cuepoint / XMP script tags between media tags must not
+    // affect the audio packet stream the demuxer yields.
+    let bytes = build_flv_with_cue_and_xmp();
+    let mut dmx = open(bytes);
+    let mut audio_count = 0;
+    let mut last_ts = -1i64;
+    while let Ok(pkt) = dmx.next_packet() {
+        if pkt.flags.header || pkt.flags.discard {
+            continue;
+        }
+        let ts = pkt.pts.unwrap_or(-1);
+        assert!(
+            ts > last_ts,
+            "audio timestamps must advance: {ts} > {last_ts}"
+        );
+        last_ts = ts;
+        audio_count += 1;
+    }
+    assert_eq!(audio_count, 2, "two MP3 frames in fixture");
 }

@@ -343,6 +343,8 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | AMF0 writers | `amf0::{write_number, write_boolean, write_string, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 |
 | `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |
 | `onMetaData.keyframes` seek-table composite | `MetadataBag::keyframes(file_positions, times_seconds)` + AMF0 `write_strict_array_number` | §E.4.4.7 / §E.4.4.9 |
+| `onCuePoint` script tag (Annex A embedded cue point) | `script::write_on_cue_point(w, ts_ms, &CuePointParams)` | Annex A.2 |
+| `onXMPData` script tag (XMP metadata) | `script::write_on_xmp_data(w, ts_ms, live_xml)` | §E.6 |
 
 `write_tag` returns the total bytes written (`11 + body.len() + 4`) and
 emits the trailing `PreviousTagSize = 11 + DataSize` back-pointer.
@@ -361,6 +363,22 @@ correct offsets in the toc typically reserve a fixed-size `onMetaData`
 slot up front, mux the body to learn the keyframe positions, and
 rewrite the slot in-place with the populated toc — the writer is
 agnostic of that strategy.
+
+`script::write_on_cue_point(w, ts_ms, &CuePointParams)` emits an
+Annex A embedded cue point. The typed [`CuePointParams`] pack carries
+the four spec-conventional properties — `name` (producer identifier),
+`time_seconds` (Number, validated finite), `kind` (
+[`CuePointType::Event`] / [`CuePointType::Navigation`], wire-spelled
+`"event"` / `"navigation"`), and a `parameters` Object of `(name,
+string)` pairs the demuxer surfaces under
+`metadata["cuepoint.<n>.parameters.<key>"]`. `timestamp_ms` is the
+playback alignment timestamp the runtime dispatches on (Annex A.4:
+the AMF data track is interleaved at the right time alongside audio
+and video). `script::write_on_xmp_data(w, ts_ms, live_xml)` emits an
+§E.6 `onXMPData` script tag carrying the `liveXML` String the
+demuxer surfaces under `metadata["xmp"]`. Both writers round-trip
+bit-exactly through `FlvDemuxer` and may be interleaved freely
+between media tags.
 
 The video tag writers all share the same `VideoTagHeader` / `FrameType`
 model the demuxer uses; `write_avc_nalu_tag` packs `pts - dts` as the
