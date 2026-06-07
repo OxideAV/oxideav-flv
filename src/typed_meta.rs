@@ -149,11 +149,45 @@ impl<'a> TypedMetadata<'a> {
     /// `videoframerate` or the older `framerate` — both are observed
     /// in the wild — so this accessor returns the spec-named
     /// `framerate` property only. Callers wanting the producer's
-    /// effective frame rate should also consult `videoframerate`
-    /// (not in the Annex E.5 fixed table, but the demuxer surfaces
-    /// it as a parallel string entry).
+    /// effective frame rate should reach for
+    /// [`Self::effective_framerate`], which consults
+    /// [`Self::videoframerate`] first (the Annex B.1 alias the
+    /// demuxer prefers when both keys are present) and falls back to
+    /// the spec-named `framerate`.
     pub fn framerate(&self) -> Option<f64> {
         self.lookup_finite_f64("framerate")
+    }
+
+    /// `videoframerate` — the producer-stamped frame rate under the
+    /// Annex B.1 alias (the de-facto property name emitted by every
+    /// post-2008 Flash-era producer).
+    ///
+    /// AMF type: Number. The spec's Annex E.5 fixed table lists only
+    /// `framerate`, but Annex B.1 of the Adobe *Video File Format
+    /// Specification* (the "Metadata Tags" appendix that catalogues
+    /// the conventional property names extant on the wire) declares
+    /// `videoframerate` as the preferred carrier; the demuxer reads
+    /// it first and falls back to `framerate` when absent. This
+    /// accessor surfaces the raw `videoframerate` value verbatim so
+    /// callers can choose their own preference order; reach for
+    /// [`Self::effective_framerate`] when the demuxer's
+    /// alias-first-then-fallback shape is wanted instead.
+    pub fn videoframerate(&self) -> Option<f64> {
+        self.lookup_finite_f64("videoframerate")
+    }
+
+    /// Effective frame rate — [`Self::videoframerate`] when present,
+    /// otherwise [`Self::framerate`].
+    ///
+    /// Mirrors the alias preference the demuxer uses when lifting
+    /// `frame_rate` into [`oxideav_core::CodecParameters`]: the
+    /// Annex B.1 `videoframerate` alias is preferred (and is what
+    /// every modern producer stamps), with the legacy Annex E.5
+    /// `framerate` as the spec-named fallback. Returns `None` when
+    /// neither key is present in the bag or when both fail finite
+    /// parsing.
+    pub fn effective_framerate(&self) -> Option<f64> {
+        self.videoframerate().or_else(|| self.framerate())
     }
 
     /// `videodatarate` — video bit rate in kbit/s (Annex E.5).
@@ -532,6 +566,54 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].0, "duration");
         assert_eq!(pairs[0].1, "1.0");
+    }
+
+    #[test]
+    fn videoframerate_alias_is_surfaced_independently_of_framerate() {
+        // Annex B.1's `videoframerate` and Annex E.5's `framerate` are
+        // two distinct bag keys; the typed view exposes each via its
+        // own accessor so callers that want one specifically can read
+        // only that.
+        let b = bag(&[("videoframerate", "59.94"), ("framerate", "30")]);
+        let m = TypedMetadata::new(&b);
+        assert_eq!(m.videoframerate(), Some(59.94));
+        assert_eq!(m.framerate(), Some(30.0));
+    }
+
+    #[test]
+    fn effective_framerate_prefers_videoframerate_then_framerate() {
+        // Producer emits both: the alias wins (mirroring the demuxer's
+        // own `frame_rate` lift order).
+        let both = bag(&[("videoframerate", "29.97"), ("framerate", "30")]);
+        assert_eq!(TypedMetadata::new(&both).effective_framerate(), Some(29.97));
+        // Alias only.
+        let alias_only = bag(&[("videoframerate", "23.976")]);
+        assert_eq!(
+            TypedMetadata::new(&alias_only).effective_framerate(),
+            Some(23.976)
+        );
+        // Legacy `framerate` only: the fallback fires.
+        let legacy_only = bag(&[("framerate", "24")]);
+        assert_eq!(
+            TypedMetadata::new(&legacy_only).effective_framerate(),
+            Some(24.0)
+        );
+        // Neither: None.
+        let none = bag(&[("width", "1920")]);
+        assert_eq!(TypedMetadata::new(&none).effective_framerate(), None);
+    }
+
+    #[test]
+    fn effective_framerate_falls_through_when_alias_is_malformed() {
+        // A malformed `videoframerate` (non-finite / unparseable) is
+        // treated as absent by the alias accessor, so the fallback to
+        // `framerate` kicks in. This matches the
+        // `lookup_finite_f64` filter inside each accessor — the
+        // typed view is forgiving of producer garbage.
+        let nan_alias = bag(&[("videoframerate", "NaN"), ("framerate", "25")]);
+        let m = TypedMetadata::new(&nan_alias);
+        assert_eq!(m.videoframerate(), None);
+        assert_eq!(m.effective_framerate(), Some(25.0));
     }
 
     #[test]

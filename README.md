@@ -258,7 +258,10 @@ let vid = typed.video_codec_id_str();       // Option<String>  — "h264", "vp6f
 ```
 
 Per-property accessors: `duration` / `filesize` / `width` / `height` /
-`framerate` / `video_data_rate_kbps` / `audio_data_rate_kbps` /
+`framerate` / `videoframerate` / `effective_framerate` (alias-aware:
+`videoframerate` first, falls back to `framerate` — mirrors the order
+the demuxer uses when lifting `CodecParameters::frame_rate`) /
+`video_data_rate_kbps` / `audio_data_rate_kbps` /
 `audio_sample_rate` / `audio_sample_size` / `audio_delay_seconds` /
 `video_codec_id` / `audio_codec_id` (+ string forms via
 [`tag::video_codec_id_str`] / [`tag::audio_codec_id_str`]) / `stereo` /

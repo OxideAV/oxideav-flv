@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `TypedMetadata::videoframerate()` + `TypedMetadata::effective_framerate()`
+  accessors for the Annex B.1 `videoframerate` alias of the Annex E.5
+  `framerate` property. `videoframerate()` returns the de-facto
+  property name emitted by every post-2008 Flash-era producer (the
+  bag carries it under the same `Vec<(String, String)>` shape, so the
+  accessor is a finite-`f64` re-type identical to the spec-named
+  `framerate` accessor). `effective_framerate()` mirrors the demuxer's
+  alias-preference order — `videoframerate` first, falling back to
+  `framerate` — so callers wanting the same value the demuxer lifted
+  into `CodecParameters::frame_rate` can read it back through the
+  typed view without re-implementing the preference logic. Three
+  unit tests cover the alias-only / spec-only / both-present cases
+  plus the malformed-alias fallthrough.
 - `onCuePoint` (Annex A) and `onXMPData` (§E.6) script-data tag
   writers — completing the muxer's coverage of the four spec-defined
   script names (the other two being `onMetaData` E.5 and the
