@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `TypedMetadata::video_track_info_map()` /
+  `TypedMetadata::audio_track_info_map()` iterators and
+  `TypedMetadata::video_track_info(track_id)` /
+  `TypedMetadata::audio_track_info(track_id)` lookups for the
+  Enhanced-RTMP-v2 §"Enhancing onMetaData" per-track property maps
+  (`videoTrackIdInfoMap` / `audioTrackIdInfoMap`). Each entry parses
+  back into a typed view — `TypedVideoTrackInfo` exposes `width` /
+  `height` / `video_data_rate_kbps` / `video_codec_id` / `framerate`
+  (alias-preference: `videoframerate` first, falling back to
+  `framerate`); `TypedAudioTrackInfo` exposes `audio_data_rate_kbps` /
+  `audio_sample_rate` (the spec's per-track shortened `samplerate`
+  field, not the top-level `audiosamplerate`) / `channels` (modern
+  count, not the legacy `stereo` boolean) / `audio_codec_id`. The
+  iterator deduplicates per-trackId, preserves bag-insertion order,
+  skips trackId 0 (the default track — its fields belong at the top
+  level of `onMetaData` and are surfaced by the regular accessors),
+  and gracefully skips malformed trackId strings instead of wedging.
+  Delta-style per-track entries (only the fields that differ from the
+  default track) are first-class: absent fields return `None` rather
+  than synthesising from the top-level value, so callers can
+  distinguish "producer signalled no per-track override" from
+  "producer signalled the same value as the default track". Eleven
+  unit tests cover the round-trip against the demuxer's flatten
+  fixtures, the trackId-0 / malformed-id / malformed-value rejects,
+  the alias-preference for per-track `framerate`, and the
+  empty-map case where no track keys exist.
 - `TypedMetadata::videoframerate()` + `TypedMetadata::effective_framerate()`
   accessors for the Annex B.1 `videoframerate` alias of the Annex E.5
   `framerate` property. `videoframerate()` returns the de-facto

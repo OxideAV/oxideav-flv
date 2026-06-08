@@ -271,6 +271,28 @@ the demuxer uses when lifting `CodecParameters::frame_rate`) /
 stamped the field as an AMF0 `Date`). Missing or malformed entries
 return `None`; the accessor never panics on bag contents.
 
+The Enhanced-RTMP-v2 per-track property maps (`videoTrackIdInfoMap` /
+`audioTrackIdInfoMap` from the §"Enhancing onMetaData" extension) get
+their own typed views — `TypedMetadata::video_track_info_map()` /
+`audio_track_info_map()` iterate one
+[`TypedVideoTrackInfo`] / [`TypedAudioTrackInfo`] per non-zero
+trackId the producer signalled (trackId 0 is the default track — its
+fields live at the top level of `onMetaData` and are read via the
+regular accessors above; the iterator skips it). Each entry re-types
+the per-track scalars: video tracks expose `width` / `height` /
+`video_data_rate_kbps` / `video_codec_id` / `framerate`
+(alias-preference: `videoframerate` first, falling back to
+`framerate`); audio tracks expose `audio_data_rate_kbps` /
+`audio_sample_rate` (the spec's per-track shortened `samplerate`, not
+the top-level `audiosamplerate`) / `channels` (modern count, not the
+legacy `stereo` boolean) / `audio_codec_id`. Delta-style entries
+(only the fields that differ from the default track) are first-class
+— absent fields return `None` rather than synthesising from the
+default-track value, so callers can distinguish "producer signalled
+no per-track override" from "producer signalled the same value as
+the default". `TypedMetadata::video_track_info(id)` /
+`audio_track_info(id)` look up a specific trackId without iterating.
+
 ### Robustness
 
 The demuxer is fuzz-shaped by a hand-crafted adversarial-input suite

@@ -373,6 +373,315 @@ impl<'a> TypedMetadata<'a> {
             _ => None,
         }
     }
+
+    // ----------------------- Enhanced-RTMP-v2 per-track maps -----------------
+    //
+    // The `videoTrackIdInfoMap` / `audioTrackIdInfoMap` properties (Enhanced
+    // RTMP v2 §"Enhancing onMetaData") carry per-track metadata for the
+    // additional (non-default) tracks of a multitrack stream. trackId 0 is
+    // the default track — its fields live at the top level of onMetaData
+    // and are surfaced by the regular accessors above. trackId 1, 2, … are
+    // the extras; the demuxer flattens each entry under the prefix
+    // `videotrackidinfomap.<N>.` / `audiotrackidinfomap.<N>.` so callers
+    // can read the producer's per-track values without an AMF model.
+    //
+    // The methods below give a typed read of that same flatten — one
+    // [`TypedVideoTrackInfo`] / [`TypedAudioTrackInfo`] view per non-zero
+    // trackId, with the same `Option<T>` shape as the top-level
+    // accessors. Producers may emit delta-style entries (only the fields
+    // that differ from the default track); absent fields return `None`.
+
+    /// Borrowed view over the per-track entries of
+    /// `videoTrackIdInfoMap`, one [`TypedVideoTrackInfo`] per non-zero
+    /// trackId the producer stamped. Iteration order matches the
+    /// insertion order of the bag (which mirrors the producer's AMF
+    /// object key order). Returns an empty iterator when the producer
+    /// didn't emit a `videoTrackIdInfoMap`.
+    pub fn video_track_info_map(&self) -> TrackInfoIter<'a, TypedVideoTrackInfo<'a>> {
+        TrackInfoIter::new(self.bag, "videotrackidinfomap.", TypedVideoTrackInfo::new)
+    }
+
+    /// Look up a single video per-track entry by `trackId`. trackId 0
+    /// is the default track (its fields live at the top level of
+    /// onMetaData and are surfaced by the regular accessors above); the
+    /// per-track map carries trackId 1, 2, …
+    ///
+    /// Returns `None` when the producer didn't emit a
+    /// `videoTrackIdInfoMap` at all OR when the requested trackId is
+    /// absent from the map. trackId 0 always returns `None` here — it
+    /// would shadow the top-level fields; callers should read those
+    /// directly via [`Self::width`] / [`Self::height`] / etc.
+    pub fn video_track_info(&self, track_id: u32) -> Option<TypedVideoTrackInfo<'a>> {
+        if track_id == 0 {
+            return None;
+        }
+        let prefix = format!("videotrackidinfomap.{track_id}.");
+        if self.bag.iter().any(|(k, _)| k.starts_with(&prefix)) {
+            Some(TypedVideoTrackInfo::new(self.bag, track_id))
+        } else {
+            None
+        }
+    }
+
+    /// Borrowed view over the per-track entries of
+    /// `audioTrackIdInfoMap`. Twin of [`Self::video_track_info_map`].
+    pub fn audio_track_info_map(&self) -> TrackInfoIter<'a, TypedAudioTrackInfo<'a>> {
+        TrackInfoIter::new(self.bag, "audiotrackidinfomap.", TypedAudioTrackInfo::new)
+    }
+
+    /// Look up a single audio per-track entry by `trackId`. Twin of
+    /// [`Self::video_track_info`].
+    pub fn audio_track_info(&self, track_id: u32) -> Option<TypedAudioTrackInfo<'a>> {
+        if track_id == 0 {
+            return None;
+        }
+        let prefix = format!("audiotrackidinfomap.{track_id}.");
+        if self.bag.iter().any(|(k, _)| k.starts_with(&prefix)) {
+            Some(TypedAudioTrackInfo::new(self.bag, track_id))
+        } else {
+            None
+        }
+    }
+}
+
+/// Iterator over the per-track entries of `videoTrackIdInfoMap` /
+/// `audioTrackIdInfoMap`. Yields one [`TypedVideoTrackInfo`] /
+/// [`TypedAudioTrackInfo`] per non-zero trackId seen in the bag, in
+/// bag-insertion order, deduplicated so each trackId is yielded at most
+/// once.
+#[derive(Debug)]
+pub struct TrackInfoIter<'a, T> {
+    bag: &'a [(String, String)],
+    prefix: &'static str,
+    ctor: fn(&'a [(String, String)], u32) -> T,
+    seen: Vec<u32>,
+    cursor: usize,
+}
+
+impl<'a, T> TrackInfoIter<'a, T> {
+    fn new(
+        bag: &'a [(String, String)],
+        prefix: &'static str,
+        ctor: fn(&'a [(String, String)], u32) -> T,
+    ) -> Self {
+        Self {
+            bag,
+            prefix,
+            ctor,
+            seen: Vec::new(),
+            cursor: 0,
+        }
+    }
+}
+
+impl<'a, T> Iterator for TrackInfoIter<'a, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        while self.cursor < self.bag.len() {
+            let (k, _) = &self.bag[self.cursor];
+            self.cursor += 1;
+            let rest = match k.strip_prefix(self.prefix) {
+                Some(r) => r,
+                None => continue,
+            };
+            // The flattened key is `<prefix><track_id>.<field>`. The
+            // demuxer's `flatten_amf_value` walker uses the AMF object's
+            // key verbatim as the next path segment, so the trackId is
+            // an ASCII decimal between the prefix and the first `.`.
+            let id_str = match rest.split_once('.') {
+                Some((id, _)) => id,
+                None => continue,
+            };
+            let id: u32 = match id_str.parse() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            // trackId 0 is the default track; its fields belong at the
+            // top level. A producer who nests them under the per-track
+            // map anyway shadows the top-level accessors — skip it.
+            if id == 0 {
+                continue;
+            }
+            if self.seen.contains(&id) {
+                continue;
+            }
+            self.seen.push(id);
+            return Some((self.ctor)(self.bag, id));
+        }
+        None
+    }
+}
+
+/// Borrowed view over one video per-track entry inside
+/// `videoTrackIdInfoMap`. Each accessor reads the matching
+/// `videotrackidinfomap.<track_id>.<field>` key out of the bag and
+/// parses it back into the field's spec-declared AMF type. Missing or
+/// malformed entries return `None`.
+///
+/// Producers commonly emit delta-style entries — only the fields that
+/// differ from the default track — so an `Option<T>` shape is the
+/// honest model. The default track's fields are at the top level of
+/// `onMetaData` and are read via the [`TypedMetadata`] accessors
+/// above; this view never falls back to the top level.
+#[derive(Clone, Copy, Debug)]
+pub struct TypedVideoTrackInfo<'a> {
+    bag: &'a [(String, String)],
+    track_id: u32,
+}
+
+impl<'a> TypedVideoTrackInfo<'a> {
+    fn new(bag: &'a [(String, String)], track_id: u32) -> Self {
+        Self { bag, track_id }
+    }
+
+    /// The trackId this view is keyed under (1, 2, …; non-zero by
+    /// construction).
+    pub fn track_id(&self) -> u32 {
+        self.track_id
+    }
+
+    fn key(&self, field: &str) -> String {
+        format!("videotrackidinfomap.{}.{}", self.track_id, field)
+    }
+
+    fn lookup_str(&self, field: &str) -> Option<&'a str> {
+        let k = self.key(field);
+        self.bag
+            .iter()
+            .find(|(bk, _)| bk == &k)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn lookup_finite_f64(&self, field: &str) -> Option<f64> {
+        let n: f64 = self.lookup_str(field)?.parse().ok()?;
+        if !n.is_finite() {
+            return None;
+        }
+        Some(n)
+    }
+
+    fn lookup_u32(&self, field: &str) -> Option<u32> {
+        let n = self.lookup_finite_f64(field)?;
+        if !(0.0..=u32::MAX as f64).contains(&n) {
+            return None;
+        }
+        Some(n as u32)
+    }
+
+    /// `width` — video width in pixels for this track.
+    pub fn width(&self) -> Option<u32> {
+        self.lookup_u32("width")
+    }
+
+    /// `height` — video height in pixels for this track.
+    pub fn height(&self) -> Option<u32> {
+        self.lookup_u32("height")
+    }
+
+    /// `videodatarate` — video bit rate in kbit/s for this track.
+    pub fn video_data_rate_kbps(&self) -> Option<f64> {
+        self.lookup_finite_f64("videodatarate")
+    }
+
+    /// `videocodecid` — the codec id for this track. The Enhanced-RTMP
+    /// spec lets producers stamp this as either the legacy 4-bit
+    /// CodecID nibble (E.4.3.1) or the packed FourCc form via
+    /// `makeFourCc()` (e.g. `'a''v''0''1' == 0x61763031 == 1_635_135_537`).
+    /// Returns the raw integer; callers wanting the string form should
+    /// pass the value through the same fallback path as
+    /// [`TypedMetadata::video_codec_id_str`].
+    pub fn video_codec_id(&self) -> Option<u32> {
+        self.lookup_u32("videocodecid")
+    }
+
+    /// `framerate` — frames per second for this track. Producers
+    /// emitting per-track maps tend to stamp the modern
+    /// `videoframerate` alias instead; both are read here, with the
+    /// alias preferred (mirroring the demuxer's top-level alias
+    /// preference for [`TypedMetadata::effective_framerate`]).
+    pub fn framerate(&self) -> Option<f64> {
+        self.lookup_finite_f64("videoframerate")
+            .or_else(|| self.lookup_finite_f64("framerate"))
+    }
+}
+
+/// Borrowed view over one audio per-track entry inside
+/// `audioTrackIdInfoMap`. Twin of [`TypedVideoTrackInfo`].
+#[derive(Clone, Copy, Debug)]
+pub struct TypedAudioTrackInfo<'a> {
+    bag: &'a [(String, String)],
+    track_id: u32,
+}
+
+impl<'a> TypedAudioTrackInfo<'a> {
+    fn new(bag: &'a [(String, String)], track_id: u32) -> Self {
+        Self { bag, track_id }
+    }
+
+    /// The trackId this view is keyed under (1, 2, …; non-zero by
+    /// construction).
+    pub fn track_id(&self) -> u32 {
+        self.track_id
+    }
+
+    fn key(&self, field: &str) -> String {
+        format!("audiotrackidinfomap.{}.{}", self.track_id, field)
+    }
+
+    fn lookup_str(&self, field: &str) -> Option<&'a str> {
+        let k = self.key(field);
+        self.bag
+            .iter()
+            .find(|(bk, _)| bk == &k)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn lookup_finite_f64(&self, field: &str) -> Option<f64> {
+        let n: f64 = self.lookup_str(field)?.parse().ok()?;
+        if !n.is_finite() {
+            return None;
+        }
+        Some(n)
+    }
+
+    fn lookup_u32(&self, field: &str) -> Option<u32> {
+        let n = self.lookup_finite_f64(field)?;
+        if !(0.0..=u32::MAX as f64).contains(&n) {
+            return None;
+        }
+        Some(n as u32)
+    }
+
+    /// `audiodatarate` — audio bit rate in kbit/s for this track.
+    pub fn audio_data_rate_kbps(&self) -> Option<f64> {
+        self.lookup_finite_f64("audiodatarate")
+    }
+
+    /// `samplerate` — audio sample rate in Hz for this track.
+    ///
+    /// Note that the per-track map uses the spec-shortened name
+    /// `samplerate` (rather than the top-level `audiosamplerate`); the
+    /// demuxer flattens both verbatim so the accessor matches what the
+    /// producer wrote. A `0` or negative value is rejected as
+    /// nonsense.
+    pub fn audio_sample_rate(&self) -> Option<f64> {
+        self.lookup_finite_f64("samplerate").filter(|n| *n >= 0.0)
+    }
+
+    /// `channels` — number of audio channels for this track. The
+    /// per-track map uses the modern `channels` count directly rather
+    /// than the legacy `stereo` boolean from Annex E.5.
+    pub fn channels(&self) -> Option<u32> {
+        self.lookup_u32("channels")
+    }
+
+    /// `audiocodecid` — the codec id for this track. As with
+    /// [`TypedVideoTrackInfo::video_codec_id`], either the legacy
+    /// 4-bit SoundFormat (E.4.2.1) or a packed FourCc may be stamped.
+    pub fn audio_codec_id(&self) -> Option<u32> {
+        self.lookup_u32("audiocodecid")
+    }
 }
 
 /// Parse the `"date:<ms>tz:<offset>"` carrier form used by the demuxer
@@ -624,5 +933,180 @@ mod tests {
         let b = bag(&[("duration", "1.0"), ("duration", "2.0")]);
         let m = TypedMetadata::new(&b);
         assert_eq!(m.duration(), Some(1.0));
+    }
+
+    #[test]
+    fn video_track_info_map_round_trips_demuxer_flatten() {
+        // Mirrors the demuxer's `on_metadata_video_track_id_info_map_flattens`
+        // fixture: trackId 1 carries width/height/videodatarate/videocodecid,
+        // trackId 2 carries width/height only (delta-style entry).
+        let b = bag(&[
+            ("videotrackidinfomap.1.width", "1024"),
+            ("videotrackidinfomap.1.height", "768"),
+            ("videotrackidinfomap.1.videodatarate", "2000"),
+            ("videotrackidinfomap.1.videocodecid", "1635135537"),
+            ("videotrackidinfomap.2.width", "3840"),
+            ("videotrackidinfomap.2.height", "2160"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let tracks: Vec<_> = m.video_track_info_map().collect();
+        assert_eq!(tracks.len(), 2);
+        // trackId 1 — full entry.
+        let t1 = &tracks[0];
+        assert_eq!(t1.track_id(), 1);
+        assert_eq!(t1.width(), Some(1024));
+        assert_eq!(t1.height(), Some(768));
+        assert_eq!(t1.video_data_rate_kbps(), Some(2000.0));
+        assert_eq!(t1.video_codec_id(), Some(1_635_135_537));
+        // trackId 2 — delta entry: width/height only.
+        let t2 = &tracks[1];
+        assert_eq!(t2.track_id(), 2);
+        assert_eq!(t2.width(), Some(3840));
+        assert_eq!(t2.height(), Some(2160));
+        assert_eq!(t2.video_data_rate_kbps(), None);
+        assert_eq!(t2.video_codec_id(), None);
+    }
+
+    #[test]
+    fn audio_track_info_map_round_trips_demuxer_flatten() {
+        // Mirrors the demuxer's `on_metadata_audio_track_id_info_map_flattens`
+        // fixture.
+        let b = bag(&[
+            ("audiotrackidinfomap.1.audiodatarate", "256"),
+            ("audiotrackidinfomap.1.channels", "2"),
+            ("audiotrackidinfomap.1.samplerate", "44100"),
+            ("audiotrackidinfomap.2.audiodatarate", "320"),
+            ("audiotrackidinfomap.2.samplerate", "48000"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let tracks: Vec<_> = m.audio_track_info_map().collect();
+        assert_eq!(tracks.len(), 2);
+        let t1 = &tracks[0];
+        assert_eq!(t1.track_id(), 1);
+        assert_eq!(t1.audio_data_rate_kbps(), Some(256.0));
+        assert_eq!(t1.channels(), Some(2));
+        assert_eq!(t1.audio_sample_rate(), Some(44_100.0));
+        let t2 = &tracks[1];
+        assert_eq!(t2.track_id(), 2);
+        assert_eq!(t2.audio_data_rate_kbps(), Some(320.0));
+        assert_eq!(t2.audio_sample_rate(), Some(48_000.0));
+        // trackId 2 had no `channels` field — delta-style.
+        assert_eq!(t2.channels(), None);
+    }
+
+    #[test]
+    fn track_info_lookup_by_id_returns_some_only_when_present() {
+        let b = bag(&[
+            ("videotrackidinfomap.1.width", "1024"),
+            ("videotrackidinfomap.1.height", "768"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        // Present.
+        let t1 = m.video_track_info(1).expect("trackId 1 should be present");
+        assert_eq!(t1.width(), Some(1024));
+        // Absent.
+        assert!(m.video_track_info(2).is_none());
+        // trackId 0 is the default track — never surfaced through the per-track map.
+        assert!(m.video_track_info(0).is_none());
+    }
+
+    #[test]
+    fn track_info_map_empty_when_no_track_keys_in_bag() {
+        // A plain onMetaData (no track maps) — the iterators are empty
+        // and per-id lookups all return None.
+        let b = bag(&[("width", "640"), ("height", "360")]);
+        let m = TypedMetadata::new(&b);
+        assert_eq!(m.video_track_info_map().count(), 0);
+        assert_eq!(m.audio_track_info_map().count(), 0);
+        assert!(m.video_track_info(1).is_none());
+        assert!(m.audio_track_info(1).is_none());
+    }
+
+    #[test]
+    fn track_info_iter_deduplicates_per_track_id() {
+        // Every per-track entry contributes multiple bag rows (one per
+        // field). The iterator must surface each trackId once even
+        // though its keys appear multiple times in the bag.
+        let b = bag(&[
+            ("videotrackidinfomap.1.width", "640"),
+            ("videotrackidinfomap.1.height", "360"),
+            ("videotrackidinfomap.1.videodatarate", "500"),
+            ("videotrackidinfomap.2.width", "1920"),
+            ("videotrackidinfomap.2.height", "1080"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let ids: Vec<u32> = m.video_track_info_map().map(|t| t.track_id()).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn track_info_iter_skips_track_id_zero() {
+        // trackId 0 is the default track — its fields belong at the
+        // top level of onMetaData, not the per-track map. A producer
+        // who stamps it under the map anyway is surfacing redundant
+        // data; skip it so the iterator yields only the "extra"
+        // tracks.
+        let b = bag(&[
+            ("videotrackidinfomap.0.width", "999"),
+            ("videotrackidinfomap.1.width", "1024"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let ids: Vec<u32> = m.video_track_info_map().map(|t| t.track_id()).collect();
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[test]
+    fn track_info_iter_skips_malformed_track_ids() {
+        // A producer who somehow stamps a non-integer trackId would
+        // otherwise wedge the iterator; the parse-fail path simply
+        // skips those rows and continues.
+        let b = bag(&[
+            ("videotrackidinfomap.abc.width", "1024"),
+            ("videotrackidinfomap.1.width", "640"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let ids: Vec<u32> = m.video_track_info_map().map(|t| t.track_id()).collect();
+        assert_eq!(ids, vec![1]);
+    }
+
+    #[test]
+    fn track_info_framerate_prefers_videoframerate_alias() {
+        // Per-track video framerate alias preference mirrors the
+        // top-level `effective_framerate` behaviour.
+        let alias = bag(&[
+            ("videotrackidinfomap.1.videoframerate", "29.97"),
+            ("videotrackidinfomap.1.framerate", "30"),
+        ]);
+        let m = TypedMetadata::new(&alias);
+        let t = m.video_track_info(1).unwrap();
+        assert_eq!(t.framerate(), Some(29.97));
+        // Legacy `framerate` only — fallback fires.
+        let legacy = bag(&[("videotrackidinfomap.1.framerate", "24")]);
+        assert_eq!(
+            TypedMetadata::new(&legacy)
+                .video_track_info(1)
+                .unwrap()
+                .framerate(),
+            Some(24.0)
+        );
+    }
+
+    #[test]
+    fn track_info_rejects_malformed_field_values() {
+        let b = bag(&[
+            ("videotrackidinfomap.1.width", "wide"),
+            ("videotrackidinfomap.1.height", "-1"),
+            ("videotrackidinfomap.1.videodatarate", "NaN"),
+            ("audiotrackidinfomap.1.samplerate", "-44100"),
+            ("audiotrackidinfomap.1.channels", "twelve"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let v = m.video_track_info(1).unwrap();
+        assert_eq!(v.width(), None);
+        assert_eq!(v.height(), None);
+        assert_eq!(v.video_data_rate_kbps(), None);
+        let a = m.audio_track_info(1).unwrap();
+        assert_eq!(a.audio_sample_rate(), None);
+        assert_eq!(a.channels(), None);
     }
 }
