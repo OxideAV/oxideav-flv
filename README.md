@@ -293,6 +293,28 @@ no per-track override" from "producer signalled the same value as
 the default". `TypedMetadata::video_track_info(id)` /
 `audio_track_info(id)` look up a specific trackId without iterating.
 
+The Enhanced-RTMP-v2 `colorInfo` HDR Metadata Frame (§"Metadata Frame")
+gets its own typed read view: `TypedMetadata::color_info()` returns
+`Option<TypedColorInfo>` — `Some` when the producer ever stamped a
+`colorInfo` (populated or reset), `None` when the producer never sent
+one. Field accessors mirror the encode-side
+[`color_info::ColorInfo`] / `ColorConfig` / `HdrCll` / `HdrMdcv` groups:
+`bit_depth` / `color_primaries` / `transfer_characteristics` /
+`matrix_coefficients` for the `colorConfig` ISO 23091-4 / H.273
+indices; `max_fall` / `max_cll` for the content-light-level pair;
+`red_x` / `red_y` / `green_x` / `green_y` / `blue_x` / `blue_y` /
+`white_point_x` / `white_point_y` / `max_luminance` / `min_luminance`
+for the SMPTE ST 2086:2018 mastering-display primaries. Producers
+stamp only the metadata they actually have; absent fields return
+`None`. The RECOMMENDED `["colorInfo", Undefined]` reset shape is
+surfaced via `TypedColorInfo::is_reset_sentinel()` — `true` after the
+producer cleared HDR state (every field accessor still returns `None`
+in that case), `false` for a regular populated frame or the
+empty-object reset form. The two shapes are otherwise indistinguishable
+through the field accessors; the sentinel is the only way to tell
+"producer reset HDR state" apart from "producer stamped a populated
+frame whose fields the reader happened not to ask for".
+
 ### Robustness
 
 The demuxer is fuzz-shaped by a hand-crafted adversarial-input suite

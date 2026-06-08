@@ -442,6 +442,218 @@ impl<'a> TypedMetadata<'a> {
             None
         }
     }
+
+    // -------------------------- Enhanced-RTMP-v2 colorInfo HDR view --------
+    //
+    // The Enhanced-RTMP-v2 §"Metadata Frame" / §`ColorInfo` block carries
+    // HDR signalling (bit depth + ISO 23091-4 indices + content-light-level
+    // pair + SMPTE ST 2086 mastering-display primaries) as an AMF
+    // `["colorInfo", Object]` pair on a `videoPacketType = 4` (Metadata)
+    // Ex video tag. The demuxer flattens the parsed object under
+    // `metadata["colorinfo.<group>.<field>"]` (with the outer name
+    // lowercased and the inner AMF property names preserved verbatim) and
+    // installs a `metadata["colorinfo"] = "undefined"` sentinel when the
+    // producer emitted the RECOMMENDED `Undefined` reset shape.
+    //
+    // [`TypedColorInfo`] is the read-side mirror of
+    // [`crate::color_info::ColorInfo`]: a borrowed view that re-types
+    // each populated field back into its spec-declared shape (bit depth +
+    // ISO indices as `u8`, chromaticity coordinates + luminance + content
+    // light level as `f64`). Missing fields return `None`. The
+    // [`Self::is_reset_sentinel`] flag tells callers whether the producer
+    // sent the Undefined reset (versus simply not stamping the property
+    // at all) — both shapes have empty nested groups, so the sentinel is
+    // the only way to distinguish them.
+
+    /// Borrowed view over the Enhanced-RTMP-v2 `colorInfo` HDR metadata
+    /// the producer stamped on the stream, if any.
+    ///
+    /// Returns `None` only when the producer never stamped a `colorInfo`
+    /// Metadata Frame at all (the bag has no `colorinfo` / `colorinfo.*`
+    /// keys). Returns `Some` after either a populated Metadata Frame OR
+    /// the RECOMMENDED Undefined reset; use [`TypedColorInfo::is_reset_sentinel`]
+    /// to distinguish.
+    pub fn color_info(&self) -> Option<TypedColorInfo<'a>> {
+        let present = self
+            .bag
+            .iter()
+            .any(|(k, _)| k == "colorinfo" || k.starts_with("colorinfo."));
+        present.then(|| TypedColorInfo::new(self.bag))
+    }
+}
+
+/// Borrowed view over the Enhanced-RTMP-v2 `colorInfo` HDR metadata
+/// (`enhanced-rtmp-v2` §"Metadata Frame" / §`ColorInfo`). Each accessor
+/// reads the matching `colorinfo.<group>.<field>` key out of the bag
+/// and re-types it back into the spec-declared AMF Number shape — `u8`
+/// for the ISO 23091-4 / H.273 index fields, `f64` for the chromaticity
+/// coordinates / content-light-level / luminance fields.
+///
+/// Read-side mirror of [`crate::color_info::ColorInfo`]: the
+/// `ColorInfo::encode_amf` writer-side struct produces an AMF body
+/// whose demuxed bag round-trips through every accessor here.
+///
+/// Per spec, every group / field is optional — producers stamp only the
+/// metadata they actually have. Absent fields return `None`; the
+/// accessors never panic on bag contents, no matter how the producer
+/// wrote them.
+///
+/// The Undefined reset shape (the RECOMMENDED way to clear the player's
+/// HDR state per spec) has no nested fields — every accessor returns
+/// `None` but [`Self::is_reset_sentinel`] returns `true`, so callers can
+/// distinguish "producer reset HDR state" from "producer never stamped a
+/// `colorInfo`". The empty-object reset shape (the alternative spec form)
+/// is reported as `is_reset_sentinel() == false` with all accessors
+/// returning `None` — the demuxer drops every prior `colorinfo.*` entry
+/// in both cases.
+#[derive(Clone, Copy, Debug)]
+pub struct TypedColorInfo<'a> {
+    bag: &'a [(String, String)],
+}
+
+impl<'a> TypedColorInfo<'a> {
+    fn new(bag: &'a [(String, String)]) -> Self {
+        Self { bag }
+    }
+
+    /// `true` when the producer sent the RECOMMENDED `Undefined` reset
+    /// shape (`["colorInfo", Undefined]`) — the demuxer stamps a
+    /// `colorinfo = "undefined"` sentinel in that case. `false` for a
+    /// regular populated frame, the empty-object reset, or when no
+    /// `colorInfo` was ever stamped (in which case
+    /// [`TypedMetadata::color_info`] returns `None` and this view
+    /// doesn't exist anyway).
+    pub fn is_reset_sentinel(&self) -> bool {
+        self.lookup_str("colorinfo") == Some("undefined")
+    }
+
+    // ----------------------------------------------------- colorConfig group
+
+    /// `colorConfig.bitDepth` — spec SHOULD says 8, 10, or 12.
+    pub fn bit_depth(&self) -> Option<u8> {
+        self.lookup_u8("colorinfo.colorConfig.bitDepth")
+    }
+
+    /// `colorConfig.colorPrimaries` — ISO 23091-4 / ITU-T H.273 §8.1
+    /// enumeration (range `[0, 255]`).
+    pub fn color_primaries(&self) -> Option<u8> {
+        self.lookup_u8("colorinfo.colorConfig.colorPrimaries")
+    }
+
+    /// `colorConfig.transferCharacteristics` — ISO 23091-4 / H.273 §8.2
+    /// enumeration (range `[0, 255]`).
+    pub fn transfer_characteristics(&self) -> Option<u8> {
+        self.lookup_u8("colorinfo.colorConfig.transferCharacteristics")
+    }
+
+    /// `colorConfig.matrixCoefficients` — ISO 23091-4 / H.273 §8.3
+    /// enumeration (range `[0, 255]`).
+    pub fn matrix_coefficients(&self) -> Option<u8> {
+        self.lookup_u8("colorinfo.colorConfig.matrixCoefficients")
+    }
+
+    // --------------------------------------------------------- hdrCll group
+
+    /// `hdrCll.maxFall` — maximum frame-average light level of the
+    /// entire playback sequence, in cd/m^2. Spec range is
+    /// `[0.0001, 10_000]`; producer-stamped out-of-range values still
+    /// flow through (the read view is descriptive, not prescriptive).
+    pub fn max_fall(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrCll.maxFall")
+    }
+
+    /// `hdrCll.maxCLL` — maximum light level of any single pixel of the
+    /// entire playback sequence, in cd/m^2.
+    pub fn max_cll(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrCll.maxCLL")
+    }
+
+    // -------------------------------------------------------- hdrMdcv group
+
+    /// `hdrMdcv.redX` — CIE 1931 X chromaticity coordinate of the
+    /// mastering-display red primary (SMPTE ST 2086:2018). Spec range
+    /// for X coordinates is `[0.0001, 0.7400]`.
+    pub fn red_x(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrMdcv.redX")
+    }
+
+    /// `hdrMdcv.redY` — CIE 1931 Y chromaticity coordinate of the
+    /// mastering-display red primary. Spec range for Y coordinates is
+    /// `[0.0001, 0.8400]`.
+    pub fn red_y(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrMdcv.redY")
+    }
+
+    /// `hdrMdcv.greenX` — CIE 1931 X chromaticity of the
+    /// mastering-display green primary.
+    pub fn green_x(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrMdcv.greenX")
+    }
+
+    /// `hdrMdcv.greenY` — CIE 1931 Y chromaticity of the
+    /// mastering-display green primary.
+    pub fn green_y(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrMdcv.greenY")
+    }
+
+    /// `hdrMdcv.blueX` — CIE 1931 X chromaticity of the
+    /// mastering-display blue primary.
+    pub fn blue_x(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrMdcv.blueX")
+    }
+
+    /// `hdrMdcv.blueY` — CIE 1931 Y chromaticity of the
+    /// mastering-display blue primary.
+    pub fn blue_y(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrMdcv.blueY")
+    }
+
+    /// `hdrMdcv.whitePointX` — CIE 1931 X chromaticity of the
+    /// mastering-display white point.
+    pub fn white_point_x(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrMdcv.whitePointX")
+    }
+
+    /// `hdrMdcv.whitePointY` — CIE 1931 Y chromaticity of the
+    /// mastering-display white point.
+    pub fn white_point_y(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrMdcv.whitePointY")
+    }
+
+    /// `hdrMdcv.maxLuminance` — peak mastering-display luminance,
+    /// cd/m^2. Spec range is `[5, 10_000]`.
+    pub fn max_luminance(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrMdcv.maxLuminance")
+    }
+
+    /// `hdrMdcv.minLuminance` — minimum mastering-display luminance,
+    /// cd/m^2. Spec range is `[0.0001, 5]`.
+    pub fn min_luminance(&self) -> Option<f64> {
+        self.lookup_finite_f64("colorinfo.hdrMdcv.minLuminance")
+    }
+
+    // --------------------------------------------------------------- helpers
+
+    fn lookup_str(&self, key: &str) -> Option<&'a str> {
+        self.bag
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn lookup_finite_f64(&self, key: &str) -> Option<f64> {
+        let v = self.lookup_str(key)?;
+        let n: f64 = v.parse().ok()?;
+        n.is_finite().then_some(n)
+    }
+
+    fn lookup_u8(&self, key: &str) -> Option<u8> {
+        let n = self.lookup_finite_f64(key)?;
+        if !(0.0..=u8::MAX as f64).contains(&n) {
+            return None;
+        }
+        Some(n as u8)
+    }
 }
 
 /// Iterator over the per-track entries of `videoTrackIdInfoMap` /
@@ -1108,5 +1320,160 @@ mod tests {
         let a = m.audio_track_info(1).unwrap();
         assert_eq!(a.audio_sample_rate(), None);
         assert_eq!(a.channels(), None);
+    }
+
+    // -------------------------- TypedColorInfo tests -----------------------
+
+    #[test]
+    fn color_info_returns_none_when_no_color_info_in_bag() {
+        let b = bag(&[("width", "1920"), ("height", "1080")]);
+        let m = TypedMetadata::new(&b);
+        assert!(m.color_info().is_none());
+    }
+
+    #[test]
+    fn color_info_round_trips_demuxer_flatten() {
+        // Mirrors the demuxer's `ex_video_metadata_colorinfo_flattens_into_metadata`
+        // fixture: a populated colorConfig + hdrCll group lands under the
+        // `colorinfo.<group>.<field>` prefix.
+        let b = bag(&[
+            ("colorinfo.colorConfig.bitDepth", "10"),
+            ("colorinfo.colorConfig.colorPrimaries", "9"),
+            ("colorinfo.colorConfig.transferCharacteristics", "16"),
+            ("colorinfo.colorConfig.matrixCoefficients", "9"),
+            ("colorinfo.hdrCll.maxFall", "400"),
+            ("colorinfo.hdrCll.maxCLL", "1000"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let ci = m.color_info().expect("colorInfo bag present");
+        assert!(!ci.is_reset_sentinel());
+        assert_eq!(ci.bit_depth(), Some(10));
+        assert_eq!(ci.color_primaries(), Some(9));
+        assert_eq!(ci.transfer_characteristics(), Some(16));
+        assert_eq!(ci.matrix_coefficients(), Some(9));
+        assert_eq!(ci.max_fall(), Some(400.0));
+        assert_eq!(ci.max_cll(), Some(1000.0));
+        // hdrMdcv unset — all None.
+        assert_eq!(ci.red_x(), None);
+        assert_eq!(ci.max_luminance(), None);
+    }
+
+    #[test]
+    fn color_info_round_trips_full_hdr_mdcv_group() {
+        // BT.2020 primaries + D65 white point + 0.01..1000 cd/m^2
+        // luminance, mirroring the encode-side fixture in
+        // `color_info::tests::populated_color_info_emits_expected_properties`.
+        let b = bag(&[
+            ("colorinfo.hdrMdcv.redX", "0.708"),
+            ("colorinfo.hdrMdcv.redY", "0.292"),
+            ("colorinfo.hdrMdcv.greenX", "0.17"),
+            ("colorinfo.hdrMdcv.greenY", "0.797"),
+            ("colorinfo.hdrMdcv.blueX", "0.131"),
+            ("colorinfo.hdrMdcv.blueY", "0.046"),
+            ("colorinfo.hdrMdcv.whitePointX", "0.3127"),
+            ("colorinfo.hdrMdcv.whitePointY", "0.329"),
+            ("colorinfo.hdrMdcv.maxLuminance", "1000"),
+            ("colorinfo.hdrMdcv.minLuminance", "0.01"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let ci = m.color_info().unwrap();
+        assert_eq!(ci.red_x(), Some(0.708));
+        assert_eq!(ci.red_y(), Some(0.292));
+        assert_eq!(ci.green_x(), Some(0.17));
+        assert_eq!(ci.green_y(), Some(0.797));
+        assert_eq!(ci.blue_x(), Some(0.131));
+        assert_eq!(ci.blue_y(), Some(0.046));
+        assert_eq!(ci.white_point_x(), Some(0.3127));
+        assert_eq!(ci.white_point_y(), Some(0.329));
+        assert_eq!(ci.max_luminance(), Some(1000.0));
+        assert_eq!(ci.min_luminance(), Some(0.01));
+        // No colorConfig / hdrCll keys in this bag — those accessors are None.
+        assert_eq!(ci.bit_depth(), None);
+        assert_eq!(ci.max_fall(), None);
+        assert_eq!(ci.max_cll(), None);
+    }
+
+    #[test]
+    fn color_info_reset_sentinel_is_distinguished_from_no_color_info() {
+        // The demuxer stamps `colorinfo = "undefined"` after the spec-
+        // RECOMMENDED `["colorInfo", Undefined]` reset. The view is
+        // present (so callers can react to "HDR state has been cleared")
+        // but every field accessor returns None and
+        // `is_reset_sentinel()` is true.
+        let b = bag(&[("colorinfo", "undefined")]);
+        let m = TypedMetadata::new(&b);
+        let ci = m
+            .color_info()
+            .expect("reset sentinel makes the view present");
+        assert!(ci.is_reset_sentinel());
+        assert_eq!(ci.bit_depth(), None);
+        assert_eq!(ci.color_primaries(), None);
+        assert_eq!(ci.transfer_characteristics(), None);
+        assert_eq!(ci.matrix_coefficients(), None);
+        assert_eq!(ci.max_fall(), None);
+        assert_eq!(ci.max_cll(), None);
+        assert_eq!(ci.red_x(), None);
+        assert_eq!(ci.max_luminance(), None);
+    }
+
+    #[test]
+    fn color_info_empty_object_reset_has_no_sentinel() {
+        // The alternative spec form `["colorInfo", {}]` drops every prior
+        // `colorinfo.*` entry but does NOT stamp the `colorinfo =
+        // "undefined"` sentinel — the demuxer simply removes the keys.
+        // After that point the bag has no `colorinfo` keys at all so the
+        // view is None.
+        let b = bag(&[("width", "1920")]);
+        let m = TypedMetadata::new(&b);
+        assert!(m.color_info().is_none());
+    }
+
+    #[test]
+    fn color_info_malformed_field_values_return_none() {
+        let b = bag(&[
+            ("colorinfo.colorConfig.bitDepth", "deep"),
+            ("colorinfo.colorConfig.colorPrimaries", "-1"),
+            ("colorinfo.colorConfig.transferCharacteristics", "1000"),
+            ("colorinfo.hdrCll.maxFall", "NaN"),
+            ("colorinfo.hdrMdcv.maxLuminance", "inf"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let ci = m.color_info().unwrap();
+        // Unparseable → None.
+        assert_eq!(ci.bit_depth(), None);
+        // Out-of-u8-range → None.
+        assert_eq!(ci.color_primaries(), None);
+        assert_eq!(ci.transfer_characteristics(), None);
+        // Non-finite → None.
+        assert_eq!(ci.max_fall(), None);
+        assert_eq!(ci.max_luminance(), None);
+    }
+
+    #[test]
+    fn color_info_view_does_not_synthesise_reset_sentinel_when_only_fields_present() {
+        // A populated frame with no `colorinfo` (no-dot) row in the bag
+        // must NOT report itself as a reset.
+        let b = bag(&[("colorinfo.colorConfig.bitDepth", "8")]);
+        let m = TypedMetadata::new(&b);
+        let ci = m.color_info().unwrap();
+        assert!(!ci.is_reset_sentinel());
+        assert_eq!(ci.bit_depth(), Some(8));
+    }
+
+    #[test]
+    fn color_info_view_independent_of_per_track_info_maps() {
+        // The two views key off different prefixes — adding per-track
+        // info-map entries to a bag with colorInfo doesn't affect the
+        // colorInfo view, and vice versa.
+        let b = bag(&[
+            ("colorinfo.colorConfig.bitDepth", "12"),
+            ("videotrackidinfomap.1.width", "1920"),
+            ("videotrackidinfomap.1.height", "1080"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let ci = m.color_info().unwrap();
+        assert_eq!(ci.bit_depth(), Some(12));
+        let t = m.video_track_info(1).unwrap();
+        assert_eq!(t.width(), Some(1920));
     }
 }

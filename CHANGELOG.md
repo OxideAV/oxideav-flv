@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `TypedMetadata::color_info()` accessor returning
+  `Option<TypedColorInfo>` — a borrowed read-side mirror of the
+  encode-side [`color_info::ColorInfo`] struct that re-types every
+  populated field of the Enhanced-RTMP-v2 §"Metadata Frame" /
+  §`ColorInfo` HDR signalling back into its spec-declared AMF Number
+  shape. `bit_depth` / `color_primaries` / `transfer_characteristics`
+  / `matrix_coefficients` cover the `colorConfig` ISO 23091-4 / H.273
+  index fields as `u8`; `max_fall` / `max_cll` cover the
+  content-light-level pair as `f64` cd/m^2; `red_x` / `red_y` /
+  `green_x` / `green_y` / `blue_x` / `blue_y` / `white_point_x` /
+  `white_point_y` / `max_luminance` / `min_luminance` cover the SMPTE
+  ST 2086:2018 mastering-display primaries / white point / luminance
+  as `f64`. `TypedColorInfo::is_reset_sentinel()` distinguishes the
+  RECOMMENDED `["colorInfo", Undefined]` reset shape (the demuxer's
+  `colorinfo = "undefined"` sentinel) from a regular populated frame
+  — both surface the view as `Some`, but the reset case reports
+  `is_reset_sentinel() == true` with every field accessor returning
+  `None`. Producers stamp only the metadata they actually have;
+  absent fields, out-of-range values, and non-finite numbers all
+  flow through as `None`. Eight unit tests cover round-tripping
+  against the demuxer's `ex_video_metadata_colorinfo_flattens_into_metadata`
+  / `..._undefined_resets` fixtures, the full BT.2020 + D65 hdrMdcv
+  group, the reset-vs-no-colorInfo distinction, malformed field
+  rejects, and the orthogonality of `colorInfo` against the per-track
+  info maps.
 - `TypedMetadata::video_track_info_map()` /
   `TypedMetadata::audio_track_info_map()` iterators and
   `TypedMetadata::video_track_info(track_id)` /
