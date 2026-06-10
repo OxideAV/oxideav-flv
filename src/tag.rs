@@ -902,6 +902,32 @@ pub fn write_ex_audio_sequence_end<W: Write + ?Sized>(
     write_ex_audio_tag(w, timestamp_ms, &header, &[])
 }
 
+/// Write an Ex-audio `MultichannelConfig` tag for the given FourCc
+/// (enhanced-rtmp-v2 §`ExAudioTagBody`): the typed
+/// [`crate::multichannel::MultichannelConfig`] is validated and
+/// serialised as the tag payload.
+///
+/// The demuxer parses the same body back into
+/// `metadata["multichannelconfig.*"]` entries and lifts the channel
+/// count into `CodecParameters::channels`, so the writer and parser
+/// share one source of truth. Invalid configs (see
+/// [`crate::multichannel::MultichannelConfig::to_bytes`]) error before
+/// any bytes reach `w`.
+pub fn write_ex_audio_multichannel_config<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    fourcc: u32,
+    config: &crate::multichannel::MultichannelConfig,
+) -> Result<u32> {
+    let header = single_track_ex_audio_header(
+        crate::ex_audio::ExAudioPacketType::MultichannelConfig,
+        fourcc,
+    );
+    let mut payload = Vec::with_capacity(2 + 4 + config.mapping.as_ref().map_or(0, Vec::len));
+    config.to_bytes(&mut payload)?;
+    write_ex_audio_tag(w, timestamp_ms, &header, &payload)
+}
+
 fn u24_to_be(v: u32) -> [u8; 3] {
     [(v >> 16) as u8, (v >> 8) as u8, v as u8]
 }

@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced-RTMP-v2 `AudioPacketType.MultichannelConfig` body parsing +
+  emission (new `multichannel` module). The previously-opaque speaker
+  layout signal (§`ExAudioTagBody`) now decodes into a typed
+  `MultichannelConfig` struct — `AudioChannelOrder`
+  (`Unspecified` / `Native` / `Custom` / reserved-preserving),
+  `channel_count`, the `Custom` per-channel `AudioChannel` speaker map
+  (all 24 spec positions through 22.2 / SMPTE ST 2036-2-2008, plus
+  `Unused` 0xFE / `Unknown` 0xFF / reserved), and the `Native`
+  `audioChannelFlags` UI32 presence mask. The demuxer harvests the
+  parsed config (multitrack-aware: the default track's payload is
+  unwrapped first) into `metadata["multichannelconfig.order" /
+  ".channelcount" / ".flags" / ".layout" / ".mapping"]` — latest signal
+  supersedes the prior one — and lifts the channel count into
+  `CodecParameters::channels` (the spec's channel-mapping truth for
+  codecs that are not self-describing; the `onMetaData` `stereo`
+  boolean can only express 1 or 2). The tag itself still surfaces as a
+  header+discard packet. Write side:
+  `tag::write_ex_audio_multichannel_config(w, ts, fourcc, &config)` +
+  `MultichannelConfig::to_bytes` validate order/field consistency
+  (Custom mapping length == channelCount, Native mask popcount ==
+  channelCount with no reserved high bits, reserved orders rejected)
+  before any bytes are emitted; the parser stays lenient on all three
+  so callers see exactly what a producer signalled. 12 unit tests +
+  2 demuxer tests + 2 mux→demux round-trip integration tests.
 - `TypedColorInfo::to_color_info()` — reconstructs the encode-side
   [`color_info::ColorInfo`] struct from the read view in one call,
   closing the read↔write symmetry loop for the Enhanced-RTMP-v2

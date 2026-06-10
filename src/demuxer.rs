@@ -38,6 +38,7 @@ use crate::ex_video::{
     FOURCC_VVC1,
 };
 use crate::header::FlvHeader;
+use crate::multichannel::{mask_channel_labels, MultichannelConfig};
 use crate::multitrack::split_tracks;
 use crate::tag::{
     audio_codec_id_str, video_codec_id_str, AudioTagHeader, EncryptedTagPreamble, TagHeader,
@@ -321,6 +322,29 @@ impl Demuxer for FlvDemuxer {
                         Some(i) => i,
                         None => continue,
                     };
+                    // Enhanced-RTMP `AudioPacketType.MultichannelConfig`
+                    // frames carry the stream's speaker layout (no audio
+                    // data). Harvest the parsed config into the metadata
+                    // bag + the stream's channel count here — the spec
+                    // defines it as the channel-mapping signal for codecs
+                    // that are not self-describing, and a new config
+                    // supersedes the prior one. The packet itself is
+                    // still emitted as header+discard for parity.
+                    if let Ok(Some(ex)) = ExAudioTagHeader::parse(&body) {
+                        if ex.packet_type == ExAudioPacketType::MultichannelConfig {
+                            let start = ex.bytes_consumed.min(body.len());
+                            let tail = &body[start..];
+                            let payload = match ex.multitrack {
+                                Some(mt) => default_track_payload(mt, ex.fourcc, tail),
+                                None => tail.to_vec(),
+                            };
+                            harvest_multichannel_config(
+                                &payload,
+                                &mut self.metadata,
+                                &mut self.streams[idx as usize],
+                            );
+                        }
+                    }
                     if let Some((pkt, pending)) =
                         build_audio_packet(&self.streams[idx as usize], &header, &body)
                     {
@@ -803,7 +827,9 @@ fn build_audio_packet(
     //   AudioPacketType=0 SequenceStart        → header packet (config)
     //   AudioPacketType=1 CodedFrames          → data packet
     //   AudioPacketType=2 SequenceEnd          → skip (no decoder input)
-    //   AudioPacketType=4 MultichannelConfig   → header+discard
+    //   AudioPacketType=4 MultichannelConfig   → header+discard (the
+    //     parsed speaker layout is harvested into the metadata bag +
+    //     stream channels by `next_packet` before this call)
     //   AudioPacketType=7 ModEx + reserved     → header+discard
     // The outer `Multitrack` (=5) value never appears on
     // `ex.packet_type`: the parser already resolves it down to the
@@ -1504,6 +1530,69 @@ fn harvest_video_metadata_frame(body: &[u8], out: &mut Vec<(String, String)>) {
         // "invalidates and replaces the current one"; Undefined / {} reset).
         out.retain(|(k, _)| k != &prefix && !k.starts_with(&format!("{prefix}.")));
         flatten_amf_value(&value, &prefix, out);
+    }
+}
+
+/// Harvest an Enhanced-RTMP-v2 `AudioPacketType.MultichannelConfig`
+/// payload (enhanced-rtmp-v2 §`ExAudioTagBody`) into the metadata bag
+/// and onto the audio stream's `CodecParameters`.
+///
+/// Keys (latest config wins — a new signal supersedes the prior one, so
+/// every prior `multichannelconfig.*` entry is dropped first):
+///
+/// * `multichannelconfig.order` — `"unspecified"` / `"native"` /
+///   `"custom"` / `"reserved:<n>"`.
+/// * `multichannelconfig.channelcount` — the UI8 channel count.
+/// * `multichannelconfig.flags` (`Native` only) — the raw UI32
+///   `audioChannelFlags` mask as `0x<8-hex-digits>`.
+/// * `multichannelconfig.layout` (`Native` only) — comma-joined speaker
+///   labels for every spec-defined mask bit set, in mask-bit order
+///   (e.g. `"frontleft,frontright,frontcenter,lowfrequency1,backleft,
+///   backright"` for 5.1).
+/// * `multichannelconfig.mapping` (`Custom` only) — comma-joined
+///   per-channel speaker labels in bitstream order (`"unused"` /
+///   `"unknown"` / `"reserved:<n>"` for the special values).
+///
+/// The channel count also overrides `CodecParameters::channels` when
+/// non-zero — the spec defines this signal as the channel-mapping truth
+/// for codecs that are not self-describing (the `onMetaData` `stereo`
+/// boolean can only express 1 or 2). A malformed body is skipped
+/// silently: side-channel info must not kill the stream, and the tag is
+/// still surfaced as a header+discard packet either way.
+fn harvest_multichannel_config(
+    payload: &[u8],
+    out: &mut Vec<(String, String)>,
+    stream: &mut StreamInfo,
+) {
+    let mcc = match MultichannelConfig::parse(payload) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    out.retain(|(k, _)| k != "multichannelconfig" && !k.starts_with("multichannelconfig."));
+    out.push(("multichannelconfig.order".into(), mcc.order.label()));
+    out.push((
+        "multichannelconfig.channelcount".into(),
+        mcc.channel_count.to_string(),
+    ));
+    if let Some(flags) = mcc.channel_flags {
+        out.push(("multichannelconfig.flags".into(), format!("0x{flags:08X}")));
+        out.push((
+            "multichannelconfig.layout".into(),
+            mask_channel_labels(flags).join(","),
+        ));
+    }
+    if let Some(mapping) = &mcc.mapping {
+        out.push((
+            "multichannelconfig.mapping".into(),
+            mapping
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>()
+                .join(","),
+        ));
+    }
+    if mcc.channel_count > 0 {
+        stream.params.channels = Some(mcc.channel_count as u16);
     }
 }
 
@@ -2889,7 +2978,9 @@ mod tests {
         let seq_tag = make_tag(0x08, 0, &seq_body);
         let mut mcc_body = vec![0x94]; // MultichannelConfig
         mcc_body.extend_from_slice(b"Opus");
-        mcc_body.extend_from_slice(&[0x01, 0x02, 0x03]); // dummy config
+        // Truncated config: order=Native promises a UI32 flags field
+        // but only one byte follows — the harvest must skip silently.
+        mcc_body.extend_from_slice(&[0x01, 0x02, 0x03]);
         let mcc_tag = make_tag(0x08, 10, &mcc_body);
         let vp6_body = {
             let flags = (1u8 << 4) | 4;
@@ -2904,6 +2995,55 @@ mod tests {
         assert!(m.flags.header);
         assert!(m.flags.discard);
         assert_eq!(m.data, vec![0x01, 0x02, 0x03]);
+        // Malformed side-channel info: no metadata keys, channel count
+        // untouched.
+        assert!(dmx
+            .metadata()
+            .iter()
+            .all(|(k, _)| !k.starts_with("multichannelconfig")));
+        assert_ne!(dmx.streams()[0].params.channels, Some(2));
+    }
+
+    #[test]
+    fn ex_audio_multichannel_config_in_multitrack_default_track_harvests() {
+        // MultichannelConfig wrapped in a Multitrack OneTrack record:
+        // the harvest must unwrap the default track's payload exactly
+        // like the packet path does. Lead 0x95 = ExHeader + Multitrack;
+        // 0x04 = OneTrack | inner MultichannelConfig; shared FourCc;
+        // then the OneTrack record = trackId UI8 + payload (Unspecified
+        // order, 4 channels).
+        let mut seq_body = vec![0x90];
+        seq_body.extend_from_slice(b"Opus");
+        seq_body.push(0x00);
+        let seq_tag = make_tag(0x08, 0, &seq_body);
+        let mut mcc_body = vec![0x95];
+        mcc_body.push(0x04); // OneTrack | MultichannelConfig
+        mcc_body.extend_from_slice(b"Opus");
+        mcc_body.push(0x00); // trackId 0
+        mcc_body.extend_from_slice(&[0x00, 0x04]); // Unspecified, 4 ch
+        let mcc_tag = make_tag(0x08, 10, &mcc_body);
+        let vp6_body = {
+            let flags = (1u8 << 4) | 4;
+            vec![flags, 0x00, 0x42]
+        };
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&seq_tag, &mcc_tag, &video_tag]);
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        let _seq = dmx.next_packet().unwrap();
+        let m = dmx.next_packet().unwrap();
+        assert!(m.flags.header && m.flags.discard);
+        assert_eq!(
+            meta_lookup(dmx.metadata(), "multichannelconfig.order"),
+            Some("unspecified")
+        );
+        assert_eq!(
+            meta_lookup(dmx.metadata(), "multichannelconfig.channelcount"),
+            Some("4")
+        );
+        assert!(meta_lookup(dmx.metadata(), "multichannelconfig.flags").is_none());
+        assert!(meta_lookup(dmx.metadata(), "multichannelconfig.mapping").is_none());
+        assert_eq!(dmx.streams()[0].params.channels, Some(4));
     }
 
     #[test]

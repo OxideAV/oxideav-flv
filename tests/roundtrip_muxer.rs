@@ -23,16 +23,17 @@ use oxideav_flv::{
 use oxideav_flv::{
     write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_ac3_coded_frames,
     write_av1_coded_frames, write_av1_sequence_start, write_avc_nalu_tag,
-    write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_sequence_end,
-    write_ex_audio_tag, write_ex_video_color_info, write_ex_video_color_info_reset,
-    write_ex_video_metadata, write_ex_video_sequence_end, write_ex_video_tag,
-    write_flac_coded_frames, write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames,
-    write_hevc_coded_frames_x, write_hevc_sequence_start, write_mp3_ex_coded_frames,
-    write_opus_coded_frames, write_opus_sequence_start, write_vp6_tag, write_vp6a_tag,
-    write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
-    write_vvc_sequence_start, AvMultitrackType, ColorConfig, ColorInfo, ExAudioPacketType,
-    ExAudioTagHeader, ExFrameType, ExPacketType, ExVideoTagHeader, HdrCll, HdrMdcv, ModExEntry,
-    ModExPayload, FOURCC_AUDIO_AAC, FOURCC_AV01, FOURCC_OPUS,
+    write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_multichannel_config,
+    write_ex_audio_sequence_end, write_ex_audio_tag, write_ex_video_color_info,
+    write_ex_video_color_info_reset, write_ex_video_metadata, write_ex_video_sequence_end,
+    write_ex_video_tag, write_flac_coded_frames, write_flac_sequence_start, write_h263_tag,
+    write_hevc_coded_frames, write_hevc_coded_frames_x, write_hevc_sequence_start,
+    write_mp3_ex_coded_frames, write_opus_coded_frames, write_opus_sequence_start, write_vp6_tag,
+    write_vp6a_tag, write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
+    write_vvc_sequence_start, AudioChannel, AudioChannelOrder, AvMultitrackType, ColorConfig,
+    ColorInfo, ExAudioPacketType, ExAudioTagHeader, ExFrameType, ExPacketType, ExVideoTagHeader,
+    HdrCll, HdrMdcv, ModExEntry, ModExPayload, MultichannelConfig, FOURCC_AUDIO_AAC, FOURCC_AV01,
+    FOURCC_OPUS,
 };
 
 /// Three distinct synthetic MP3 frame payloads. The demuxer treats an
@@ -570,6 +571,106 @@ fn ex_audio_sequence_end_emits_empty_body() {
     assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
     let _ = dmx.next_packet();
     let _ = dmx.next_packet();
+}
+
+#[test]
+fn ex_audio_multichannel_config_native_round_trips_through_demuxer() {
+    // Native-order 5.1 (FrontLeft | FrontRight | FrontCenter |
+    // LowFrequency1 | BackLeft | BackRight = 0x3F): the writer's
+    // typed MultichannelConfig must come back out of the demuxer as
+    // multichannelconfig.* metadata + an updated channel count.
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    write_opus_sequence_start(&mut buf, 0, &[0x4F, 0x70]).unwrap();
+    let mcc = MultichannelConfig {
+        order: AudioChannelOrder::Native,
+        channel_count: 6,
+        mapping: None,
+        channel_flags: Some(0x3F),
+    };
+    write_ex_audio_multichannel_config(&mut buf, 5, FOURCC_OPUS, &mcc).unwrap();
+    write_opus_coded_frames(&mut buf, 20, &[0xFC, 0x12]).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    let _seq = dmx.next_packet().unwrap();
+    let m = dmx.next_packet().unwrap();
+    assert!(m.flags.header && m.flags.discard);
+    // The discardable packet's body is the raw config bytes.
+    assert_eq!(m.data, vec![0x01, 6, 0x00, 0x00, 0x00, 0x3F]);
+    let lookup = |key: &str| {
+        dmx.metadata()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(lookup("multichannelconfig.order"), Some("native"));
+    assert_eq!(lookup("multichannelconfig.channelcount"), Some("6"));
+    assert_eq!(lookup("multichannelconfig.flags"), Some("0x0000003F"));
+    assert_eq!(
+        lookup("multichannelconfig.layout"),
+        Some("frontleft,frontright,frontcenter,lowfrequency1,backleft,backright")
+    );
+    assert_eq!(lookup("multichannelconfig.mapping"), None);
+    assert_eq!(dmx.streams()[0].params.channels, Some(6));
+    // The coded frame after the config still decodes normally.
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, vec![0xFC, 0x12]);
+}
+
+#[test]
+fn ex_audio_multichannel_config_custom_supersedes_native() {
+    // A second MultichannelConfig replaces the first: Native 5.1 is
+    // followed by a Custom 2-channel swap map — the flags/layout keys
+    // must vanish and the mapping + count must reflect the new signal.
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    write_opus_sequence_start(&mut buf, 0, &[0x4F, 0x70]).unwrap();
+    let native = MultichannelConfig {
+        order: AudioChannelOrder::Native,
+        channel_count: 6,
+        mapping: None,
+        channel_flags: Some(0x3F),
+    };
+    write_ex_audio_multichannel_config(&mut buf, 5, FOURCC_OPUS, &native).unwrap();
+    let custom = MultichannelConfig {
+        order: AudioChannelOrder::Custom,
+        channel_count: 2,
+        mapping: Some(vec![AudioChannel::FrontRight, AudioChannel::FrontLeft]),
+        channel_flags: None,
+    };
+    write_ex_audio_multichannel_config(&mut buf, 10, FOURCC_OPUS, &custom).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    let _seq = dmx.next_packet().unwrap();
+    let _native = dmx.next_packet().unwrap();
+    let _custom = dmx.next_packet().unwrap();
+    let lookup = |key: &str| {
+        dmx.metadata()
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(lookup("multichannelconfig.order"), Some("custom"));
+    assert_eq!(lookup("multichannelconfig.channelcount"), Some("2"));
+    assert_eq!(
+        lookup("multichannelconfig.mapping"),
+        Some("frontright,frontleft")
+    );
+    assert_eq!(lookup("multichannelconfig.flags"), None);
+    assert_eq!(lookup("multichannelconfig.layout"), None);
+    // Exactly one entry per key — the retain-then-push replace must not
+    // leave duplicates behind.
+    let count = dmx
+        .metadata()
+        .iter()
+        .filter(|(k, _)| k == "multichannelconfig.order")
+        .count();
+    assert_eq!(count, 1);
+    assert_eq!(dmx.streams()[0].params.channels, Some(2));
 }
 
 // ---- onMetaData.keyframes seek-table writer round-trip ------------------

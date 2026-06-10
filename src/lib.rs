@@ -30,6 +30,7 @@ pub mod ex_audio;
 pub mod ex_video;
 pub mod header;
 pub mod mod_ex;
+pub mod multichannel;
 pub mod multitrack;
 pub mod script;
 pub mod tag;
@@ -53,6 +54,7 @@ pub use ex_video::{
 };
 pub use header::{FlvHeader, FLV_SIGNATURE};
 pub use mod_ex::{ModExEntry, ModExPayload};
+pub use multichannel::{mask_channel_labels, AudioChannel, AudioChannelOrder, MultichannelConfig};
 pub use multitrack::{split_tracks, MultitrackTrack};
 pub use script::{
     write_on_cue_point, write_on_cue_point_body, write_on_metadata, write_on_metadata_body,
@@ -63,17 +65,18 @@ pub use tag::{
     audio_codec_id_str, video_codec_id_str, write_aac_ex_coded_frames, write_aac_ex_sequence_start,
     write_aac_raw_tag, write_ac3_coded_frames, write_audio_tag, write_av1_coded_frames,
     write_av1_sequence_start, write_avc_end_of_sequence, write_avc_nalu_tag,
-    write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_sequence_end,
-    write_ex_audio_tag, write_ex_video_color_info, write_ex_video_color_info_reset,
-    write_ex_video_metadata, write_ex_video_sequence_end, write_ex_video_tag,
-    write_first_previous_tag_size, write_flac_coded_frames, write_flac_sequence_start,
-    write_h263_tag, write_hevc_coded_frames, write_hevc_coded_frames_x, write_hevc_sequence_start,
-    write_mp3_ex_coded_frames, write_mp3_tag, write_opus_coded_frames, write_opus_sequence_start,
-    write_tag, write_video_info_command_tag, write_video_tag, write_vp6_tag, write_vp6a_tag,
-    write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
-    write_vvc_sequence_start, AudioTagHeader, EncryptedTagPreamble, FrameType, TagHeader, TagType,
-    VideoInfoCommand, VideoTagHeader, AUDIO_CODEC_AAC, AUDIO_CODEC_MP3, AUDIO_CODEC_MP3_8K,
-    VIDEO_CODEC_FLV1, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A, VIDEO_CODEC_VP6F,
+    write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_multichannel_config,
+    write_ex_audio_sequence_end, write_ex_audio_tag, write_ex_video_color_info,
+    write_ex_video_color_info_reset, write_ex_video_metadata, write_ex_video_sequence_end,
+    write_ex_video_tag, write_first_previous_tag_size, write_flac_coded_frames,
+    write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames, write_hevc_coded_frames_x,
+    write_hevc_sequence_start, write_mp3_ex_coded_frames, write_mp3_tag, write_opus_coded_frames,
+    write_opus_sequence_start, write_tag, write_video_info_command_tag, write_video_tag,
+    write_vp6_tag, write_vp6a_tag, write_vp9_coded_frames, write_vp9_sequence_start,
+    write_vvc_coded_frames, write_vvc_sequence_start, AudioTagHeader, EncryptedTagPreamble,
+    FrameType, TagHeader, TagType, VideoInfoCommand, VideoTagHeader, AUDIO_CODEC_AAC,
+    AUDIO_CODEC_MP3, AUDIO_CODEC_MP3_8K, VIDEO_CODEC_FLV1, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A,
+    VIDEO_CODEC_VP6F,
 };
 pub use typed_meta::{
     TrackInfoIter, TypedAudioTrackInfo, TypedColorInfo, TypedMetadata, TypedVideoTrackInfo,

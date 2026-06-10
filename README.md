@@ -204,7 +204,18 @@ oxideav-flv = "0.0"
     config blob (Opus ID header / FLAC `fLaC + STREAMINFO` / AAC
     `AudioSpecificConfig`) routed to extradata; `CodedFrames` → data
     packet; `SequenceEnd` → dropped (no decoder input);
-    `MultichannelConfig` / `ModEx` → header + discard
+    `MultichannelConfig` → header + discard, **and** the speaker-layout
+    body is parsed (enhanced-rtmp-v2 §`ExAudioTagBody`):
+    `AudioChannelOrder` + channelCount + (`Custom`) the per-channel
+    `AudioChannel` speaker map / (`Native`) the `audioChannelFlags`
+    UI32 presence mask land under
+    `metadata["multichannelconfig.order" / ".channelcount" / ".flags"
+    / ".layout" / ".mapping"]` (latest signal supersedes), and the
+    channel count lifts into `CodecParameters::channels` — the spec's
+    channel-mapping truth for codecs that are not self-describing
+    (called out for Opus streams with an empty SequenceStart payload);
+    multitrack-wrapped configs unwrap the default track's payload
+    first; `ModEx` → header + discard
     (parsed but not consumed); `Multitrack` → outer header parsed, body
     split per-track via `split_tracks`, default track (trackId 0, or
     first) emitted via its inner packet type (extradata lifted from the
@@ -394,6 +405,7 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | MP3 (FourCc-mode) coded frames | `tag::write_mp3_ex_coded_frames` | FourCc `.mp3` |
 | AAC (FourCc-mode) sequence start / coded frames | `tag::write_aac_ex_sequence_start` / `tag::write_aac_ex_coded_frames` | FourCc `mp4a` |
 | Ex-audio sequence end | `tag::write_ex_audio_sequence_end` | enhanced-rtmp v2 |
+| Ex-audio multichannel config | `tag::write_ex_audio_multichannel_config(w, ts_ms, fourcc, &MultichannelConfig)` | enhanced-rtmp v2 §`ExAudioTagBody` |
 | Ex-video HDR `colorInfo` metadata tag | `tag::write_ex_video_color_info(w, ts_ms, fourcc, &ColorInfo)` | enhanced-rtmp v2 §"Metadata Frame" |
 | Ex-video HDR `colorInfo` reset (`Undefined`) | `tag::write_ex_video_color_info_reset(w, ts_ms, fourcc)` | enhanced-rtmp v2 §"Metadata Frame" |
 | Typed `colorInfo` AMF body encoder | `color_info::{ColorInfo, ColorConfig, HdrCll, HdrMdcv}::encode_amf()` / `encode_amf_into` / `encode_amf_reset` | enhanced-rtmp v2 §`ColorInfo` |
