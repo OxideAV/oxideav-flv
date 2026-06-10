@@ -314,6 +314,16 @@ empty-object reset form. The two shapes are otherwise indistinguishable
 through the field accessors; the sentinel is the only way to tell
 "producer reset HDR state" apart from "producer stamped a populated
 frame whose fields the reader happened not to ask for".
+`TypedColorInfo::to_color_info()` reconstructs the encode-side
+[`color_info::ColorInfo`] struct from the read view in one call, closing
+the read↔write loop: the struct it returns, fed back through
+`ColorInfo::encode_amf` / `tag::write_ex_video_color_info`, re-emits the
+same `["colorInfo", Object]` AMF body the demuxer parsed. Each of the
+three groups (`colorConfig` / `hdrCll` / `hdrMdcv`) is `Some` only when
+at least one of its fields survives as a finite, in-range value —
+mirroring the encoder's "omit an all-absent group" convention — so a
+reset sentinel and an all-malformed frame both rebuild to
+`ColorInfo::default()`.
 
 ### Robustness
 

@@ -492,6 +492,8 @@ impl<'a> TypedMetadata<'a> {
 /// Read-side mirror of [`crate::color_info::ColorInfo`]: the
 /// `ColorInfo::encode_amf` writer-side struct produces an AMF body
 /// whose demuxed bag round-trips through every accessor here.
+/// [`Self::to_color_info`] reconstructs the encode-side struct in one
+/// call, closing the read↔write loop.
 ///
 /// Per spec, every group / field is optional — producers stamp only the
 /// metadata they actually have. Absent fields return `None`; the
@@ -630,6 +632,69 @@ impl<'a> TypedColorInfo<'a> {
     /// cd/m^2. Spec range is `[0.0001, 5]`.
     pub fn min_luminance(&self) -> Option<f64> {
         self.lookup_finite_f64("colorinfo.hdrMdcv.minLuminance")
+    }
+
+    // ------------------------------------------------- encode-struct rebuild
+
+    /// Rebuild the encode-side [`crate::color_info::ColorInfo`] struct
+    /// from this read view, closing the read↔write symmetry loop: the
+    /// struct returned here, fed back through
+    /// [`crate::color_info::ColorInfo::encode_amf`] /
+    /// [`crate::tag::write_ex_video_color_info`], re-emits the same
+    /// `["colorInfo", Object]` AMF body the demuxer just parsed (modulo
+    /// fields the producer stamped out-of-range, which the read view
+    /// drops to `None` and so do not survive the rebuild).
+    ///
+    /// Each of the three groups (`colorConfig` / `hdrCll` / `hdrMdcv`) is
+    /// populated to `Some(..)` only when at least one of its fields
+    /// survives as a finite, in-range value — mirroring the encode-side
+    /// convention that an all-`None` group is omitted from the AMF
+    /// object entirely (Veovera `enhanced-rtmp-v2` §"Metadata Frame":
+    /// "Producers stamp only the metadata they actually have"). A reset
+    /// sentinel (`is_reset_sentinel() == true`) and an
+    /// all-fields-malformed frame therefore both rebuild to the empty
+    /// [`crate::color_info::ColorInfo::default()`], which the encoder
+    /// emits as the spec's empty-object reset shape.
+    pub fn to_color_info(&self) -> crate::color_info::ColorInfo {
+        use crate::color_info::{ColorConfig, ColorInfo, HdrCll, HdrMdcv};
+
+        let color_config = {
+            let cc = ColorConfig {
+                bit_depth: self.bit_depth(),
+                color_primaries: self.color_primaries(),
+                transfer_characteristics: self.transfer_characteristics(),
+                matrix_coefficients: self.matrix_coefficients(),
+            };
+            (cc != ColorConfig::default()).then_some(cc)
+        };
+        let hdr_cll = {
+            let cll = HdrCll {
+                max_fall: self.max_fall(),
+                max_cll: self.max_cll(),
+            };
+            (cll != HdrCll::default()).then_some(cll)
+        };
+        let hdr_mdcv = {
+            let mdcv = HdrMdcv {
+                red_x: self.red_x(),
+                red_y: self.red_y(),
+                green_x: self.green_x(),
+                green_y: self.green_y(),
+                blue_x: self.blue_x(),
+                blue_y: self.blue_y(),
+                white_point_x: self.white_point_x(),
+                white_point_y: self.white_point_y(),
+                max_luminance: self.max_luminance(),
+                min_luminance: self.min_luminance(),
+            };
+            (mdcv != HdrMdcv::default()).then_some(mdcv)
+        };
+
+        ColorInfo {
+            color_config,
+            hdr_cll,
+            hdr_mdcv,
+        }
     }
 
     // --------------------------------------------------------------- helpers
@@ -1475,5 +1540,118 @@ mod tests {
         assert_eq!(ci.bit_depth(), Some(12));
         let t = m.video_track_info(1).unwrap();
         assert_eq!(t.width(), Some(1920));
+    }
+
+    #[test]
+    fn to_color_info_rebuilds_full_encode_struct() {
+        use crate::color_info::{ColorConfig, HdrCll, HdrMdcv};
+        // A bag carrying every group rebuilds into the same encode-side
+        // struct a producer would feed `tag::write_ex_video_color_info`.
+        let b = bag(&[
+            ("colorinfo.colorConfig.bitDepth", "10"),
+            ("colorinfo.colorConfig.colorPrimaries", "9"),
+            ("colorinfo.colorConfig.transferCharacteristics", "16"),
+            ("colorinfo.colorConfig.matrixCoefficients", "9"),
+            ("colorinfo.hdrCll.maxFall", "400"),
+            ("colorinfo.hdrCll.maxCLL", "1000"),
+            ("colorinfo.hdrMdcv.redX", "0.708"),
+            ("colorinfo.hdrMdcv.redY", "0.292"),
+            ("colorinfo.hdrMdcv.greenX", "0.17"),
+            ("colorinfo.hdrMdcv.greenY", "0.797"),
+            ("colorinfo.hdrMdcv.blueX", "0.131"),
+            ("colorinfo.hdrMdcv.blueY", "0.046"),
+            ("colorinfo.hdrMdcv.whitePointX", "0.3127"),
+            ("colorinfo.hdrMdcv.whitePointY", "0.329"),
+            ("colorinfo.hdrMdcv.maxLuminance", "1000"),
+            ("colorinfo.hdrMdcv.minLuminance", "0.01"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let rebuilt = m.color_info().unwrap().to_color_info();
+        assert_eq!(
+            rebuilt.color_config,
+            Some(ColorConfig {
+                bit_depth: Some(10),
+                color_primaries: Some(9),
+                transfer_characteristics: Some(16),
+                matrix_coefficients: Some(9),
+            })
+        );
+        assert_eq!(
+            rebuilt.hdr_cll,
+            Some(HdrCll {
+                max_fall: Some(400.0),
+                max_cll: Some(1000.0),
+            })
+        );
+        assert_eq!(
+            rebuilt.hdr_mdcv,
+            Some(HdrMdcv {
+                red_x: Some(0.708),
+                red_y: Some(0.292),
+                green_x: Some(0.17),
+                green_y: Some(0.797),
+                blue_x: Some(0.131),
+                blue_y: Some(0.046),
+                white_point_x: Some(0.3127),
+                white_point_y: Some(0.329),
+                max_luminance: Some(1000.0),
+                min_luminance: Some(0.01),
+            })
+        );
+    }
+
+    #[test]
+    fn to_color_info_omits_absent_groups() {
+        // Only a colorConfig group present → hdrCll / hdrMdcv rebuild to
+        // None, mirroring the encoder's "omit an all-None group" rule.
+        let b = bag(&[
+            ("colorinfo.colorConfig.bitDepth", "8"),
+            ("colorinfo.colorConfig.colorPrimaries", "1"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let rebuilt = m.color_info().unwrap().to_color_info();
+        let cc = rebuilt.color_config.expect("colorConfig present");
+        assert_eq!(cc.bit_depth, Some(8));
+        assert_eq!(cc.color_primaries, Some(1));
+        // The two unset colorConfig fields stay None inside the group.
+        assert_eq!(cc.transfer_characteristics, None);
+        assert_eq!(cc.matrix_coefficients, None);
+        assert_eq!(rebuilt.hdr_cll, None);
+        assert_eq!(rebuilt.hdr_mdcv, None);
+    }
+
+    #[test]
+    fn to_color_info_reset_sentinel_rebuilds_default() {
+        // The RECOMMENDED Undefined reset has no nested fields, so the
+        // rebuild collapses to the empty struct — which the encoder emits
+        // as the spec's empty-object reset shape.
+        let b = bag(&[("colorinfo", "undefined")]);
+        let m = TypedMetadata::new(&b);
+        let ci = m.color_info().unwrap();
+        assert!(ci.is_reset_sentinel());
+        assert_eq!(ci.to_color_info(), crate::color_info::ColorInfo::default());
+    }
+
+    #[test]
+    fn to_color_info_drops_out_of_range_fields() {
+        // Out-of-range / malformed producer values are dropped to None by
+        // the read view, so the rebuilt struct omits them (and the whole
+        // colorConfig group, since every field was malformed). The
+        // surviving hdrCll field keeps that group alive.
+        let b = bag(&[
+            ("colorinfo.colorConfig.bitDepth", "deep"),
+            ("colorinfo.colorConfig.colorPrimaries", "-1"),
+            ("colorinfo.hdrCll.maxCLL", "1000"),
+        ]);
+        let m = TypedMetadata::new(&b);
+        let rebuilt = m.color_info().unwrap().to_color_info();
+        assert_eq!(rebuilt.color_config, None);
+        assert_eq!(
+            rebuilt.hdr_cll,
+            Some(crate::color_info::HdrCll {
+                max_fall: None,
+                max_cll: Some(1000.0),
+            })
+        );
     }
 }

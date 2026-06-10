@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `TypedColorInfo::to_color_info()` — reconstructs the encode-side
+  [`color_info::ColorInfo`] struct from the read view in one call,
+  closing the read↔write symmetry loop for the Enhanced-RTMP-v2
+  §"Metadata Frame" HDR `colorInfo` signalling. The struct it returns,
+  fed back through `ColorInfo::encode_amf` /
+  `tag::write_ex_video_color_info`, re-emits the same
+  `["colorInfo", Object]` AMF body the demuxer parsed (modulo fields the
+  producer stamped out-of-range, which the read view drops to `None` and
+  so do not survive the rebuild). Each of the three groups
+  (`colorConfig` / `hdrCll` / `hdrMdcv`) is populated to `Some(..)` only
+  when at least one of its fields survives as a finite, in-range value —
+  mirroring the encode-side convention that an all-`None` group is
+  omitted from the AMF object entirely. A reset sentinel
+  (`is_reset_sentinel() == true`) and an all-fields-malformed frame both
+  rebuild to `ColorInfo::default()`, which the encoder emits as the
+  spec's empty-object reset shape. Four `typed_meta::tests::*` unit
+  tests cover the full-payload rebuild, the absent-group omission, the
+  reset-sentinel default rebuild, and the out-of-range field drop; two
+  new `tests/roundtrip_muxer.rs` integration tests drive the full
+  mux → demux → `to_color_info()` loop (fully-populated equality + the
+  Undefined reset default rebuild).
 - `TypedMetadata::color_info()` accessor returning
   `Option<TypedColorInfo>` — a borrowed read-side mirror of the
   encode-side [`color_info::ColorInfo`] struct that re-types every

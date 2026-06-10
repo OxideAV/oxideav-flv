@@ -1081,6 +1081,88 @@ fn ex_video_color_info_writer_round_trip_full_payload() {
 }
 
 #[test]
+fn ex_video_color_info_full_read_write_loop_via_to_color_info() {
+    // Close the read↔write loop end-to-end: mux a fully-populated
+    // colorInfo Metadata tag, demux it, and reconstruct the encode-side
+    // `ColorInfo` struct from the typed read view via
+    // `TypedColorInfo::to_color_info`. The rebuilt struct must equal the
+    // one the producer encoded (every field is a finite, in-range value
+    // here so none drop on the read side).
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    make_hvc1_seq_start(&mut buf);
+
+    let ci = ColorInfo {
+        color_config: Some(ColorConfig {
+            bit_depth: Some(10),
+            color_primaries: Some(9),
+            transfer_characteristics: Some(16),
+            matrix_coefficients: Some(9),
+        }),
+        hdr_cll: Some(HdrCll {
+            max_fall: Some(400.0),
+            max_cll: Some(1000.0),
+        }),
+        hdr_mdcv: Some(HdrMdcv {
+            red_x: Some(0.708),
+            red_y: Some(0.292),
+            green_x: Some(0.170),
+            green_y: Some(0.797),
+            blue_x: Some(0.131),
+            blue_y: Some(0.046),
+            white_point_x: Some(0.3127),
+            white_point_y: Some(0.3290),
+            max_luminance: Some(1000.0),
+            min_luminance: Some(0.01),
+        }),
+    };
+    write_ex_video_color_info(&mut buf, 40, oxideav_flv::FOURCC_HVC1, &ci).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    while dmx.next_packet().is_ok() {}
+
+    let md = dmx.metadata();
+    let typed = oxideav_flv::TypedMetadata::new(md);
+    let rebuilt = typed
+        .color_info()
+        .expect("colorInfo view present")
+        .to_color_info();
+    assert_eq!(rebuilt, ci);
+}
+
+#[test]
+fn ex_video_color_info_reset_loop_rebuilds_default() {
+    // After the spec-RECOMMENDED Undefined reset, the typed view reports
+    // `is_reset_sentinel()` and rebuilds to the empty `ColorInfo`.
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    make_hvc1_seq_start(&mut buf);
+
+    let ci = ColorInfo {
+        color_config: Some(ColorConfig {
+            bit_depth: Some(10),
+            ..ColorConfig::default()
+        }),
+        ..ColorInfo::default()
+    };
+    write_ex_video_color_info(&mut buf, 40, oxideav_flv::FOURCC_HVC1, &ci).unwrap();
+    write_ex_video_color_info_reset(&mut buf, 80, oxideav_flv::FOURCC_HVC1).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    while dmx.next_packet().is_ok() {}
+
+    let md = dmx.metadata();
+    let typed = oxideav_flv::TypedMetadata::new(md);
+    let view = typed
+        .color_info()
+        .expect("reset sentinel makes view present");
+    assert!(view.is_reset_sentinel());
+    assert_eq!(view.to_color_info(), ColorInfo::default());
+}
+
+#[test]
 fn ex_video_color_info_writer_omits_absent_groups() {
     // Populate only `colorConfig`; assert hdrCll / hdrMdcv keys do
     // not appear in the metadata bag so producers can emit partial
