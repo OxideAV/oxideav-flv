@@ -134,6 +134,20 @@ oxideav-flv = "0.0"
   - Codec id 1 = ADPCM.
   - Codec id 7 = G.711 A-law, 8 = G.711 mu-law.
   - Codec id 11 = Speex.
+  - **Audio silence message** (enhanced-rtmp-v2 §`AudioPacketType`): an
+    audio tag whose payload is zero-length (an empty audio message
+    carrying no `AudioTagHeader`) signals a period of silence with
+    spec-defined playback semantics — drain buffered audio, flush the
+    audio decoder, and stop using the audio clock as the A/V-sync master
+    until media resumes (declared to have "no less than the same meaning
+    as" `SequenceEnd`). Once an audio stream is established, the demuxer
+    surfaces the silence message as a zero-length `header = true` +
+    `discard = true` packet at the tag's timestamp, so callers can react
+    to the boundary rather than have the signal silently dropped; the
+    empty body never reaches a decoder as a frame, and the stream
+    resumes cleanly on the next real audio tag. (A silence tag that
+    precedes any real audio tag mints no stream — silence carries no
+    codec — and is skipped during discovery, unchanged.)
 - Video tag (0x09):
   - Codec id 2 = Sorenson H.263 (flv1).
   - Codec id 3 = Screen video.

@@ -820,7 +820,29 @@ fn build_audio_packet(
     body: &[u8],
 ) -> Option<(Packet, Option<Packet>)> {
     if body.is_empty() {
-        return None;
+        // Enhanced-RTMP-v2 "audio silence message" (§`AudioPacketType`,
+        // SequenceStart/SequenceEnd comments): "This silence message is
+        // identified when an audio message contains a zero-length
+        // payload, or more precisely, an empty audio message without an
+        // AudioTagHeader, indicating a period of silence." The spec
+        // gives it explicit playback semantics — play out the buffered
+        // audio, flush the audio decoder, and stop using the audio clock
+        // as the A/V sync master for the silence period; it is declared
+        // to have "no less than the same meaning as" `SequenceEnd`.
+        //
+        // Surface it as a zero-length header+discard packet at the tag's
+        // timestamp so callers can react to the boundary (flush their
+        // decoder / switch to wall-clock timing) instead of having the
+        // signal silently dropped. `header` marks "this carries no
+        // decodable media"; `discard` keeps the empty body from reaching
+        // a decoder as a frame.
+        let mut pkt = Packet::new(stream.index, stream.time_base, Vec::new());
+        pkt.pts = Some(hdr.timestamp_ms as i64);
+        pkt.dts = Some(hdr.timestamp_ms as i64);
+        pkt.flags.keyframe = true;
+        pkt.flags.header = true;
+        pkt.flags.discard = true;
+        return Some((pkt, None));
     }
     // Enhanced RTMP / E-FLV ExAudioTagHeader path (SoundFormat=9).
     // Map onto the existing Packet semantics:
@@ -1858,6 +1880,61 @@ mod tests {
         assert_eq!(p2.pts, Some(33));
         assert!(p2.flags.keyframe);
         assert_eq!(p2.data, vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
+
+        assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
+    }
+
+    #[test]
+    fn empty_audio_tag_emits_silence_message() {
+        // Enhanced-RTMP-v2 "audio silence message": an audio tag with a
+        // zero-length payload (no AudioTagHeader byte) signals a period
+        // of silence. The demuxer must surface it as a zero-length
+        // header+discard packet at the tag's timestamp — not drop it,
+        // and not abort the stream.
+        let mp3_body = {
+            let flags = (2u8 << 4) | (2 << 2) | 0x02 | 0x01; // mp3, 22 kHz, 16-bit, stereo
+            let mut v = vec![flags];
+            v.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+            v
+        };
+        let audio_tag = make_tag(0x08, 0, &mp3_body);
+        // The silence message: an audio tag with a zero-length body.
+        let silence_tag = make_tag(0x08, 120, &[]);
+        // A normal audio frame after the silence period resumes playback.
+        // Leading byte is the legacy AudioTagHeader (mp3, 22 kHz, 16-bit,
+        // stereo); the remaining bytes are the coded payload.
+        let resume_tag = make_tag(0x08, 240, &[mp3_body[0], 0xDE, 0xAD]);
+        let flv = make_flv(&[&audio_tag, &silence_tag, &resume_tag]);
+
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open(input, &NullCodecResolver).unwrap();
+        assert_eq!(dmx.streams().len(), 1);
+        assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "mp3");
+
+        // First the real audio frame.
+        let p1 = dmx.next_packet().unwrap();
+        assert_eq!(p1.stream_index, 0);
+        assert_eq!(p1.pts, Some(0));
+        assert_eq!(p1.data, vec![0xAA, 0xBB, 0xCC]);
+        assert!(!p1.flags.discard);
+
+        // Then the silence message: empty body, header+discard, correct ts.
+        let silence = dmx.next_packet().unwrap();
+        assert_eq!(silence.stream_index, 0);
+        assert_eq!(silence.pts, Some(120));
+        assert_eq!(silence.dts, Some(120));
+        assert!(silence.data.is_empty(), "silence carries no media bytes");
+        assert!(silence.flags.header, "silence is a non-media signal");
+        assert!(
+            silence.flags.discard,
+            "silence must not reach a decoder as a frame"
+        );
+
+        // Playback resumes with the next real frame — the silence message
+        // did not abort the stream.
+        let p3 = dmx.next_packet().unwrap();
+        assert_eq!(p3.pts, Some(240));
+        assert_eq!(p3.data, vec![0xDE, 0xAD]);
 
         assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
     }

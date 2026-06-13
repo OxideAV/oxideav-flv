@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced-RTMP-v2 **audio silence message** handling (§`AudioPacketType`).
+  An audio tag with a zero-length payload (an empty audio message
+  without an `AudioTagHeader`) signals a period of silence whose
+  spec-defined playback semantics are to drain buffered audio, flush
+  the audio decoder, and stop using the audio clock as the A/V-sync
+  master for the silence period (declared to have "no less than the
+  same meaning as" `SequenceEnd`). Previously the demuxer dropped such
+  a tag silently in `build_audio_packet`; it now surfaces it — when an
+  audio stream is already established — as a zero-length
+  `header = true` + `discard = true` packet at the tag's timestamp, so
+  callers can react to the silence boundary (flush their decoder /
+  switch to wall-clock timing) instead of seeing nothing. The empty
+  body never reaches a decoder as a frame, and playback resumes on the
+  next real audio tag. A silence tag preceding any real audio tag still
+  mints no stream (silence carries no codec) and is skipped during
+  discovery, unchanged. 1 new unit test; the existing
+  `zero_length_audio_tag_is_skipped_not_panic` /
+  `flood_of_zero_size_tags_terminates` robustness tests remain green
+  (the silence packet only emits once an audio stream exists).
 - Enhanced-RTMP-v2 `AudioPacketType.MultichannelConfig` body parsing +
   emission (new `multichannel` module). The previously-opaque speaker
   layout signal (§`ExAudioTagBody`) now decodes into a typed
