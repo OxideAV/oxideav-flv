@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `MultichannelConfig::present_channels()` / `has_channel()` /
+  `present_channel_labels()` — order-agnostic speaker-presence queries
+  for the Enhanced-RTMP-v2 `AudioPacketType.MultichannelConfig` body.
+  The spec poses a single question — "to see if a specific audio channel
+  is present" — but answers it two ways: `Native` order via the
+  `audioChannelFlags & AudioChannelMask.xxx` bitmask test, `Custom`
+  order via the explicit per-channel mapping. These helpers unify both
+  into one set of present speakers (`Custom` excludes
+  `AudioChannel::Unused` — the spec's "empty, can be safely skipped"
+  channel; reserved high mask bits outside the 24-bit `AudioChannelMask`
+  range carry no speaker). `Unspecified` / reserved orders report no
+  present channels. Complements the existing `mask_channel_labels`
+  (which only covered the `Native` bitmask form).
 - `tag::video_codec_id_str_u32` / `tag::audio_codec_id_str_u32` —
   codec-id resolvers that accept both `onMetaData` `videocodecid` /
   `audiocodecid` encodings the Enhanced-RTMP-v2 §"Enhancing onMetaData"

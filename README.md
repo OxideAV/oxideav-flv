@@ -227,7 +227,14 @@ oxideav-flv = "0.0"
     / ".layout" / ".mapping"]` (latest signal supersedes), and the
     channel count lifts into `CodecParameters::channels` — the spec's
     channel-mapping truth for codecs that are not self-describing
-    (called out for Opus streams with an empty SequenceStart payload);
+    (called out for Opus streams with an empty SequenceStart payload).
+    The parsed [`multichannel::MultichannelConfig`] also answers the
+    spec's "is a specific audio channel present" question
+    order-agnostically — `present_channels()` / `has_channel()` /
+    `present_channel_labels()` unify the `Native` `audioChannelFlags`
+    bitmask test and the `Custom` per-channel map into one present-speaker
+    set (`Custom` skips `AudioChannel::Unused`; reserved high mask bits
+    carry no speaker; `Unspecified` / reserved orders report none);
     multitrack-wrapped configs unwrap the default track's payload
     first; `ModEx` → header + discard
     (parsed but not consumed); `Multitrack` → outer header parsed, body

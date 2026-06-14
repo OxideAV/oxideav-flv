@@ -443,6 +443,89 @@ impl MultichannelConfig {
         }
         Ok(())
     }
+
+    /// The speaker positions present in the stream, as a single
+    /// order-agnostic list.
+    ///
+    /// The spec poses one question — *"to see if a specific audio
+    /// channel is present"* — but answers it two different ways
+    /// depending on [`AudioChannelOrder`]:
+    ///
+    /// * `Native` — derived from the `audioChannelFlags` bitmask (the
+    ///   spec's `audioChannelFlags & AudioChannelMask.xxx` test). Bits
+    ///   are returned in ascending mask-bit order, which is also
+    ///   [`AudioChannel`] enum order. Reserved high bits (`>= 2^24`,
+    ///   outside [`CHANNEL_MASK_BITS`]) are skipped — they carry no
+    ///   spec-defined speaker.
+    /// * `Custom` — the explicit per-channel `mapping`, in bitstream
+    ///   order. The spec defines [`AudioChannel::Unused`] (`0xFE`) as a
+    ///   channel that "is empty and can be safely skipped", so those
+    ///   entries are excluded from the present set; every other entry
+    ///   (including [`AudioChannel::Unknown`] and `Reserved`) is a
+    ///   carried channel and is kept.
+    /// * `Unspecified` / `Reserved(_)` — no per-speaker presence
+    ///   information is signalled, so the list is empty even when
+    ///   `channel_count` is non-zero. (The caller still has
+    ///   `channel_count` for the raw count.)
+    ///
+    /// A producer that signals the same physical layout via either
+    /// ordering yields the same *set* of present channels here — though
+    /// `Custom` preserves bitstream order while `Native` is always in
+    /// enum order, so the two only match as ordered lists when the
+    /// `Custom` map happens to be in enum order.
+    pub fn present_channels(&self) -> Vec<AudioChannel> {
+        match self.order {
+            AudioChannelOrder::Native => {
+                let flags = self.channel_flags.unwrap_or(0);
+                (0..CHANNEL_MASK_BITS)
+                    .filter(|bit| flags & (1 << bit) != 0)
+                    .map(|bit| AudioChannel::from_u8(bit as u8))
+                    .collect()
+            }
+            AudioChannelOrder::Custom => self
+                .mapping
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .filter(|c| *c != AudioChannel::Unused)
+                .collect(),
+            AudioChannelOrder::Unspecified | AudioChannelOrder::Reserved(_) => Vec::new(),
+        }
+    }
+
+    /// Whether a specific speaker position is present in the stream —
+    /// the spec's `audioChannelFlags & AudioChannelMask.xxx` query,
+    /// answered uniformly across `Native` and `Custom` orderings.
+    ///
+    /// Returns `false` for `Unspecified` / `Reserved(_)` orders (no
+    /// per-speaker presence is signalled) and for
+    /// [`AudioChannel::Unused`] (a skipped channel is never "present").
+    /// A [`AudioChannel::Reserved`] / [`AudioChannel::Unknown`] query is
+    /// answered against the `Custom` mapping only — those values have no
+    /// `Native` mask bit, so they are always absent under `Native`.
+    pub fn has_channel(&self, channel: AudioChannel) -> bool {
+        if channel == AudioChannel::Unused {
+            return false;
+        }
+        match self.order {
+            AudioChannelOrder::Native => {
+                let bit = channel.to_u8();
+                (bit as u32) < CHANNEL_MASK_BITS
+                    && self.channel_flags.unwrap_or(0) & (1 << bit) != 0
+            }
+            AudioChannelOrder::Custom => self.mapping.as_deref().unwrap_or(&[]).contains(&channel),
+            AudioChannelOrder::Unspecified | AudioChannelOrder::Reserved(_) => false,
+        }
+    }
+
+    /// The present speaker positions as stable lowercase labels, in the
+    /// same order as [`present_channels`](Self::present_channels) — the
+    /// order-agnostic counterpart of [`mask_channel_labels`] (which only
+    /// covers the `Native` bitmask form).
+    pub fn present_channel_labels(&self) -> Vec<String> {
+        self.present_channels().iter().map(|c| c.label()).collect()
+    }
 }
 
 #[cfg(test)]
@@ -667,6 +750,134 @@ mod tests {
         for v in 0u8..=255 {
             assert_eq!(AudioChannelOrder::from_u8(v).to_u8(), v);
         }
+    }
+
+    #[test]
+    fn present_channels_native_matches_mask_labels() {
+        // 5.1 via Native flags.
+        let mcc = MultichannelConfig {
+            order: AudioChannelOrder::Native,
+            channel_count: 6,
+            mapping: None,
+            channel_flags: Some(0x3F),
+        };
+        assert_eq!(
+            mcc.present_channels(),
+            vec![
+                AudioChannel::FrontLeft,
+                AudioChannel::FrontRight,
+                AudioChannel::FrontCenter,
+                AudioChannel::LowFrequency1,
+                AudioChannel::BackLeft,
+                AudioChannel::BackRight,
+            ]
+        );
+        // present_channel_labels agrees with mask_channel_labels for Native.
+        assert_eq!(mcc.present_channel_labels(), mask_channel_labels(0x3F));
+        assert!(mcc.has_channel(AudioChannel::FrontCenter));
+        assert!(mcc.has_channel(AudioChannel::LowFrequency1));
+        assert!(!mcc.has_channel(AudioChannel::BackCenter));
+        // Reserved high mask bits don't introduce a speaker.
+        assert!(!mcc.has_channel(AudioChannel::Reserved(30)));
+    }
+
+    #[test]
+    fn present_channels_native_skips_reserved_high_bits() {
+        // Bit 31 is outside the spec mask range; it carries no speaker.
+        let mcc = MultichannelConfig {
+            order: AudioChannelOrder::Native,
+            channel_count: 1,
+            mapping: None,
+            channel_flags: Some(0x8000_0001),
+        };
+        assert_eq!(mcc.present_channels(), vec![AudioChannel::FrontLeft]);
+    }
+
+    #[test]
+    fn present_channels_custom_keeps_bitstream_order_drops_unused() {
+        // Custom map: FR, FL, Unused, Unknown — Unused is skipped, the
+        // rest (including Unknown) are kept, in bitstream order.
+        let mcc = MultichannelConfig {
+            order: AudioChannelOrder::Custom,
+            channel_count: 4,
+            mapping: Some(vec![
+                AudioChannel::FrontRight,
+                AudioChannel::FrontLeft,
+                AudioChannel::Unused,
+                AudioChannel::Unknown,
+            ]),
+            channel_flags: None,
+        };
+        assert_eq!(
+            mcc.present_channels(),
+            vec![
+                AudioChannel::FrontRight,
+                AudioChannel::FrontLeft,
+                AudioChannel::Unknown,
+            ]
+        );
+        assert!(mcc.has_channel(AudioChannel::FrontRight));
+        assert!(mcc.has_channel(AudioChannel::Unknown));
+        assert!(!mcc.has_channel(AudioChannel::Unused));
+        assert!(!mcc.has_channel(AudioChannel::FrontCenter));
+    }
+
+    #[test]
+    fn present_channels_unspecified_and_reserved_are_empty() {
+        for order in [
+            AudioChannelOrder::Unspecified,
+            AudioChannelOrder::Reserved(7),
+        ] {
+            let mcc = MultichannelConfig {
+                order,
+                channel_count: 2,
+                mapping: None,
+                channel_flags: None,
+            };
+            assert!(mcc.present_channels().is_empty());
+            assert!(mcc.present_channel_labels().is_empty());
+            assert!(!mcc.has_channel(AudioChannel::FrontLeft));
+        }
+    }
+
+    #[test]
+    fn native_and_custom_describe_the_same_present_set() {
+        // The same physical 5.1 layout via both orderings yields the
+        // same *set* of present channels (Custom in enum order so the
+        // ordered lists coincide too).
+        let native = MultichannelConfig {
+            order: AudioChannelOrder::Native,
+            channel_count: 6,
+            mapping: None,
+            channel_flags: Some(0x3F),
+        };
+        let custom = MultichannelConfig {
+            order: AudioChannelOrder::Custom,
+            channel_count: 6,
+            mapping: Some(vec![
+                AudioChannel::FrontLeft,
+                AudioChannel::FrontRight,
+                AudioChannel::FrontCenter,
+                AudioChannel::LowFrequency1,
+                AudioChannel::BackLeft,
+                AudioChannel::BackRight,
+            ]),
+            channel_flags: None,
+        };
+        assert_eq!(native.present_channels(), custom.present_channels());
+    }
+
+    #[test]
+    fn has_channel_unused_is_never_present() {
+        // Even if a Custom map literally lists Unused, it isn't present.
+        let mcc = MultichannelConfig {
+            order: AudioChannelOrder::Custom,
+            channel_count: 1,
+            mapping: Some(vec![AudioChannel::Unused]),
+            channel_flags: None,
+        };
+        assert!(!mcc.has_channel(AudioChannel::Unused));
+        assert!(mcc.present_channels().is_empty());
     }
 
     #[test]
