@@ -307,8 +307,16 @@ Per-property accessors: `duration` / `filesize` / `width` / `height` /
 the demuxer uses when lifting `CodecParameters::frame_rate`) /
 `video_data_rate_kbps` / `audio_data_rate_kbps` /
 `audio_sample_rate` / `audio_sample_size` / `audio_delay_seconds` /
-`video_codec_id` / `audio_codec_id` (+ string forms via
-[`tag::video_codec_id_str`] / [`tag::audio_codec_id_str`]) / `stereo` /
+`video_codec_id` / `audio_codec_id` (+ string forms that accept both
+encodings the Enhanced-RTMP-v2 §"Enhancing onMetaData" extension allows
+for these properties: a legacy E.4.3.1 / E.4.2.1 CodecID nibble *or* a
+packed FourCc UI32 stamped via `makeFourCc()` — `videocodecid =
+1635135537` decodes as big-endian `"av01"` → `"av1"`, `audiocodecid =
+1332770163` → `"opus"` — both routed through the same resolver the
+wire-side ExVideo / ExAudio path uses via
+[`tag::video_codec_id_str_u32`] / [`tag::audio_codec_id_str_u32`]; an
+unrecognised FourCc surfaces as `flv:exvideo:<ascii>` /
+`flv:exaudio:<ascii>` rather than the raw integer) / `stereo` /
 `can_seek_to_end` / `creationdate` (+ a structured
 `creationdate_as_date` accessor that decodes the
 `"date:<ms>tz:<offset>"` carrier the demuxer uses when the producer
@@ -329,7 +337,12 @@ the per-track scalars: video tracks expose `width` / `height` /
 `framerate`); audio tracks expose `audio_data_rate_kbps` /
 `audio_sample_rate` (the spec's per-track shortened `samplerate`, not
 the top-level `audiosamplerate`) / `channels` (modern count, not the
-legacy `stereo` boolean) / `audio_codec_id`. Delta-style entries
+legacy `stereo` boolean) / `audio_codec_id`. Per-track codec ids also
+have string forms (`TypedVideoTrackInfo::video_codec_id_str()` /
+`TypedAudioTrackInfo::audio_codec_id_str()`) that resolve the same
+legacy-or-FourCc encoding as the top-level accessors — the spec
+example's `videocodecid: makeFourCc("av01")` surfaces as `"av1"`,
+`audiocodecid: makeFourCc("Opus")` as `"opus"`. Delta-style entries
 (only the fields that differ from the default track) are first-class
 — absent fields return `None` rather than synthesising from the
 default-track value, so callers can distinguish "producer signalled

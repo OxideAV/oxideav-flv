@@ -58,7 +58,7 @@
 //! assert_eq!(meta.audio_sample_rate(), Some(48_000.0));
 //! ```
 
-use crate::tag::{audio_codec_id_str, video_codec_id_str};
+use crate::tag::{audio_codec_id_str_u32, video_codec_id_str_u32};
 
 /// Borrowed view over the `Demuxer::metadata` bag that re-types the
 /// Annex E.5 fifteen well-known properties back into their declared
@@ -249,37 +249,33 @@ impl<'a> TypedMetadata<'a> {
     }
 
     /// Convenience: [`Self::video_codec_id`] mapped through the
-    /// stable [`crate::tag::video_codec_id_str`] table — `"flv1"`,
+    /// stable [`crate::tag::video_codec_id_str_u32`] table — `"flv1"`,
     /// `"vp6f"`, `"h264"`, …
     ///
     /// Returns `None` when `videocodecid` is absent or malformed.
-    /// Unknown legacy ids (0..=15) flow through as
-    /// `flv:video:<N>`; out-of-range producer-stamped values
-    /// (anything `> 0x0F`) likewise flow through the
-    /// `flv:video:<N>` fallback so the caller still sees the raw
-    /// number rather than `None`.
+    /// Unknown legacy ids (0..=15) flow through as `flv:video:<N>`.
+    /// When the producer stamps the modern FourCc form via
+    /// `makeFourCc()` (Enhanced-RTMP-v2 §"Enhancing onMetaData" — e.g.
+    /// `"av01" == 0x61763031 == 1_635_135_537`) the value is decoded as
+    /// a big-endian FourCc UI32 and routed through the same resolver the
+    /// wire-side ExVideo path uses, so it surfaces as `"av1"` / `"vp9"`
+    /// / `"h265"` / … An unrecognised FourCc falls through to the
+    /// `flv:exvideo:<ascii>` / `flv:exvideo:0x…` carrier rather than
+    /// `None`.
     pub fn video_codec_id_str(&self) -> Option<String> {
-        let id = self.video_codec_id()?;
-        // Producers occasionally stamp the FourCc as an integer via
-        // `makeFourCc()` (e.g. 1635135537 == "av01"); the helper's
-        // u8 input mask trims those down to the low byte. Forward
-        // the raw value through the formatter so the caller sees
-        // exactly what the bag held.
-        if id > u8::MAX as u32 {
-            return Some(format!("flv:video:{id}"));
-        }
-        Some(video_codec_id_str(id as u8))
+        Some(video_codec_id_str_u32(self.video_codec_id()?))
     }
 
     /// Convenience: [`Self::audio_codec_id`] mapped through the
-    /// stable [`crate::tag::audio_codec_id_str`] table — `"mp3"`,
+    /// stable [`crate::tag::audio_codec_id_str_u32`] table — `"mp3"`,
     /// `"aac"`, `"speex"`, …
+    ///
+    /// As with [`Self::video_codec_id_str`], a FourCc-packed
+    /// `audiocodecid` (e.g. `"Opus" == 0x4F707573 == 1_332_770_163`)
+    /// resolves to the wire-side string (`"opus"` / `"flac"` / `"ac3"`
+    /// / …).
     pub fn audio_codec_id_str(&self) -> Option<String> {
-        let id = self.audio_codec_id()?;
-        if id > u8::MAX as u32 {
-            return Some(format!("flv:audio:{id}"));
-        }
-        Some(audio_codec_id_str(id as u8))
+        Some(audio_codec_id_str_u32(self.audio_codec_id()?))
     }
 
     // ----------------------------------------------------------- Boolean
@@ -872,6 +868,18 @@ impl<'a> TypedVideoTrackInfo<'a> {
         self.lookup_u32("videocodecid")
     }
 
+    /// `videocodecid` resolved to the stable codec string via
+    /// [`crate::tag::video_codec_id_str_u32`] — the same legacy-or-FourCc
+    /// resolver [`TypedMetadata::video_codec_id_str`] uses for the
+    /// default track. A per-track `videocodecid: makeFourCc("av01")`
+    /// surfaces as `"av1"`; a legacy nibble as `"h264"` / `"vp6f"` / …
+    ///
+    /// Returns `None` only when the track stamped no `videocodecid`
+    /// (delta-style entries omit fields that match the default track).
+    pub fn video_codec_id_str(&self) -> Option<String> {
+        Some(video_codec_id_str_u32(self.video_codec_id()?))
+    }
+
     /// `framerate` — frames per second for this track. Producers
     /// emitting per-track maps tend to stamp the modern
     /// `videoframerate` alias instead; both are read here, with the
@@ -958,6 +966,17 @@ impl<'a> TypedAudioTrackInfo<'a> {
     /// 4-bit SoundFormat (E.4.2.1) or a packed FourCc may be stamped.
     pub fn audio_codec_id(&self) -> Option<u32> {
         self.lookup_u32("audiocodecid")
+    }
+
+    /// `audiocodecid` resolved to the stable codec string via
+    /// [`crate::tag::audio_codec_id_str_u32`] — the same legacy-or-FourCc
+    /// resolver [`TypedMetadata::audio_codec_id_str`] uses for the
+    /// default track. A per-track `audiocodecid: makeFourCc("Opus")`
+    /// surfaces as `"opus"`; a legacy nibble as `"aac"` / `"mp3"` / …
+    ///
+    /// Returns `None` only when the track stamped no `audiocodecid`.
+    pub fn audio_codec_id_str(&self) -> Option<String> {
+        Some(audio_codec_id_str_u32(self.audio_codec_id()?))
     }
 }
 
@@ -1129,19 +1148,75 @@ mod tests {
 
     #[test]
     fn codec_id_str_handles_fourcc_packed_ids() {
-        // Enhanced-RTMP encoders sometimes stamp `videocodecid` as a
-        // packed FourCc via `makeFourCc()` ('a' 'v' '0' '1' →
-        // 0x61763031 == 1_635_135_537). The helper trims those down
-        // to a `flv:video:<N>` carrier so the caller still sees
-        // the raw integer; the FourCc surfaces separately via the
-        // Ex video tag header.
-        let b = bag(&[("videocodecid", "1635135537")]);
+        // Enhanced-RTMP-v2 §"Enhancing onMetaData" lets producers stamp
+        // `videocodecid` / `audiocodecid` as a packed FourCc via
+        // `makeFourCc()` ('a' 'v' '0' '1' → 0x61763031 == 1_635_135_537).
+        // The string accessor decodes the UI32 as a big-endian FourCc
+        // and routes it through the same resolver the wire-side ExVideo /
+        // ExAudio path uses, so it surfaces as the canonical codec name
+        // rather than a raw-integer carrier.
+        let b = bag(&[
+            ("videocodecid", "1635135537"), // "av01"
+            ("audiocodecid", "1332770163"), // "Opus"
+        ]);
         let m = TypedMetadata::new(&b);
+        // The raw-integer accessor still returns the packed value.
         assert_eq!(m.video_codec_id(), Some(1_635_135_537));
-        assert_eq!(
-            m.video_codec_id_str().as_deref(),
-            Some("flv:video:1635135537")
-        );
+        assert_eq!(m.audio_codec_id(), Some(1_332_770_163));
+        // The string accessor now resolves the FourCc.
+        assert_eq!(m.video_codec_id_str().as_deref(), Some("av1"));
+        assert_eq!(m.audio_codec_id_str().as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn codec_id_str_fourcc_covers_every_ex_fourcc() {
+        // Each FourCc the wire-side Ex path resolves must resolve the
+        // same way when it arrives packed in `videocodecid` /
+        // `audiocodecid`.
+        let cases_video = [
+            (b"av01", "av1"),
+            (b"vp09", "vp9"),
+            (b"vp08", "vp8"),
+            (b"hvc1", "h265"),
+            (b"avc1", "h264"),
+            (b"vvc1", "h266"),
+        ];
+        for (cc, want) in cases_video {
+            let id = u32::from_be_bytes(*cc);
+            let b = bag(&[("videocodecid", &id.to_string())]);
+            let m = TypedMetadata::new(&b);
+            assert_eq!(m.video_codec_id_str().as_deref(), Some(want), "{cc:?}");
+        }
+        let cases_audio = [
+            (b"Opus", "opus"),
+            (b"fLaC", "flac"),
+            (b"ac-3", "ac3"),
+            (b"ec-3", "eac3"),
+            (b".mp3", "mp3"),
+            (b"mp4a", "aac"),
+        ];
+        for (cc, want) in cases_audio {
+            let id = u32::from_be_bytes(*cc);
+            let b = bag(&[("audiocodecid", &id.to_string())]);
+            let m = TypedMetadata::new(&b);
+            assert_eq!(m.audio_codec_id_str().as_deref(), Some(want), "{cc:?}");
+        }
+    }
+
+    #[test]
+    fn codec_id_str_unknown_fourcc_falls_through_to_carrier() {
+        // A `> 0xFF` value whose four bytes form an unrecognised but
+        // printable FourCc surfaces via the wire-side `flv:exvideo:` /
+        // `flv:exaudio:` ASCII carrier rather than `None`.
+        let vid = u32::from_be_bytes(*b"xyzw");
+        let aud = u32::from_be_bytes(*b"qrst");
+        let b = bag(&[
+            ("videocodecid", &vid.to_string()),
+            ("audiocodecid", &aud.to_string()),
+        ]);
+        let m = TypedMetadata::new(&b);
+        assert_eq!(m.video_codec_id_str().as_deref(), Some("flv:exvideo:xyzw"));
+        assert_eq!(m.audio_codec_id_str().as_deref(), Some("flv:exaudio:qrst"));
     }
 
     #[test]
@@ -1235,6 +1310,8 @@ mod tests {
         assert_eq!(t1.height(), Some(768));
         assert_eq!(t1.video_data_rate_kbps(), Some(2000.0));
         assert_eq!(t1.video_codec_id(), Some(1_635_135_537));
+        // FourCc-packed per-track codec id resolves to the canonical name.
+        assert_eq!(t1.video_codec_id_str().as_deref(), Some("av1"));
         // trackId 2 — delta entry: width/height only.
         let t2 = &tracks[1];
         assert_eq!(t2.track_id(), 2);
@@ -1242,6 +1319,8 @@ mod tests {
         assert_eq!(t2.height(), Some(2160));
         assert_eq!(t2.video_data_rate_kbps(), None);
         assert_eq!(t2.video_codec_id(), None);
+        // Absent per-track codec id stays None (delta-style omission).
+        assert_eq!(t2.video_codec_id_str(), None);
     }
 
     #[test]
@@ -1252,8 +1331,10 @@ mod tests {
             ("audiotrackidinfomap.1.audiodatarate", "256"),
             ("audiotrackidinfomap.1.channels", "2"),
             ("audiotrackidinfomap.1.samplerate", "44100"),
+            ("audiotrackidinfomap.1.audiocodecid", "1836069985"), // "mp4a"
             ("audiotrackidinfomap.2.audiodatarate", "320"),
             ("audiotrackidinfomap.2.samplerate", "48000"),
+            ("audiotrackidinfomap.2.audiocodecid", "1332770163"), // "Opus"
         ]);
         let m = TypedMetadata::new(&b);
         let tracks: Vec<_> = m.audio_track_info_map().collect();
@@ -1263,12 +1344,14 @@ mod tests {
         assert_eq!(t1.audio_data_rate_kbps(), Some(256.0));
         assert_eq!(t1.channels(), Some(2));
         assert_eq!(t1.audio_sample_rate(), Some(44_100.0));
+        assert_eq!(t1.audio_codec_id_str().as_deref(), Some("aac"));
         let t2 = &tracks[1];
         assert_eq!(t2.track_id(), 2);
         assert_eq!(t2.audio_data_rate_kbps(), Some(320.0));
         assert_eq!(t2.audio_sample_rate(), Some(48_000.0));
         // trackId 2 had no `channels` field — delta-style.
         assert_eq!(t2.channels(), None);
+        assert_eq!(t2.audio_codec_id_str().as_deref(), Some("opus"));
     }
 
     #[test]

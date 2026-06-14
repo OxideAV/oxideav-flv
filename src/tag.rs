@@ -1085,6 +1085,33 @@ pub fn audio_codec_id_str(id: u8) -> String {
     }
 }
 
+/// Resolve an `onMetaData` `audiocodecid` value into its stable codec
+/// string, accepting both encodings the Enhanced-RTMP-v2 spec allows
+/// for that property (§"Enhancing onMetaData"):
+///
+/// * a legacy 4-bit `SoundFormat` value (E.4.2.1) — routed through
+///   [`audio_codec_id_str`];
+/// * a packed [FourCC] UI32 stamped via `makeFourCc()` — e.g.
+///   `"Opus" == 0x4F707573 == 1_332_770_163` — routed through
+///   [`crate::ex_audio::fourcc_audio_codec_id_str`] so it resolves to
+///   the same `"opus"` / `"flac"` / `"ac3"` / … string the wire-side
+///   ExAudio path produces.
+///
+/// The discriminator is the same one the spec example relies on: a
+/// FourCC packs four printable ASCII bytes, so every spec-defined
+/// FourCC is `> 0xFF`. A value in `0..=0xFF` is treated as the legacy
+/// id. A value `> 0xFF` whose four bytes are not all printable ASCII
+/// is neither a legacy id nor a well-formed FourCC; it falls through
+/// the FourCC resolver's own `flv:exaudio:0x…` hex carrier so the
+/// caller still sees the raw value rather than `None`.
+pub fn audio_codec_id_str_u32(id: u32) -> String {
+    if id <= u8::MAX as u32 {
+        audio_codec_id_str(id as u8)
+    } else {
+        crate::ex_audio::fourcc_audio_codec_id_str(id)
+    }
+}
+
 // ---- video codec map -------------------------------------------------------
 
 pub const VIDEO_CODEC_JPEG: u8 = 1;
@@ -1344,6 +1371,29 @@ pub fn video_codec_id_str(id: u8) -> String {
         VIDEO_CODEC_SCREEN_V2 => "flashsv2".into(),
         VIDEO_CODEC_H264 => "h264".into(),
         other => format!("flv:video:{other}"),
+    }
+}
+
+/// Resolve an `onMetaData` `videocodecid` value into its stable codec
+/// string, accepting both encodings the Enhanced-RTMP-v2 spec allows
+/// for that property (§"Enhancing onMetaData"):
+///
+/// * a legacy 4-bit `CodecID` value (E.4.3.1) — routed through
+///   [`video_codec_id_str`];
+/// * a packed [FourCC] UI32 stamped via `makeFourCc()` — e.g.
+///   `"av01" == 0x61763031 == 1_635_135_537` — routed through
+///   [`crate::ex_video::fourcc_codec_id_str`] so it resolves to the
+///   same `"av1"` / `"vp9"` / `"h265"` / … string the wire-side
+///   ExVideo path produces.
+///
+/// See [`audio_codec_id_str_u32`] for the legacy-vs-FourCC
+/// discriminator rationale (a FourCC packs four printable ASCII bytes,
+/// so it is always `> 0xFF`).
+pub fn video_codec_id_str_u32(id: u32) -> String {
+    if id <= u8::MAX as u32 {
+        video_codec_id_str(id as u8)
+    } else {
+        crate::ex_video::fourcc_codec_id_str(id)
     }
 }
 

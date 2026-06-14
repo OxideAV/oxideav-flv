@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tag::video_codec_id_str_u32` / `tag::audio_codec_id_str_u32` —
+  codec-id resolvers that accept both `onMetaData` `videocodecid` /
+  `audiocodecid` encodings the Enhanced-RTMP-v2 §"Enhancing onMetaData"
+  extension allows: a legacy 4-bit CodecID (E.4.3.1 / E.4.2.1) **or** a
+  packed FourCc UI32 stamped via `makeFourCc()`. A FourCc-packed value
+  (e.g. `"av01" == 0x61763031 == 1_635_135_537`, `"Opus" == 0x4F707573`)
+  is decoded as a big-endian FourCc and routed through the same resolver
+  the wire-side ExVideo / ExAudio path uses, so it surfaces as `"av1"` /
+  `"opus"` / `"h265"` / … instead of the prior useless
+  `flv:video:1635135537` raw-integer carrier.
+- `TypedVideoTrackInfo::video_codec_id_str()` /
+  `TypedAudioTrackInfo::audio_codec_id_str()` — per-track string forms of
+  the codec id, resolving the same legacy-or-FourCc encoding so the
+  Enhanced-RTMP-v2 per-track info-map example
+  (`videocodecid: makeFourCc("av01")`) reads back as `"av1"`.
+
+### Changed
+
+- `TypedMetadata::video_codec_id_str` / `audio_codec_id_str` now resolve
+  a FourCc-packed `videocodecid` / `audiocodecid` to the canonical codec
+  string instead of emitting a `flv:video:<N>` / `flv:audio:<N>`
+  raw-integer carrier.
+
+### Added (multitrack)
+
 - Enhanced-RTMP **non-default multitrack track** read access
   (§"Track Ordering", §`ExAudioTagBody` / §`ExVideoTagBody`).
   `next_packet` emits only the default track (trackId 0 / first in wire
