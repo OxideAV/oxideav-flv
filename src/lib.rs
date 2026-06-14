@@ -41,7 +41,7 @@ use oxideav_core::ContainerRegistry;
 pub use amf0::{parse_amf0_value, AmfValue};
 pub use amf3::{parse_amf3_value, Amf3Array, Amf3Object, Amf3Value};
 pub use color_info::{ColorConfig, ColorInfo, HdrCll, HdrMdcv};
-pub use demuxer::{open as open_demuxer, FlvDemuxer};
+pub use demuxer::{open as open_demuxer, open_concrete as open_demuxer_concrete, FlvDemuxer};
 pub use ex_audio::{
     fourcc_audio_codec_id_str, AudioPacketModExType, AvMultitrackType, ExAudioPacketType,
     ExAudioTagHeader, FOURCC_AAC as FOURCC_AUDIO_AAC, FOURCC_AC3, FOURCC_EAC3, FOURCC_FLAC,
@@ -55,7 +55,7 @@ pub use ex_video::{
 pub use header::{FlvHeader, FLV_SIGNATURE};
 pub use mod_ex::{ModExEntry, ModExPayload};
 pub use multichannel::{mask_channel_labels, AudioChannel, AudioChannelOrder, MultichannelConfig};
-pub use multitrack::{split_tracks, MultitrackTrack};
+pub use multitrack::{split_tracks, MultitrackPacketTrack, MultitrackTrack};
 pub use script::{
     write_on_cue_point, write_on_cue_point_body, write_on_metadata, write_on_metadata_body,
     write_on_xmp_data, write_on_xmp_data_body, CuePointParams, CuePointType, MetaValue,

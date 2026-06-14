@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Enhanced-RTMP **non-default multitrack track** read access
+  (§"Track Ordering", §`ExAudioTagBody` / §`ExVideoTagBody`).
+  `next_packet` emits only the default track (trackId 0 / first in wire
+  order) of a multitrack Ex tag, so the other variants — different
+  bitrate, resolution, codec, language, or camera angle — used to be
+  dropped from the single-stream packet flow. `FlvDemuxer` now keeps
+  every track of the most-recently-emitted multitrack tag and exposes
+  them via `last_multitrack_tracks() -> Option<&[MultitrackPacketTrack]>`.
+  Each `MultitrackPacketTrack` carries `track_id`, the codec `fourcc` +
+  resolved `codec_name`, and an *owned* copy of that track's coded
+  payload (the SI24 CompositionTimeOffset is preserved for AVC/HEVC/VVC
+  `CodedFrames`), so a receiver implementing its own track-selection
+  logic recovers a non-default variant without re-parsing the Ex header
+  or re-running `split_tracks`. The side-channel refreshes on every
+  `next_packet` and clears to `None` the moment a single-track tag is
+  emitted, so it never reports stale tracks. To reach the concrete
+  accessor, `demuxer::open_concrete` (re-exported as
+  `open_demuxer_concrete`) returns the concrete `FlvDemuxer`; the
+  registry `open` wraps it in a `Box<dyn Demuxer>` unchanged. New public
+  type `MultitrackPacketTrack`. 3 new unit tests (video ManyTracks +
+  audio ManyTracksManyCodecs with single-track clear + OneTrack).
 - Enhanced-RTMP-v2 **audio silence message** handling (§`AudioPacketType`).
   An audio tag with a zero-length payload (an empty audio message
   without an `AudioTagHeader`) signals a period of silence whose

@@ -39,7 +39,7 @@ use crate::ex_video::{
 };
 use crate::header::FlvHeader;
 use crate::multichannel::{mask_channel_labels, MultichannelConfig};
-use crate::multitrack::split_tracks;
+use crate::multitrack::{split_tracks, MultitrackPacketTrack};
 use crate::tag::{
     audio_codec_id_str, video_codec_id_str, AudioTagHeader, EncryptedTagPreamble, TagHeader,
     TagType, VideoTagHeader, AUDIO_CODEC_AAC, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A,
@@ -83,8 +83,24 @@ struct EncryptionHeadline {
 const STREAM_AUDIO: u32 = 0;
 const STREAM_VIDEO: u32 = 1;
 
-/// Open factory used by the container registry.
-pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+/// Open factory used by the container registry. Returns the demuxer as a
+/// trait object; use [`open_concrete`] when you need the concrete
+/// [`FlvDemuxer`] accessors ([`FlvDemuxer::is_encrypted`] /
+/// [`FlvDemuxer::last_multitrack_tracks`]).
+pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(open_concrete(input, codecs)?))
+}
+
+/// Open factory returning the concrete [`FlvDemuxer`] so callers can
+/// reach the FLV-specific accessors that the [`Demuxer`] trait does not
+/// expose — [`FlvDemuxer::is_encrypted`] (Adobe FLV §Annex F encryption
+/// flag) and [`FlvDemuxer::last_multitrack_tracks`] (every track of the
+/// last Enhanced-RTMP multitrack tag). [`open`] wraps this in a
+/// `Box<dyn Demuxer>` for the registry path.
+pub fn open_concrete(
+    mut input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<FlvDemuxer> {
     let _hdr = FlvHeader::read(&mut *input)?;
     // The four bytes immediately after the header are the first
     // `PreviousTagSize` — per spec always 0x00000000.
@@ -203,7 +219,7 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
     // --- Rewind for packet emission -----------------------------------------
     input.seek(SeekFrom::Start(first_tag_pos))?;
 
-    Ok(Box::new(FlvDemuxer {
+    Ok(FlvDemuxer {
         input,
         streams,
         metadata,
@@ -217,7 +233,8 @@ pub fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
         first_tag_pos,
         keyframe_index,
         is_encrypted,
-    }))
+        last_multitrack: None,
+    })
 }
 
 /// Public [`Demuxer`] type, exported so the integration tests can
@@ -246,6 +263,15 @@ pub struct FlvDemuxer {
     /// `flags.discard = true` so decoders skip past them rather than
     /// trying to interpret ciphertext as a frame.
     is_encrypted: bool,
+    /// Every track of the most-recently-emitted multitrack Ex tag, in
+    /// wire order (enhanced-rtmp-v2 §`ExAudioTagBody` / §`ExVideoTagBody`).
+    /// `next_packet` emits a packet built from the *default* track only,
+    /// so this side-channel preserves the non-default variants (different
+    /// bitrate / resolution / codec / language / camera angle) that the
+    /// stream model would otherwise drop. Reset to `None` each time
+    /// `next_packet` returns a packet from a single-track tag, so the
+    /// accessor never reports stale tracks from an earlier multitrack tag.
+    last_multitrack: Option<Vec<MultitrackPacketTrack>>,
 }
 
 impl FlvDemuxer {
@@ -254,6 +280,75 @@ impl FlvDemuxer {
     pub fn is_encrypted(&self) -> bool {
         self.is_encrypted
     }
+
+    /// Every track of the most-recently-emitted Enhanced-RTMP multitrack
+    /// Ex tag (audio or video), in wire order — or `None` when the last
+    /// packet [`next_packet`] returned came from a single-track tag.
+    ///
+    /// [`next_packet`] surfaces the *default* track (trackId 0, or the
+    /// first track in wire order) as the [`Packet`]; for a multitrack tag
+    /// the other variants — different bitrate, resolution, codec,
+    /// language, or camera angle (enhanced-rtmp-v2 §"Track Ordering") —
+    /// are not part of the single-stream packet flow. This accessor lets
+    /// a caller recover them: each [`MultitrackPacketTrack`] carries the
+    /// `trackId`, the codec `fourcc` + resolved `codec_name`, and an
+    /// *owned* copy of that track's coded payload, so a receiver
+    /// implementing its own track-selection logic can pick a non-default
+    /// variant without re-parsing the Ex header or re-running
+    /// [`crate::split_tracks`].
+    ///
+    /// The slice is refreshed on every [`next_packet`] call: it holds the
+    /// tracks of the tag the just-returned packet was built from, and is
+    /// cleared to `None` as soon as a single-track tag is emitted, so it
+    /// never reports stale tracks from an earlier multitrack tag.
+    /// `SequenceEnd` and other tags that produce no packet do not disturb
+    /// the previously-captured set.
+    ///
+    /// [`next_packet`]: oxideav_core::Demuxer::next_packet
+    pub fn last_multitrack_tracks(&self) -> Option<&[MultitrackPacketTrack]> {
+        self.last_multitrack.as_deref()
+    }
+}
+
+/// Resolve every track of a multitrack Ex tag body to an owned
+/// [`MultitrackPacketTrack`], or `None` when the tag is not a multitrack
+/// Ex tag (legacy tag, single-track Ex tag, command, or a malformed
+/// multitrack body that does not split).
+///
+/// `is_video` selects the audio vs. video FourCc name table and the Ex
+/// header parser. The returned payloads are the per-track Ex bodies
+/// exactly as they sit on the wire (the leading `SI24`
+/// CompositionTimeOffset for AVC/HEVC/VVC `CodedFrames` is preserved).
+fn extract_multitrack_tracks(body: &[u8], is_video: bool) -> Option<Vec<MultitrackPacketTrack>> {
+    // `(multitrack_type, default_fourcc, payload_start)` differs only in
+    // which Ex parser reads the header; the split + naming below is shared.
+    let (mt_type, default_fourcc, payload_start) = if is_video {
+        let ex = ExVideoTagHeader::parse(body).ok().flatten()?;
+        (ex.multitrack?, ex.fourcc, ex.bytes_consumed.min(body.len()))
+    } else {
+        let ex = ExAudioTagHeader::parse(body).ok().flatten()?;
+        (ex.multitrack?, ex.fourcc, ex.bytes_consumed.min(body.len()))
+    };
+    let tail = &body[payload_start..];
+    let tracks = split_tracks(mt_type, default_fourcc.unwrap_or(0), tail).ok()?;
+    Some(
+        tracks
+            .into_iter()
+            .map(|t| {
+                let codec_name = if is_video {
+                    fourcc_codec_id_str(t.fourcc)
+                } else {
+                    fourcc_audio_codec_id_str(t.fourcc)
+                };
+                MultitrackPacketTrack {
+                    track_id: t.track_id,
+                    fourcc: t.fourcc,
+                    codec_name,
+                    payload: tail[t.payload].to_vec(),
+                }
+            })
+            .collect(),
+    )
 }
 
 impl std::fmt::Debug for FlvDemuxer {
@@ -348,6 +443,10 @@ impl Demuxer for FlvDemuxer {
                     if let Some((pkt, pending)) =
                         build_audio_packet(&self.streams[idx as usize], &header, &body)
                     {
+                        // Capture all tracks of a multitrack tag (or clear
+                        // the side-channel for a single-track tag) for
+                        // `last_multitrack_tracks`.
+                        self.last_multitrack = extract_multitrack_tracks(&body, false);
                         if let Some(p) = pending {
                             self.pending_packet = Some(pkt);
                             return Ok(p);
@@ -375,6 +474,10 @@ impl Demuxer for FlvDemuxer {
                     if let Some((pkt, pending)) =
                         build_video_packet(&self.streams[idx as usize], &header, &body)
                     {
+                        // Capture all tracks of a multitrack tag (or clear
+                        // the side-channel for a single-track tag) for
+                        // `last_multitrack_tracks`.
+                        self.last_multitrack = extract_multitrack_tracks(&body, true);
                         if let Some(p) = pending {
                             self.pending_packet = Some(pkt);
                             return Ok(p);
@@ -3280,6 +3383,132 @@ mod tests {
         assert_eq!(apkt.stream_index, 0);
         // Default (trackId 0) Opus payload only.
         assert_eq!(apkt.data, vec![0x4F, 0x67]);
+    }
+
+    #[test]
+    fn last_multitrack_tracks_exposes_video_non_default_variants() {
+        // Same fixture shape as `multitrack_video_emits_default_track_payload`
+        // (ManyTracks, two av01 tracks) — but here we assert the demuxer
+        // also exposes the *non-default* track (id=1) through
+        // `last_multitrack_tracks`, which the single-stream packet flow
+        // would otherwise drop.
+        let mut vbody = vec![0x96, 0x11];
+        vbody.extend_from_slice(b"av01");
+        vbody.push(0x00);
+        vbody.extend_from_slice(&[0x00, 0x00, 0x03]);
+        vbody.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
+        vbody.push(0x01);
+        vbody.extend_from_slice(&[0x00, 0x00, 0x02]);
+        vbody.extend_from_slice(&[0x11, 0x22]);
+
+        let mp3_body = vec![(((2 << 4) | (2 << 2) | 0x02 | 0x01) as u8), 0xAA];
+        let audio_tag = make_tag(0x08, 0, &mp3_body);
+        let video_tag = make_tag(0x09, 40, &vbody);
+        let flv = make_flv(&[&audio_tag, &video_tag]);
+
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open_concrete(input, &NullCodecResolver).unwrap();
+
+        let fourcc_av01 = u32::from_be_bytes(*b"av01");
+
+        // Before any packet is pulled, no multitrack tag has been seen.
+        assert!(dmx.last_multitrack_tracks().is_none());
+
+        // The audio tag is single-track → side-channel stays None.
+        let _audio = dmx.next_packet().unwrap();
+        assert!(dmx.last_multitrack_tracks().is_none());
+
+        // The video tag is multitrack → both tracks surface.
+        let _vpkt = dmx.next_packet().unwrap();
+        let tracks = dmx.last_multitrack_tracks().expect("multitrack captured");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].track_id, 0);
+        assert_eq!(tracks[0].fourcc, fourcc_av01);
+        assert_eq!(tracks[0].codec_name, "av1");
+        assert_eq!(tracks[0].payload, vec![0xDE, 0xAD, 0xBE]);
+        assert_eq!(tracks[0].len(), 3);
+        assert!(!tracks[0].is_empty());
+        // The non-default variant — not reachable via the Packet flow.
+        assert_eq!(tracks[1].track_id, 1);
+        assert_eq!(tracks[1].fourcc, fourcc_av01);
+        assert_eq!(tracks[1].codec_name, "av1");
+        assert_eq!(tracks[1].payload, vec![0x11, 0x22]);
+    }
+
+    #[test]
+    fn last_multitrack_tracks_audio_many_codecs_and_clears_on_single_track() {
+        // ExAudio ManyTracksManyCodecs (per-track FourCc) followed by a
+        // legacy single-track audio tag. The side-channel must (a) expose
+        // both tracks with their distinct resolved codec names, then (b)
+        // clear to None once a single-track tag is emitted, so it never
+        // reports stale tracks.
+        let mut abody = vec![0x95, 0x21];
+        abody.extend_from_slice(b"Opus");
+        abody.push(0x00);
+        abody.extend_from_slice(&[0x00, 0x00, 0x02]);
+        abody.extend_from_slice(&[0x4F, 0x67]);
+        abody.extend_from_slice(b"mp4a");
+        abody.push(0x01);
+        abody.extend_from_slice(&[0x00, 0x00, 0x01]);
+        abody.push(0x99);
+        let mt_tag = make_tag(0x08, 0, &abody);
+
+        // A second, legacy MP3 audio tag (single-track).
+        let mp3_body = vec![(((2 << 4) | (2 << 2) | 0x02 | 0x01) as u8), 0xBB];
+        let mp3_tag = make_tag(0x08, 20, &mp3_body);
+
+        let vp6_body = vec![((1 << 4) | 4) as u8, 0x00, 0x42];
+        let video_tag = make_tag(0x09, 0, &vp6_body);
+        let flv = make_flv(&[&mt_tag, &mp3_tag, &video_tag]);
+
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open_concrete(input, &NullCodecResolver).unwrap();
+
+        // First packet is the multitrack tag.
+        let _a0 = dmx.next_packet().unwrap();
+        let tracks = dmx.last_multitrack_tracks().expect("multitrack captured");
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].track_id, 0);
+        assert_eq!(tracks[0].codec_name, "opus");
+        assert_eq!(tracks[0].payload, vec![0x4F, 0x67]);
+        assert_eq!(tracks[1].track_id, 1);
+        // Per-track FourCc "mp4a" resolves to the AAC audio name.
+        assert_eq!(tracks[1].codec_name, "aac");
+        assert_eq!(tracks[1].payload, vec![0x99]);
+
+        // Second packet is a single-track legacy tag → side-channel clears.
+        let _a1 = dmx.next_packet().unwrap();
+        assert!(dmx.last_multitrack_tracks().is_none());
+    }
+
+    #[test]
+    fn last_multitrack_tracks_one_track_mode() {
+        // OneTrack mode: a single trackId-0 track whose payload runs to the
+        // end of the body (no sizeOfTrack field). The accessor surfaces the
+        // lone track, matching the Packet payload.
+        // mt-byte 0x01 = OneTrack (0) | inner CodedFrames (1).
+        let mut vbody = vec![0x96, 0x01];
+        vbody.extend_from_slice(b"hvc1");
+        vbody.push(0x00); // trackId 0
+                          // SI24 CTO (0) + coded bytes — payload runs to end.
+        vbody.extend_from_slice(&[0x00, 0x00, 0x00, 0x77, 0x88]);
+
+        let mp3_body = vec![(((2 << 4) | (2 << 2) | 0x02 | 0x01) as u8), 0xAA];
+        let audio_tag = make_tag(0x08, 0, &mp3_body);
+        let video_tag = make_tag(0x09, 0, &vbody);
+        let flv = make_flv(&[&audio_tag, &video_tag]);
+
+        let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
+        let mut dmx = open_concrete(input, &NullCodecResolver).unwrap();
+        let _a = dmx.next_packet().unwrap();
+        let _v = dmx.next_packet().unwrap();
+        let tracks = dmx.last_multitrack_tracks().expect("one-track captured");
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].track_id, 0);
+        assert_eq!(tracks[0].fourcc, FOURCC_HVC1);
+        assert_eq!(tracks[0].codec_name, "h265");
+        // Whole tail (SI24 CTO preserved in the per-track payload).
+        assert_eq!(tracks[0].payload, vec![0x00, 0x00, 0x00, 0x77, 0x88]);
     }
 
     /// Build a SCRIPTDATA tag body whose method name is the given

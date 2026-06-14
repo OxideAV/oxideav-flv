@@ -259,6 +259,25 @@ oxideav-flv = "0.0"
     single-stream; the demuxer surfaces the default track per tag.
     `ManyTracksManyCodecs` (no shared FourCc) maps the stream to the
     `flv:exaudio:multicodec` / `flv:exvideo:multicodec` sentinel.
+  - Non-default-track read access (`FlvDemuxer::last_multitrack_tracks`):
+    because the single-stream packet flow emits only the default track,
+    the non-default variants (different bitrate / resolution / codec /
+    language / camera angle, per enhanced-rtmp-v2 §"Track Ordering") would
+    otherwise be dropped. After each `next_packet` returning a packet
+    built from a multitrack Ex tag (audio or video), the demuxer exposes
+    every track of that tag as a `Vec<MultitrackPacketTrack>` — each
+    carrying `track_id`, the codec `fourcc` + resolved `codec_name`
+    (`"h265"` / `"av1"` / `"opus"` / … or the `flv:exvideo:<ascii>` /
+    `flv:exaudio:<ascii>` sentinel), and an *owned* copy of that track's
+    coded payload (the SI24 CompositionTimeOffset is left in place for
+    AVC/HEVC/VVC `CodedFrames`). A receiver implementing its own
+    track-selection logic picks a non-default variant without re-parsing
+    the Ex header or re-running `split_tracks`. The side-channel refreshes
+    on every `next_packet` and clears to `None` the moment a single-track
+    tag is emitted, so it never reports stale tracks. Reaching it needs
+    the concrete `FlvDemuxer`, so `demuxer::open_concrete` /
+    `open_demuxer_concrete` is exposed alongside the trait-object
+    `open` (the same handle that exposes `is_encrypted`).
 
 ### Typed `onMetaData` accessors
 

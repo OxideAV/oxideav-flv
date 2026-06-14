@@ -139,6 +139,62 @@ impl MultitrackTrack {
     }
 }
 
+/// One track of a multitrack Ex tag, resolved to an *owned* payload and
+/// a codec name — the read-side companion to [`MultitrackTrack`].
+///
+/// [`MultitrackTrack`] returns a byte *range* into a borrowed body slice,
+/// which is ideal for the demuxer's zero-copy default-track lift but
+/// awkward for a caller that wants to keep every variant of a multitrack
+/// tag after the tag body goes out of scope. A [`FlvDemuxer`] surfaces
+/// the full set of tracks of the most-recently-emitted multitrack tag as
+/// a `Vec<MultitrackPacketTrack>` (see
+/// [`FlvDemuxer::last_multitrack_tracks`]), so a caller that wants the
+/// non-default variants (different bitrate / resolution / codec /
+/// language / camera angle, per enhanced-rtmp-v2 §"Track Ordering") can
+/// recover their coded data without re-running [`split_tracks`] or
+/// re-parsing the Ex header itself.
+///
+/// [`FlvDemuxer`]: crate::FlvDemuxer
+/// [`FlvDemuxer::last_multitrack_tracks`]: crate::FlvDemuxer::last_multitrack_tracks
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultitrackPacketTrack {
+    /// `trackId` (UI8). `0` is the conventional default track; positive
+    /// ids identify additional variants. Identifiers only — they imply
+    /// no ordering, priority, or quality ranking (enhanced-rtmp-v2
+    /// §"Track Ordering").
+    pub track_id: u8,
+    /// FourCc identifying this track's codec (the shared Ex-header FourCc
+    /// for `OneTrack` / `ManyTracks`, the per-track FourCc for
+    /// `ManyTracksManyCodecs`). Big-endian packed (e.g.
+    /// `u32::from_be_bytes(*b"hvc1")`).
+    pub fourcc: u32,
+    /// Human-readable codec name for [`Self::fourcc`] (`"h265"`, `"av1"`,
+    /// `"opus"`, …), or the `flv:exvideo:<ascii>` / `flv:exaudio:<ascii>`
+    /// sentinel for a FourCc the crate does not recognise. The `is_video`
+    /// flag passed to the resolver disambiguates the audio vs. video name
+    /// table.
+    pub codec_name: String,
+    /// This track's coded payload — owned, so it outlives the tag body.
+    /// For `SequenceStart` this is the codec configuration record; for
+    /// `CodedFrames` it is the coded media (the leading `SI24`
+    /// CompositionTimeOffset, for AVC/HEVC/VVC, is left in place — the
+    /// payload is exactly the per-track Ex body the demuxer would parse).
+    pub payload: Vec<u8>,
+}
+
+impl MultitrackPacketTrack {
+    /// The length in bytes of this track's owned payload.
+    pub fn len(&self) -> usize {
+        self.payload.len()
+    }
+
+    /// `true` when the track carries no payload bytes (e.g. a per-track
+    /// `SequenceEnd`).
+    pub fn is_empty(&self) -> bool {
+        self.payload.is_empty()
+    }
+}
+
 /// Split a multitrack Ex tag body into its constituent per-track
 /// records, per `enhanced-rtmp-v2` §`ExAudioTagBody` /
 /// §`ExVideoTagBody`.
