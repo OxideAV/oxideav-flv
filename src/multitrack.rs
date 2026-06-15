@@ -295,6 +295,106 @@ pub fn split_tracks(
     Ok(tracks)
 }
 
+/// Maximum `sizeOfTrack` a multitrack body record can carry. The field
+/// is a `UI24` (`enhanced-rtmp-v2` §`ExAudioTagBody` / §`ExVideoTagBody`),
+/// so any per-track payload must fit in 24 bits.
+const MAX_SIZE_OF_TRACK: usize = 0xFF_FFFF;
+
+/// One track to emit into a multitrack Ex tag body — the write-side
+/// input companion to [`MultitrackTrack`] (which is a *borrowed* range
+/// recovered by [`split_tracks`]).
+///
+/// `payload` is exactly the per-track Ex body the demuxer would hand a
+/// single-track codec path: any codec-specific framing that lives inside
+/// the track (the `SI24 CompositionTimeOffset` for AVC/HEVC/VVC
+/// `CodedFrames`, or a codec configuration record on `SequenceStart`)
+/// is the caller's concern, mirroring [`split_tracks`]'s codec-agnostic
+/// contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackSpec<'a> {
+    /// `trackId` (UI8). `0` is the conventional default track.
+    pub track_id: u8,
+    /// FourCc identifying this track's codec. Used only for
+    /// [`AvMultitrackType::ManyTracksManyCodecs`], where each track
+    /// carries its own FourCc; ignored for `OneTrack` / `ManyTracks`,
+    /// whose shared FourCc rides in the Ex header instead.
+    pub fourcc: u32,
+    /// This track's coded payload (see the type-level note).
+    pub payload: &'a [u8],
+}
+
+/// Assemble a multitrack Ex tag body from its per-track records — the
+/// inverse of [`split_tracks`], per `enhanced-rtmp-v2` §`ExAudioTagBody`
+/// / §`ExVideoTagBody`.
+///
+/// The returned bytes are the tag-body tail that follows the Ex header
+/// (i.e. what [`split_tracks`] takes as its `body` argument); the caller
+/// prepends the Ex header — whose multitrack outer byte advertises
+/// `mt_type` and, for `OneTrack` / `ManyTracks`, the shared FourCc —
+/// via [`crate::tag::write_ex_audio_tag`] / [`crate::tag::write_ex_video_tag`].
+///
+/// Wire layout produced, matching [`split_tracks`]:
+/// * [`AvMultitrackType::OneTrack`] — exactly one track: `trackId UI8`
+///   then the payload running to the end of the body (no `sizeOfTrack`).
+/// * [`AvMultitrackType::ManyTracks`] — a loop of `trackId UI8`,
+///   `sizeOfTrack UI24`, `payload[size]`. The shared FourCc is *not*
+///   written here (it lives in the Ex header).
+/// * [`AvMultitrackType::ManyTracksManyCodecs`] — as `ManyTracks` but
+///   each record is prefixed with its own `FourCc` (4 bytes).
+///
+/// `split_tracks(mt_type, default_fourcc, &join_tracks(mt_type, tracks)?)`
+/// recovers the same per-track `track_id` / `fourcc` / payload (with
+/// `default_fourcc` matching the shared FourCc for the non-multicodec
+/// modes), so the read↔write loop is closed.
+///
+/// Errors with [`Error::InvalidData`] on:
+/// * a [`AvMultitrackType::Reserved`] type (no defined per-track layout),
+/// * an empty `tracks` slice (a body must carry at least one track),
+/// * `OneTrack` given more than one track,
+/// * any per-track payload exceeding the `UI24` `sizeOfTrack` cap.
+pub fn join_tracks(mt_type: AvMultitrackType, tracks: &[TrackSpec<'_>]) -> Result<Vec<u8>> {
+    if let AvMultitrackType::Reserved(_) = mt_type {
+        return Err(Error::invalid(
+            "FLV multitrack: reserved AvMultitrackType has no defined per-track layout",
+        ));
+    }
+    if tracks.is_empty() {
+        return Err(Error::invalid(
+            "FLV multitrack: a multitrack body must carry at least one track",
+        ));
+    }
+    if mt_type.is_one_track() && tracks.len() != 1 {
+        return Err(Error::invalid(
+            "FLV multitrack: OneTrack mode requires exactly one track",
+        ));
+    }
+
+    let mut body = Vec::new();
+    for track in tracks {
+        if mt_type.is_many_codecs() {
+            body.extend_from_slice(&track.fourcc.to_be_bytes());
+        }
+        body.push(track.track_id);
+
+        if mt_type.is_one_track() {
+            // No sizeOfTrack: the single payload runs to the body's end.
+            body.extend_from_slice(track.payload);
+            break;
+        }
+
+        if track.payload.len() > MAX_SIZE_OF_TRACK {
+            return Err(Error::invalid(
+                "FLV multitrack: per-track payload exceeds the UI24 sizeOfTrack cap",
+            ));
+        }
+        let size = track.payload.len();
+        body.extend_from_slice(&[(size >> 16) as u8, (size >> 8) as u8, size as u8]);
+        body.extend_from_slice(track.payload);
+    }
+
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +561,156 @@ mod tests {
         let body = [b'a', b'v'];
         assert!(matches!(
             split_tracks(AvMultitrackType::ManyTracksManyCodecs, 0, &body),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    // ---- join_tracks: the write-side inverse of split_tracks ----
+
+    /// Re-split a body produced by `join_tracks` and assert it recovers
+    /// the same `track_id` / `fourcc` / payload it was built from.
+    fn assert_round_trip(mt_type: AvMultitrackType, default_fourcc: u32, specs: &[TrackSpec<'_>]) {
+        let body = join_tracks(mt_type, specs).unwrap();
+        let recovered = split_tracks(mt_type, default_fourcc, &body).unwrap();
+        assert_eq!(recovered.len(), specs.len());
+        for (got, want) in recovered.iter().zip(specs) {
+            assert_eq!(got.track_id, want.track_id);
+            assert_eq!(got.fourcc, want.fourcc);
+            assert_eq!(&body[got.payload.clone()], want.payload);
+        }
+    }
+
+    #[test]
+    fn join_one_track_round_trips() {
+        let specs = [TrackSpec {
+            track_id: 0,
+            fourcc: FOURCC_AV01,
+            payload: &[0xDE, 0xAD, 0xBE, 0xEF],
+        }];
+        assert_round_trip(AvMultitrackType::OneTrack, FOURCC_AV01, &specs);
+        // OneTrack body is exactly trackId + payload (no sizeOfTrack).
+        let body = join_tracks(AvMultitrackType::OneTrack, &specs).unwrap();
+        assert_eq!(body, vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn join_one_track_empty_payload_round_trips() {
+        let specs = [TrackSpec {
+            track_id: 7,
+            fourcc: FOURCC_OPUS,
+            payload: &[],
+        }];
+        assert_round_trip(AvMultitrackType::OneTrack, FOURCC_OPUS, &specs);
+        assert_eq!(
+            join_tracks(AvMultitrackType::OneTrack, &specs).unwrap(),
+            vec![0x07]
+        );
+    }
+
+    #[test]
+    fn join_many_tracks_shared_fourcc_round_trips() {
+        let specs = [
+            TrackSpec {
+                track_id: 0,
+                fourcc: FOURCC_HVC1,
+                payload: &[0x01, 0x02, 0x03],
+            },
+            TrackSpec {
+                track_id: 1,
+                fourcc: FOURCC_HVC1,
+                payload: &[0xAA, 0xBB],
+            },
+        ];
+        assert_round_trip(AvMultitrackType::ManyTracks, FOURCC_HVC1, &specs);
+        // No per-track FourCc is written for ManyTracks: each record is
+        // trackId UI8 + sizeOfTrack UI24 + payload.
+        let body = join_tracks(AvMultitrackType::ManyTracks, &specs).unwrap();
+        #[rustfmt::skip]
+        let expected = vec![
+            0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03,
+            0x01, 0x00, 0x00, 0x02, 0xAA, 0xBB,
+        ];
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn join_many_tracks_many_codecs_round_trips() {
+        let specs = [
+            TrackSpec {
+                track_id: 0,
+                fourcc: FOURCC_AV01,
+                payload: &[0x11, 0x22],
+            },
+            TrackSpec {
+                track_id: 5,
+                fourcc: FOURCC_HVC1,
+                payload: &[0x33],
+            },
+        ];
+        // default_fourcc is ignored for ManyTracksManyCodecs (each track
+        // carries its own); pass a deliberately-wrong value to prove it.
+        assert_round_trip(AvMultitrackType::ManyTracksManyCodecs, 0xDEAD_BEEF, &specs);
+        let body = join_tracks(AvMultitrackType::ManyTracksManyCodecs, &specs).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"av01");
+        expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x02, 0x11, 0x22]);
+        expected.extend_from_slice(b"hvc1");
+        expected.extend_from_slice(&[0x05, 0x00, 0x00, 0x01, 0x33]);
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn join_reserved_type_rejected() {
+        let specs = [TrackSpec {
+            track_id: 0,
+            fourcc: FOURCC_AV01,
+            payload: &[0x00],
+        }];
+        assert!(matches!(
+            join_tracks(AvMultitrackType::Reserved(3), &specs),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn join_empty_track_list_rejected() {
+        assert!(matches!(
+            join_tracks(AvMultitrackType::ManyTracks, &[]),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn join_one_track_with_two_tracks_rejected() {
+        let specs = [
+            TrackSpec {
+                track_id: 0,
+                fourcc: FOURCC_AV01,
+                payload: &[0x01],
+            },
+            TrackSpec {
+                track_id: 1,
+                fourcc: FOURCC_AV01,
+                payload: &[0x02],
+            },
+        ];
+        assert!(matches!(
+            join_tracks(AvMultitrackType::OneTrack, &specs),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn join_oversize_payload_rejected() {
+        // A payload one byte past the UI24 sizeOfTrack cap.
+        let big = vec![0u8; MAX_SIZE_OF_TRACK + 1];
+        let specs = [TrackSpec {
+            track_id: 0,
+            fourcc: FOURCC_AV01,
+            payload: &big,
+        }];
+        assert!(matches!(
+            join_tracks(AvMultitrackType::ManyTracks, &specs),
             Err(Error::InvalidData(_))
         ));
     }

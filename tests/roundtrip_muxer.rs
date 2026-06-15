@@ -21,7 +21,7 @@ use oxideav_flv::{
     tag, FlvHeader,
 };
 use oxideav_flv::{
-    write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_ac3_coded_frames,
+    join_tracks, write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_ac3_coded_frames,
     write_av1_coded_frames, write_av1_sequence_start, write_avc_nalu_tag,
     write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_multichannel_config,
     write_ex_audio_sequence_end, write_ex_audio_tag, write_ex_video_color_info,
@@ -32,8 +32,8 @@ use oxideav_flv::{
     write_vp6a_tag, write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
     write_vvc_sequence_start, AudioChannel, AudioChannelOrder, AvMultitrackType, ColorConfig,
     ColorInfo, ExAudioPacketType, ExAudioTagHeader, ExFrameType, ExPacketType, ExVideoTagHeader,
-    HdrCll, HdrMdcv, ModExEntry, ModExPayload, MultichannelConfig, FOURCC_AUDIO_AAC, FOURCC_AV01,
-    FOURCC_OPUS,
+    HdrCll, HdrMdcv, ModExEntry, ModExPayload, MultichannelConfig, TrackSpec, FOURCC_AUDIO_AAC,
+    FOURCC_AV01, FOURCC_OPUS,
 };
 
 /// Three distinct synthetic MP3 frame payloads. The demuxer treats an
@@ -1071,6 +1071,75 @@ fn ex_audio_multitrack_many_tracks_round_trips_default_track() {
     assert_eq!(
         p.data, default_au,
         "ManyTracks default-track payload (trackId 0) must surface verbatim"
+    );
+    assert_eq!(p.pts, Some(46));
+}
+
+#[test]
+fn ex_audio_multitrack_join_tracks_matches_hand_assembled_body() {
+    // The `join_tracks` body encoder must produce byte-identical output
+    // to the hand-assembled `trackId + sizeOfTrack + payload` loop used
+    // by `ex_audio_multitrack_many_tracks_round_trips_default_track`, and
+    // the resulting tag must demux to the same default-track packet.
+    let default_au = vec![0x11u8, 0x22, 0x33, 0x44];
+    let alt_au = vec![0x55u8, 0x66, 0x77, 0x88, 0x99];
+
+    // Hand-assembled reference body (mirrors the legacy test).
+    let mut hand = Vec::new();
+    hand.push(0u8);
+    let s = default_au.len();
+    hand.extend_from_slice(&[(s >> 16) as u8, (s >> 8) as u8, s as u8]);
+    hand.extend_from_slice(&default_au);
+    hand.push(1u8);
+    let s = alt_au.len();
+    hand.extend_from_slice(&[(s >> 16) as u8, (s >> 8) as u8, s as u8]);
+    hand.extend_from_slice(&alt_au);
+
+    let joined = join_tracks(
+        AvMultitrackType::ManyTracks,
+        &[
+            TrackSpec {
+                track_id: 0,
+                fourcc: FOURCC_AUDIO_AAC,
+                payload: &default_au,
+            },
+            TrackSpec {
+                track_id: 1,
+                fourcc: FOURCC_AUDIO_AAC,
+                payload: &alt_au,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        joined, hand,
+        "join_tracks output must match the hand-assembled multitrack body"
+    );
+
+    // End-to-end: build the full tag from the joined body and demux it.
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let asc = vec![0x12, 0x10];
+    write_aac_ex_sequence_start(&mut buf, 0, &asc).unwrap();
+
+    let header_struct = ExAudioTagHeader {
+        packet_type: ExAudioPacketType::CodedFrames,
+        fourcc: Some(FOURCC_AUDIO_AAC),
+        multitrack: Some(AvMultitrackType::ManyTracks),
+        timestamp_offset_nano: 0,
+        mod_ex_entries: Vec::new(),
+        bytes_consumed: 0,
+    };
+    write_ex_audio_tag(&mut buf, 46, &header_struct, &joined).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
+    let _hdr = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(
+        p.data, default_au,
+        "default-track payload from a join_tracks body must surface verbatim"
     );
     assert_eq!(p.pts, Some(46));
 }

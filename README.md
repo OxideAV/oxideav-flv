@@ -264,7 +264,19 @@ oxideav-flv = "0.0"
     (`track_id` / `fourcc` / payload byte-range). The stream model stays
     single-stream; the demuxer surfaces the default track per tag.
     `ManyTracksManyCodecs` (no shared FourCc) maps the stream to the
-    `flv:exaudio:multicodec` / `flv:exvideo:multicodec` sentinel.
+    `flv:exaudio:multicodec` / `flv:exvideo:multicodec` sentinel. The
+    write-side inverse `multitrack::join_tracks(mt_type, &[TrackSpec])`
+    assembles a multitrack body from per-track records (`TrackSpec` is the
+    borrowed write companion to the borrowed-range `MultitrackTrack`):
+    `OneTrack` lays down `trackId` + a payload running to the body's end,
+    `ManyTracks` a `trackId UI8 + sizeOfTrack UI24 + payload` loop, and
+    `ManyTracksManyCodecs` the same with a per-track FourCc prefix. The
+    parser's invariants are enforced before any byte is emitted (reserved
+    type, empty track list, `OneTrack` with >1 track, payload past the
+    `UI24 sizeOfTrack` cap all raise `Error::InvalidData`), and
+    `split_tracks ∘ join_tracks` round-trips `track_id` / `fourcc` /
+    payload, so a caller can build a multitrack Ex tag body without
+    hand-rolling the wire loop.
   - Non-default-track read access (`FlvDemuxer::last_multitrack_tracks`):
     because the single-stream packet flow emits only the default track,
     the non-default variants (different bitrate / resolution / codec /

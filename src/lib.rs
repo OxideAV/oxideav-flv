@@ -55,7 +55,9 @@ pub use ex_video::{
 pub use header::{FlvHeader, FLV_SIGNATURE};
 pub use mod_ex::{ModExEntry, ModExPayload};
 pub use multichannel::{mask_channel_labels, AudioChannel, AudioChannelOrder, MultichannelConfig};
-pub use multitrack::{split_tracks, MultitrackPacketTrack, MultitrackTrack};
+pub use multitrack::{
+    join_tracks, split_tracks, MultitrackPacketTrack, MultitrackTrack, TrackSpec,
+};
 pub use script::{
     write_on_cue_point, write_on_cue_point_body, write_on_metadata, write_on_metadata_body,
     write_on_xmp_data, write_on_xmp_data_body, CuePointParams, CuePointType, MetaValue,

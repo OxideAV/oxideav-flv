@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `multitrack::join_tracks(mt_type, &[TrackSpec])` — the write-side
+  inverse of `split_tracks`, assembling an Enhanced-RTMP-v2 multitrack Ex
+  tag body (`enhanced-rtmp-v2` §`ExAudioTagBody` / §`ExVideoTagBody`) from
+  per-track records. `OneTrack` emits `trackId` + a payload running to the
+  body's end; `ManyTracks` emits a `trackId UI8` + `sizeOfTrack UI24` +
+  payload loop; `ManyTracksManyCodecs` prefixes each record with its own
+  FourCc. Validation mirrors the parser's invariants — `Reserved` types,
+  an empty track list, `OneTrack` with more than one track, and a payload
+  past the `UI24 sizeOfTrack` cap all raise `Error::InvalidData`.
+  `split_tracks ∘ join_tracks` round-trips `track_id` / `fourcc` /
+  payload, closing the read↔write loop the demuxer's default-track lift
+  and `last_multitrack_tracks` side-channel only covered on the read side.
+  The new borrowed `TrackSpec` input type is the write companion to the
+  borrowed-range `MultitrackTrack`. Both are re-exported from the crate
+  root.
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-flv/compare/v0.0.4...v0.0.5) - 2026-06-14
 
 ### Other
