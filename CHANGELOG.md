@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-flv/compare/v0.0.4...v0.0.5) - 2026-06-14
+
+### Other
+
+- order-agnostic speaker-presence queries
+- resolve FourCc-packed videocodecid / audiocodecid in TypedMetadata
+- expose non-default multitrack tracks via FlvDemuxer::last_multitrack_tracks
+- surface Enhanced-RTMP-v2 audio silence message as a discard packet
+- parse + emit Enhanced-RTMP-v2 MultichannelConfig speaker layout
+- TypedColorInfo::to_color_info read↔write rebuild for Enhanced-RTMP-v2 HDR colorInfo
+- TypedColorInfo read-side mirror for Enhanced-RTMP-v2 HDR colorInfo
+- TypedMetadata accessors for Enhanced-RTMP-v2 per-track info maps
+- TypedMetadata videoframerate alias + effective_framerate accessor
+- drop release-plz.toml — use release-plz defaults across the workspace
+- onCuePoint + onXMPData script-data tag writers
+- fuzz/ sub-crate — demuxer / AMF0 / AMF3 / script-metadata roundtrip
+- typed onMetaData accessors for the Annex E.5 fifteen properties
+- HDR colorInfo encode-side wiring (Enhanced-RTMP v2 Metadata Frame)
+- ExAudio multitrack emission + parser inner-AudioPacketType surfacing
+- ExVideo / ExAudio ModEx prefix emission
+- onMetaData.keyframes seek-table writer
+- Enhanced-RTMP ExVideo + ExAudio muxer slice (FourCc mode)
+- legacy video tag muxer — H.263 / VP6 / VP6A / AVC writers
+- drop stale src/writer.rs swept into prior commit
+
 ### Added
 
 - `MultichannelConfig::present_channels()` / `has_channel()` /
