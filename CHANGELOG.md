@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-flv/compare/v0.0.5...v0.0.6) - 2026-06-15
+
+### Other
+
+- join_tracks body encoder (write-side inverse of split_tracks)
+
 ### Added
 
 - `multitrack::join_tracks(mt_type, &[TrackSpec])` — the write-side
