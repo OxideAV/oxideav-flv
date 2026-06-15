@@ -11,7 +11,6 @@ framework but usable standalone.
 ```toml
 [dependencies]
 oxideav-core = "0.1"
-oxideav-container = "0.1"
 oxideav-flv = "0.0"
 ```
 
@@ -589,8 +588,7 @@ tag::write_mp3_tag(&mut flv, 0, 3, true, true, &mp3_frame)?;
 
 ```rust
 use std::io::Cursor;
-use oxideav_core::NullCodecResolver;
-use oxideav_container::{Demuxer, ReadSeek};
+use oxideav_core::{Demuxer, NullCodecResolver, ReadSeek};
 
 let bytes = std::fs::read("clip.flv")?;
 let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
@@ -607,7 +605,7 @@ while let Ok(pkt) = dmx.next_packet() {
 Container name: `"flv"` (extension `.flv`, magic `FLV\x01`).
 
 Codec ids produced by the demuxer (stable strings so downstream code
-can resolve them through `oxideav-codec`'s registry):
+can resolve them through the `oxideav-core` codec registry):
 
 | FLV id | Media | CodecId    | Notes                        |
 | ------ | ----- | ---------- | ---------------------------- |
