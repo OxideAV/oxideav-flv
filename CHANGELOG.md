@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Enhanced-RTMP-v2 NetConnection `onStatus` command + *Reconnect Request* (`on_status` module): typed `OnStatusInfo` builder, `reconnect_request` constructor (spec-pinned `code`/`level`, optional `tcUrl`/`description`), AMF0 command serialiser, and `parse_on_status_command` read↔write loop; adds `amf0::write_null`
 - `join_tracks` multitrack body serialiser — the write-side inverse of `split_tracks` (`OneTrack` / `ManyTracks` / `ManyTracksManyCodecs`), with `JoinTrack` input and `split↔join` round-trip tests
 
 ## [0.0.5](https://github.com/OxideAV/oxideav-flv/compare/v0.0.4...v0.0.5) - 2026-06-14

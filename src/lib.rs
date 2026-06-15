@@ -32,6 +32,7 @@ pub mod header;
 pub mod mod_ex;
 pub mod multichannel;
 pub mod multitrack;
+pub mod on_status;
 pub mod script;
 pub mod tag;
 pub mod typed_meta;
@@ -57,6 +58,10 @@ pub use mod_ex::{ModExEntry, ModExPayload};
 pub use multichannel::{mask_channel_labels, AudioChannel, AudioChannelOrder, MultichannelConfig};
 pub use multitrack::{
     join_tracks, split_tracks, JoinTrack, MultitrackPacketTrack, MultitrackTrack,
+};
+pub use on_status::{
+    parse_on_status_command, reconnect_request, write_info_object, write_on_status_command,
+    write_on_status_command_body, OnStatusInfo, CODE_RECONNECT_REQUEST, COMMAND_NAME, LEVEL_STATUS,
 };
 pub use script::{
     write_on_cue_point, write_on_cue_point_body, write_on_metadata, write_on_metadata_body,

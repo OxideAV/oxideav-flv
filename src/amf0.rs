@@ -315,6 +315,15 @@ pub fn write_boolean<W: Write + ?Sized>(w: &mut W, b: bool) -> Result<()> {
     Ok(())
 }
 
+/// Write an AMF0 Null value (marker `0x05`, §2.7). The marker stands on
+/// its own with no payload. Used for the `null` Command Object slot of a
+/// NetConnection command sequence such as `onStatus` (Veovera
+/// `enhanced-rtmp-v2` §"Reconnect Request").
+pub fn write_null<W: Write + ?Sized>(w: &mut W) -> Result<()> {
+    w.write_all(&[0x05])?;
+    Ok(())
+}
+
 /// Write an AMF0 String value (marker `0x02` + UI16 BE length + UTF-8
 /// bytes, §2.4). Errors if `s` exceeds 65535 bytes — a longer payload
 /// requires the Long String type (`0x0C`), which `onMetaData` property
@@ -639,6 +648,17 @@ mod tests {
             let (v, _) = parse_amf0_value(&b, 0).unwrap();
             assert_eq!(v, AmfValue::Boolean(tv));
         }
+    }
+
+    #[test]
+    fn write_null_round_trips() {
+        let mut b = Vec::new();
+        write_null(&mut b).unwrap();
+        // Lone Null marker (0x05), no payload.
+        assert_eq!(b, vec![0x05]);
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(v, AmfValue::Null);
+        assert_eq!(p, 1);
     }
 
     #[test]

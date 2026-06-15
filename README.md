@@ -471,7 +471,8 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | Ex-video HDR `colorInfo` metadata tag | `tag::write_ex_video_color_info(w, ts_ms, fourcc, &ColorInfo)` | enhanced-rtmp v2 §"Metadata Frame" |
 | Ex-video HDR `colorInfo` reset (`Undefined`) | `tag::write_ex_video_color_info_reset(w, ts_ms, fourcc)` | enhanced-rtmp v2 §"Metadata Frame" |
 | Typed `colorInfo` AMF body encoder | `color_info::{ColorInfo, ColorConfig, HdrCll, HdrMdcv}::encode_amf()` / `encode_amf_into` / `encode_amf_reset` | enhanced-rtmp v2 §`ColorInfo` |
-| AMF0 writers | `amf0::{write_number, write_boolean, write_string, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 |
+| AMF0 writers | `amf0::{write_number, write_boolean, write_null, write_string, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 |
+| NetConnection `onStatus` command (incl. reconnect request) | `on_status::write_on_status_command(&OnStatusInfo)` / `write_on_status_command_body` / `reconnect_request(tc_url, description)` | enhanced-rtmp v2 §"Reconnect Request" |
 | `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |
 | `onMetaData.keyframes` seek-table composite | `MetadataBag::keyframes(file_positions, times_seconds)` + AMF0 `write_strict_array_number` | §E.4.4.7 / §E.4.4.9 |
 | `onCuePoint` script tag (Annex A embedded cue point) | `script::write_on_cue_point(w, ts_ms, &CuePointParams)` | Annex A.2 |
@@ -510,6 +511,25 @@ and video). `script::write_on_xmp_data(w, ts_ms, live_xml)` emits an
 demuxer surfaces under `metadata["xmp"]`. Both writers round-trip
 bit-exactly through `FlvDemuxer` and may be interleaved freely
 between media tags.
+
+The `on_status` module wires the Enhanced-RTMP-v2 server→client
+NetConnection `onStatus` command and its *Reconnect Request* case. Unlike
+the `onMetaData` / `onCuePoint` / `onXMPData` script *tags*, `onStatus`
+is an RTMP **command message** — an AMF0 sequence of four values
+(command name `"onStatus"`, transaction id `0`, a `null` command object,
+and the Info Object) relayed over the command stream rather than framed
+as an FLV tag, so the writers emit just that bare AMF0 sequence.
+`on_status::reconnect_request(tc_url, description)` builds the spec-pinned
+reconnect Info Object (`code = NetConnection.Connect.ReconnectRequest`,
+`level = status`) with an optional `tcUrl` remap target and optional
+human-readable `description`; the generic `OnStatusInfo` builder
+(`new(code, level).description(..).tc_url(..).property(..)`) covers the
+other `onStatus` codes (`NetConnection.Connect.Success` / `Closed` /
+`Failed` / `Rejected` …). `on_status::parse_on_status_command(&[u8])`
+recovers the typed `OnStatusInfo` from the command bytes, closing the
+read↔write loop: the Info Object string properties are routed back into
+`code` / `level` / `description` / `tcUrl`, every other string property
+into `extra` in bitstream order, and non-string properties are ignored.
 
 The video tag writers all share the same `VideoTagHeader` / `FrameType`
 model the demuxer uses; `write_avc_nalu_tag` packs `pts - dts` as the
