@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- `join_tracks` multitrack body serialiser — the write-side inverse of `split_tracks` (`OneTrack` / `ManyTracks` / `ManyTracksManyCodecs`), with `JoinTrack` input and `split↔join` round-trip tests
+
 ## [0.0.5](https://github.com/OxideAV/oxideav-flv/compare/v0.0.4...v0.0.5) - 2026-06-14
 
 ### Other

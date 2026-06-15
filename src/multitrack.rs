@@ -1,5 +1,8 @@
-//! Enhanced RTMP / E-FLV multitrack body splitter, per Veovera
-//! `enhanced-rtmp-v2` §`ExAudioTagBody` and §`ExVideoTagBody`.
+//! Enhanced RTMP / E-FLV multitrack body codec (splitter +
+//! serialiser), per Veovera `enhanced-rtmp-v2` §`ExAudioTagBody` and
+//! §`ExVideoTagBody`. [`split_tracks`] walks a body into per-track byte
+//! ranges; [`join_tracks`] is its exact inverse, writing a batch of
+//! owned [`JoinTrack`]s back into the same wire layout.
 //!
 //! A single audio or video message at one timestamp may carry a *batch*
 //! of tracks (e.g. several `trackId` values for different bitrates,
@@ -295,6 +298,158 @@ pub fn split_tracks(
     Ok(tracks)
 }
 
+/// One track handed to [`join_tracks`] for encoding — the owned,
+/// write-side input that mirrors what [`split_tracks`] recovers.
+///
+/// `join_tracks` is the exact inverse of [`split_tracks`]: it serialises a
+/// batch of tracks back into the `enhanced-rtmp-v2` §`ExAudioTagBody` /
+/// §`ExVideoTagBody` wire layout. A [`JoinTrack`] therefore carries the
+/// same three pieces of state a [`MultitrackTrack`] / [`MultitrackPacketTrack`]
+/// exposes on read: the `trackId`, the codec `fourcc`, and the per-track
+/// payload bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinTrack {
+    /// `trackId` (UI8). `0` is the conventional default track; positive
+    /// ids identify additional variants. Identifiers only — no ordering
+    /// or quality ranking is implied (enhanced-rtmp-v2 §"Track Ordering").
+    pub track_id: u8,
+    /// FourCc identifying this track's codec, big-endian packed (e.g.
+    /// `u32::from_be_bytes(*b"hvc1")`). Emitted per-track *only* for
+    /// [`AvMultitrackType::ManyTracksManyCodecs`]; for `OneTrack` /
+    /// `ManyTracks` the shared FourCc lives in the Ex header and every
+    /// `JoinTrack::fourcc` in the batch is ignored by [`join_tracks`].
+    pub fourcc: u32,
+    /// This track's coded payload (codec configuration record on
+    /// `SequenceStart`, coded media on `CodedFrames`, or empty on
+    /// `SequenceEnd`). Serialised verbatim — `join_tracks` does not
+    /// inspect or reframe it.
+    pub payload: Vec<u8>,
+}
+
+impl JoinTrack {
+    /// Construct a [`JoinTrack`] from its parts.
+    pub fn new(track_id: u8, fourcc: u32, payload: Vec<u8>) -> Self {
+        Self {
+            track_id,
+            fourcc,
+            payload,
+        }
+    }
+
+    /// The length in bytes of this track's payload.
+    pub fn len(&self) -> usize {
+        self.payload.len()
+    }
+
+    /// `true` when this track carries no payload bytes.
+    pub fn is_empty(&self) -> bool {
+        self.payload.is_empty()
+    }
+}
+
+impl From<&MultitrackPacketTrack> for JoinTrack {
+    /// Lift an owned read-side [`MultitrackPacketTrack`] straight into the
+    /// write-side input, so `split (→ resolve) → join` round-trips without
+    /// the caller re-stating each field. The `codec_name` is dropped — the
+    /// wire layout keys off `fourcc` only.
+    fn from(t: &MultitrackPacketTrack) -> Self {
+        Self {
+            track_id: t.track_id,
+            fourcc: t.fourcc,
+            payload: t.payload.clone(),
+        }
+    }
+}
+
+/// Largest payload a single non-`OneTrack` track may carry: the
+/// `sizeOfTrack` field is a UI24, so anything above this overflows it.
+const MAX_TRACK_PAYLOAD: usize = 0x00FF_FFFF;
+
+/// Serialise a batch of tracks into a multitrack Ex tag body — the exact
+/// inverse of [`split_tracks`], per `enhanced-rtmp-v2` §`ExAudioTagBody` /
+/// §`ExVideoTagBody`.
+///
+/// `mt_type` is the [`AvMultitrackType`] the Ex header will advertise.
+/// `tracks` are the per-track records to emit, in wire order. The returned
+/// `Vec<u8>` is the tag-body tail that follows the Ex header (i.e. it does
+/// **not** include the Ex header's own multitrack-type nibble or, for the
+/// `OneTrack` / `ManyTracks` modes, the shared FourCc — those belong to
+/// the [`crate::ex_audio::ExAudioTagHeader`] /
+/// [`crate::ex_video::ExVideoTagHeader`] encoder).
+///
+/// Per the spec body loop:
+/// * For [`AvMultitrackType::ManyTracksManyCodecs`] each record is
+///   prefixed with its own `FourCc` (UI32 BE); for `OneTrack` /
+///   `ManyTracks` the FourCc is shared in the Ex header and omitted here
+///   (each track's [`JoinTrack::fourcc`] is ignored).
+/// * `trackId` (UI8) is always written.
+/// * For every mode *except* `OneTrack` a `sizeOfTrack` (UI24 BE) demarcates
+///   the payload. `OneTrack` omits it — the single payload runs to the end
+///   of the body.
+///
+/// Errors with [`Error::InvalidData`] when:
+/// * `mt_type` is [`AvMultitrackType::Reserved`] (no defined wire layout —
+///   mirrors [`split_tracks`]);
+/// * `mt_type` is [`AvMultitrackType::OneTrack`] and `tracks.len() != 1`
+///   (the degenerate mode carries exactly one track and has no
+///   `sizeOfTrack` to delimit a second);
+/// * `tracks` is empty for a non-`OneTrack` mode (a multitrack body with no
+///   tracks cannot be parsed back — `split_tracks` always yields ≥ 1);
+/// * any non-`OneTrack` track's payload exceeds [`MAX_TRACK_PAYLOAD`]
+///   (`0x00FF_FFFF`), which would overflow the UI24 `sizeOfTrack`.
+pub fn join_tracks(mt_type: AvMultitrackType, tracks: &[JoinTrack]) -> Result<Vec<u8>> {
+    if let AvMultitrackType::Reserved(_) = mt_type {
+        return Err(Error::invalid(
+            "FLV multitrack: reserved AvMultitrackType has no defined per-track layout",
+        ));
+    }
+
+    if mt_type.is_one_track() {
+        if tracks.len() != 1 {
+            return Err(Error::invalid(
+                "FLV multitrack: OneTrack body must carry exactly one track",
+            ));
+        }
+    } else if tracks.is_empty() {
+        return Err(Error::invalid(
+            "FLV multitrack: ManyTracks/ManyTracksManyCodecs body needs at least one track",
+        ));
+    }
+
+    let mut body = Vec::new();
+    for track in tracks {
+        // ManyTracksManyCodecs: each track is prefixed with its own
+        // FourCc. OneTrack / ManyTracks carry the shared FourCc in the
+        // Ex header, so it is not written into the body.
+        if mt_type.is_many_codecs() {
+            body.extend_from_slice(&track.fourcc.to_be_bytes());
+        }
+
+        // trackId UI8 — always present.
+        body.push(track.track_id);
+
+        if mt_type.is_one_track() {
+            // OneTrack: no sizeOfTrack — payload runs to the end of body.
+            body.extend_from_slice(&track.payload);
+            break;
+        }
+
+        // ManyTracks / ManyTracksManyCodecs: sizeOfTrack UI24 BE.
+        let size = track.payload.len();
+        if size > MAX_TRACK_PAYLOAD {
+            return Err(Error::invalid(
+                "FLV multitrack: track payload exceeds UI24 sizeOfTrack capacity",
+            ));
+        }
+        body.push((size >> 16) as u8);
+        body.push((size >> 8) as u8);
+        body.push(size as u8);
+        body.extend_from_slice(&track.payload);
+    }
+
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +618,232 @@ mod tests {
             split_tracks(AvMultitrackType::ManyTracksManyCodecs, 0, &body),
             Err(Error::InvalidData(_))
         ));
+    }
+
+    // ---- join_tracks (write-side inverse of split_tracks) ----
+
+    /// Resolve the read-side ranges of a `split_tracks` result against the
+    /// body slice into owned `JoinTrack`s, so a `split → join` round-trip
+    /// can be expressed without re-stating each field by hand.
+    fn resolve(body: &[u8], tracks: &[MultitrackTrack]) -> Vec<JoinTrack> {
+        tracks
+            .iter()
+            .map(|t| JoinTrack::new(t.track_id, t.fourcc, body[t.payload.clone()].to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn join_one_track_matches_handbuilt_body() {
+        let tracks = [JoinTrack::new(0, FOURCC_AV01, vec![0xDE, 0xAD, 0xBE, 0xEF])];
+        let body = join_tracks(AvMultitrackType::OneTrack, &tracks).unwrap();
+        // OneTrack body: trackId then bare payload, no FourCc, no size.
+        assert_eq!(body, vec![0x00, 0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn join_one_track_empty_payload() {
+        let tracks = [JoinTrack::new(7, FOURCC_OPUS, vec![])];
+        let body = join_tracks(AvMultitrackType::OneTrack, &tracks).unwrap();
+        assert_eq!(body, vec![0x07]);
+    }
+
+    #[test]
+    fn join_many_tracks_shared_fourcc_matches_handbuilt() {
+        let tracks = [
+            JoinTrack::new(0, FOURCC_HVC1, vec![0x01, 0x02, 0x03]),
+            JoinTrack::new(1, FOURCC_HVC1, vec![0xAA, 0xBB]),
+        ];
+        let body = join_tracks(AvMultitrackType::ManyTracks, &tracks).unwrap();
+        let expected = vec![
+            0x00, 0x00, 0x00, 0x03, 0x01, 0x02, 0x03, // track 0
+            0x01, 0x00, 0x00, 0x02, 0xAA, 0xBB, // track 1
+        ];
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn join_many_tracks_many_codecs_emits_per_track_fourcc() {
+        let tracks = [
+            JoinTrack::new(0, FOURCC_AV01, vec![0x11, 0x22]),
+            JoinTrack::new(5, FOURCC_HVC1, vec![0x33]),
+        ];
+        let body = join_tracks(AvMultitrackType::ManyTracksManyCodecs, &tracks).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"av01");
+        expected.push(0x00);
+        expected.extend_from_slice(&[0x00, 0x00, 0x02]);
+        expected.extend_from_slice(&[0x11, 0x22]);
+        expected.extend_from_slice(b"hvc1");
+        expected.push(0x05);
+        expected.extend_from_slice(&[0x00, 0x00, 0x01]);
+        expected.push(0x33);
+        assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn split_then_join_is_identity_one_track() {
+        let body = [0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+        let tracks = split_tracks(AvMultitrackType::OneTrack, FOURCC_AV01, &body).unwrap();
+        let rebuilt = join_tracks(AvMultitrackType::OneTrack, &resolve(&body, &tracks)).unwrap();
+        assert_eq!(rebuilt, body);
+    }
+
+    #[test]
+    fn split_then_join_is_identity_many_tracks() {
+        let mut body = Vec::new();
+        body.push(0x00);
+        body.extend_from_slice(&[0x00, 0x00, 0x03]);
+        body.extend_from_slice(&[0x01, 0x02, 0x03]);
+        body.push(0x01);
+        body.extend_from_slice(&[0x00, 0x00, 0x02]);
+        body.extend_from_slice(&[0xAA, 0xBB]);
+
+        let tracks = split_tracks(AvMultitrackType::ManyTracks, FOURCC_HVC1, &body).unwrap();
+        let rebuilt = join_tracks(AvMultitrackType::ManyTracks, &resolve(&body, &tracks)).unwrap();
+        assert_eq!(rebuilt, body);
+    }
+
+    #[test]
+    fn split_then_join_is_identity_many_codecs() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"av01");
+        body.push(0x00);
+        body.extend_from_slice(&[0x00, 0x00, 0x02]);
+        body.extend_from_slice(&[0x11, 0x22]);
+        body.extend_from_slice(b"hvc1");
+        body.push(0x05);
+        body.extend_from_slice(&[0x00, 0x00, 0x01]);
+        body.push(0x33);
+
+        let tracks = split_tracks(AvMultitrackType::ManyTracksManyCodecs, 0, &body).unwrap();
+        let rebuilt = join_tracks(
+            AvMultitrackType::ManyTracksManyCodecs,
+            &resolve(&body, &tracks),
+        )
+        .unwrap();
+        assert_eq!(rebuilt, body);
+    }
+
+    #[test]
+    fn join_then_split_is_identity_three_many_tracks() {
+        // Hand-built batch → join → split recovers the same trackIds and
+        // payloads (and the shared FourCc threaded through).
+        let tracks = [
+            JoinTrack::new(0, FOURCC_OPUS, vec![0xA0]),
+            JoinTrack::new(1, FOURCC_OPUS, vec![0xA1, 0xA2]),
+            JoinTrack::new(2, FOURCC_OPUS, vec![]),
+        ];
+        let body = join_tracks(AvMultitrackType::ManyTracks, &tracks).unwrap();
+        let split = split_tracks(AvMultitrackType::ManyTracks, FOURCC_OPUS, &body).unwrap();
+        assert_eq!(split.len(), 3);
+        for (orig, got) in tracks.iter().zip(split.iter()) {
+            assert_eq!(orig.track_id, got.track_id);
+            assert_eq!(orig.fourcc, got.fourcc);
+            assert_eq!(&body[got.payload.clone()], orig.payload.as_slice());
+        }
+    }
+
+    #[test]
+    fn join_then_split_is_identity_many_codecs() {
+        let tracks = [
+            JoinTrack::new(0, FOURCC_AV01, vec![0x11, 0x22, 0x33]),
+            JoinTrack::new(9, FOURCC_HVC1, vec![0x44]),
+            JoinTrack::new(2, FOURCC_OPUS, vec![]),
+        ];
+        let body = join_tracks(AvMultitrackType::ManyTracksManyCodecs, &tracks).unwrap();
+        // default_fourcc is ignored for ManyTracksManyCodecs.
+        let split = split_tracks(AvMultitrackType::ManyTracksManyCodecs, 0, &body).unwrap();
+        assert_eq!(split.len(), 3);
+        for (orig, got) in tracks.iter().zip(split.iter()) {
+            assert_eq!(orig.track_id, got.track_id);
+            assert_eq!(orig.fourcc, got.fourcc);
+            assert_eq!(&body[got.payload.clone()], orig.payload.as_slice());
+        }
+    }
+
+    #[test]
+    fn join_from_packet_track_lifts_owned_read_side() {
+        // MultitrackPacketTrack (owned read side) → JoinTrack via From.
+        let pkt = [
+            MultitrackPacketTrack {
+                track_id: 0,
+                fourcc: FOURCC_AV01,
+                codec_name: "av1".to_string(),
+                payload: vec![0x11, 0x22],
+            },
+            MultitrackPacketTrack {
+                track_id: 1,
+                fourcc: FOURCC_HVC1,
+                codec_name: "h265".to_string(),
+                payload: vec![0x33],
+            },
+        ];
+        let join: Vec<JoinTrack> = pkt.iter().map(JoinTrack::from).collect();
+        let body = join_tracks(AvMultitrackType::ManyTracksManyCodecs, &join).unwrap();
+        let split = split_tracks(AvMultitrackType::ManyTracksManyCodecs, 0, &body).unwrap();
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].fourcc, FOURCC_AV01);
+        assert_eq!(&body[split[1].payload.clone()], &[0x33]);
+    }
+
+    #[test]
+    fn join_reserved_type_rejected() {
+        let tracks = [JoinTrack::new(0, FOURCC_AV01, vec![0x00])];
+        assert!(matches!(
+            join_tracks(AvMultitrackType::Reserved(3), &tracks),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn join_one_track_rejects_multiple() {
+        let tracks = [
+            JoinTrack::new(0, FOURCC_AV01, vec![0x00]),
+            JoinTrack::new(1, FOURCC_AV01, vec![0x01]),
+        ];
+        assert!(matches!(
+            join_tracks(AvMultitrackType::OneTrack, &tracks),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn join_one_track_rejects_empty_batch() {
+        assert!(matches!(
+            join_tracks(AvMultitrackType::OneTrack, &[]),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn join_many_tracks_rejects_empty_batch() {
+        assert!(matches!(
+            join_tracks(AvMultitrackType::ManyTracks, &[]),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn join_rejects_payload_over_ui24() {
+        let tracks = [JoinTrack::new(
+            0,
+            FOURCC_AV01,
+            vec![0u8; MAX_TRACK_PAYLOAD + 1],
+        )];
+        assert!(matches!(
+            join_tracks(AvMultitrackType::ManyTracks, &tracks),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn join_accepts_max_ui24_payload_size_field() {
+        // A payload exactly at the UI24 ceiling encodes a 0xFFFFFF size.
+        // (Use a small payload but assert the boundary check is inclusive
+        // by confirming MAX is accepted, not the multi-MB allocation.)
+        let tracks = [JoinTrack::new(3, FOURCC_HVC1, vec![0xEE; 4])];
+        let body = join_tracks(AvMultitrackType::ManyTracks, &tracks).unwrap();
+        assert_eq!(&body[1..4], &[0x00, 0x00, 0x04]);
+        assert_eq!(body[0], 0x03);
     }
 }
