@@ -184,6 +184,47 @@ pub fn write_aac_raw_tag<W: Write + ?Sized>(
     write_audio_tag(w, timestamp_ms, header, &payload)
 }
 
+/// Write a legacy AAC sequence-header audio tag (`SoundFormat = 10`,
+/// `AACPacketType = 0`, spec §E.4.2.1 / §E.4.2.2). The body layout is:
+///
+/// ```text
+///   0   AudioTagHeader byte  (SoundFormat=10 | SoundRate=3 | SoundSize=1
+///                             | SoundType=1 = 0xAF)
+///   1   AACPacketType UI8    (0 — AAC sequence header)
+///   2   AudioSpecificConfig  (ISO/IEC 14496-3 — the `extradata` blob)
+/// ```
+///
+/// `audio_specific_config` is the ISO 14496-3 `AudioSpecificConfig`
+/// verbatim — the exact byte sequence the demuxer lifts into
+/// `params.extradata` when it sees `AACPacketType == 0`. This is the
+/// read-side inverse of that path and the legacy-codec sibling of
+/// [`write_aac_raw_tag`] (the raw-AU writer) and
+/// [`write_aac_ex_sequence_start`] (the Enhanced-RTMP FourCc-mode
+/// `SequenceStart` writer). Per spec the `SoundRate` / `SoundSize` /
+/// `SoundType` bits for AAC are fixed at `3` (44 kHz) / 16-bit / stereo
+/// and ignored by the player (the real parameters come from the
+/// `AudioSpecificConfig`), so the header byte is `0xAF` — identical to
+/// [`write_aac_raw_tag`]; only the `AACPacketType` byte differs (`0`
+/// here, `1` there).
+pub fn write_aac_sequence_header<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    audio_specific_config: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: AUDIO_CODEC_AAC,
+        sample_rate_idx: 3,
+        is_16bit: true,
+        is_stereo: true,
+    };
+    // AACPacketType UI8 = 0 (sequence header) precedes the
+    // AudioSpecificConfig (E.4.2.2 IF AACPacketType == 0).
+    let mut payload = Vec::with_capacity(1 + audio_specific_config.len());
+    payload.push(0x00);
+    payload.extend_from_slice(audio_specific_config);
+    write_audio_tag(w, timestamp_ms, header, &payload)
+}
+
 /// Write a video tag: a one-byte [`VideoTagHeader`] followed by
 /// `payload`, wrapped in a full FLV tag via [`write_tag`] (spec
 /// §E.4.3 / §E.4.3.1).
@@ -1627,6 +1668,28 @@ mod tests {
         assert_eq!(out[11], 0xAF);
         assert_eq!(out[12], 0x01);
         assert_eq!(&out[13..16], &au);
+    }
+
+    #[test]
+    fn write_aac_sequence_header_prefixes_packet_type_zero() {
+        let mut out = Vec::new();
+        // A minimal AudioSpecificConfig (AAC-LC, 44.1 kHz, stereo).
+        let asc = [0x12, 0x10];
+        write_aac_sequence_header(&mut out, 0, &asc).unwrap();
+        assert_eq!(out[0], 0x08); // TagType = Audio
+                                  // header byte 0xAF, AACPacketType 0x00 (sequence header),
+                                  // then the AudioSpecificConfig.
+        assert_eq!(out[11], 0xAF);
+        assert_eq!(out[12], 0x00);
+        assert_eq!(&out[13..15], &asc);
+        // PreviousTagSize = 11 + DataSize(1 header + 1 type + 2 asc = 4) = 15.
+        assert_eq!(&out[15..19], &15u32.to_be_bytes());
+        // The header byte is identical to the raw-AU writer's — only the
+        // AACPacketType byte tells the two apart on the wire.
+        let mut raw = Vec::new();
+        write_aac_raw_tag(&mut raw, 0, &asc).unwrap();
+        assert_eq!(out[11], raw[11]);
+        assert_ne!(out[12], raw[12]);
     }
 
     #[test]

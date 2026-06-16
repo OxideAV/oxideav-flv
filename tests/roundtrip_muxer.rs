@@ -21,15 +21,16 @@ use oxideav_flv::{
     tag, FlvHeader,
 };
 use oxideav_flv::{
-    write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_ac3_coded_frames,
-    write_av1_coded_frames, write_av1_sequence_start, write_avc_nalu_tag,
-    write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_multichannel_config,
-    write_ex_audio_sequence_end, write_ex_audio_tag, write_ex_video_color_info,
-    write_ex_video_color_info_reset, write_ex_video_metadata, write_ex_video_sequence_end,
-    write_ex_video_tag, write_flac_coded_frames, write_flac_sequence_start, write_h263_tag,
-    write_hevc_coded_frames, write_hevc_coded_frames_x, write_hevc_sequence_start,
-    write_mp3_ex_coded_frames, write_opus_coded_frames, write_opus_sequence_start, write_vp6_tag,
-    write_vp6a_tag, write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
+    write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_aac_raw_tag,
+    write_aac_sequence_header, write_ac3_coded_frames, write_av1_coded_frames,
+    write_av1_sequence_start, write_avc_nalu_tag, write_avc_sequence_header,
+    write_eac3_coded_frames, write_ex_audio_multichannel_config, write_ex_audio_sequence_end,
+    write_ex_audio_tag, write_ex_video_color_info, write_ex_video_color_info_reset,
+    write_ex_video_metadata, write_ex_video_sequence_end, write_ex_video_tag,
+    write_flac_coded_frames, write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames,
+    write_hevc_coded_frames_x, write_hevc_sequence_start, write_mp3_ex_coded_frames,
+    write_opus_coded_frames, write_opus_sequence_start, write_vp6_tag, write_vp6a_tag,
+    write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
     write_vvc_sequence_start, AudioChannel, AudioChannelOrder, AvMultitrackType, ColorConfig,
     ColorInfo, ExAudioPacketType, ExAudioTagHeader, ExFrameType, ExPacketType, ExVideoTagHeader,
     HdrCll, HdrMdcv, ModExEntry, ModExPayload, MultichannelConfig, FOURCC_AUDIO_AAC, FOURCC_AV01,
@@ -226,6 +227,56 @@ fn avc_sequence_header_lifts_into_extradata_and_nalu_pts_uses_cto() {
     assert_eq!(packets[0], (0, 0, idr), "IDR pts/dts and body");
     assert_eq!(packets[1], (120, 40, p_au), "B-reorder pts = dts + CTS");
     assert_eq!(packets[2], (60, 80, p_au2), "negative CTS reorders pts");
+}
+
+#[test]
+fn legacy_aac_sequence_header_lifts_into_extradata_and_raw_aus_survive() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    // onMetaData carries the producer's declared rate/channels — AAC's
+    // SoundRate/SoundType bits are spec-fixed at 44 kHz/stereo and ignored.
+    let bag = MetadataBag::new()
+        .number("audiosamplerate", 48_000.0)
+        .boolean("stereo", true);
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+
+    // Synthetic AudioSpecificConfig (ISO 14496-3) — opaque to the muxer.
+    // (AAC-LC object type 2, 48 kHz index 3, stereo channel config 2.)
+    let asc = vec![0x11, 0x90];
+    write_aac_sequence_header(&mut buf, 0, &asc).unwrap();
+
+    // Two raw access units after the config record.
+    let au0 = vec![0x21, 0x1A, 0x00, 0x4E];
+    let au1 = vec![0x21, 0x1B, 0x88, 0x12, 0x34];
+    write_aac_raw_tag(&mut buf, 0, &au0).unwrap();
+    write_aac_raw_tag(&mut buf, 21, &au1).unwrap();
+
+    let mut dmx = open(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
+    assert_eq!(
+        dmx.streams()[0].params.extradata,
+        asc,
+        "legacy AAC AudioSpecificConfig must reach extradata verbatim"
+    );
+
+    let mut packets = Vec::new();
+    while let Ok(p) = dmx.next_packet() {
+        // The sequence header surfaces as a header-flagged config packet
+        // (it carries no decodable audio frame); skip it.
+        if p.flags.header {
+            continue;
+        }
+        packets.push((p.pts.unwrap_or(-1), p.data.clone()));
+    }
+    assert_eq!(
+        packets.len(),
+        2,
+        "both raw AUs must surface as data packets"
+    );
+    assert_eq!(packets[0], (0, au0), "first raw AU body + timestamp");
+    assert_eq!(packets[1], (21, au1), "second raw AU body + timestamp");
 }
 
 #[test]

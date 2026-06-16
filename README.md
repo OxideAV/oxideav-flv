@@ -446,6 +446,7 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | Generic tag | `tag::write_tag(w, type, ts_ms, stream_id, body)` | §E.4.1 |
 | MP3 audio tag | `tag::write_mp3_tag(w, ts_ms, rate_idx, is_16bit, is_stereo, frame)` | §E.4.2.1 |
 | Raw AAC audio tag | `tag::write_aac_raw_tag(w, ts_ms, raw_au)` | §E.4.2.1/2 |
+| Legacy AAC sequence header | `tag::write_aac_sequence_header(w, ts_ms, audio_specific_config)` | §E.4.2.1/2 |
 | Generic video tag | `tag::write_video_tag(w, ts_ms, VideoTagHeader, payload)` | §E.4.3.1 |
 | Sorenson H.263 (`flv1`) tag | `tag::write_h263_tag(w, ts_ms, is_keyframe, frame)` | §E.4.3.1 |
 | VP6 (`vp6f`) tag | `tag::write_vp6_tag(w, ts_ms, is_keyframe, frame)` | §E.4.3.1 |
