@@ -25,6 +25,7 @@
 pub mod amf0;
 pub mod amf3;
 pub mod color_info;
+pub mod connect;
 pub mod demuxer;
 pub mod ex_audio;
 pub mod ex_video;
@@ -42,6 +43,10 @@ use oxideav_core::ContainerRegistry;
 pub use amf0::{parse_amf0_value, AmfValue};
 pub use amf3::{parse_amf3_value, Amf3Array, Amf3Object, Amf3Value};
 pub use color_info::{ColorConfig, ColorInfo, HdrCll, HdrMdcv};
+pub use connect::{
+    parse_command_object, parse_connect_command, write_command_object, write_connect_command,
+    write_connect_command_body, CapsExMask, ConnectCommandObject, FourCcInfoMask, ScalarValue,
+};
 pub use demuxer::{open as open_demuxer, open_concrete as open_demuxer_concrete, FlvDemuxer};
 pub use ex_audio::{
     fourcc_audio_codec_id_str, AudioPacketModExType, AvMultitrackType, ExAudioPacketType,

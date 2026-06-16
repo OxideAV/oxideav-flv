@@ -473,6 +473,7 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | Typed `colorInfo` AMF body encoder | `color_info::{ColorInfo, ColorConfig, HdrCll, HdrMdcv}::encode_amf()` / `encode_amf_into` / `encode_amf_reset` | enhanced-rtmp v2 §`ColorInfo` |
 | AMF0 writers | `amf0::{write_number, write_boolean, write_null, write_string, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 |
 | NetConnection `onStatus` command (incl. reconnect request) | `on_status::write_on_status_command(&OnStatusInfo)` / `write_on_status_command_body` / `reconnect_request(tc_url, description)` | enhanced-rtmp v2 §"Reconnect Request" |
+| NetConnection `connect` command (E-RTMP capability declaration) | `connect::write_connect_command(txn, &ConnectCommandObject)` / `write_command_object` / `parse_connect_command` | enhanced-rtmp v2 §"Enhancing NetConnection connect Command" |
 | `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |
 | `onMetaData.keyframes` seek-table composite | `MetadataBag::keyframes(file_positions, times_seconds)` + AMF0 `write_strict_array_number` | §E.4.4.7 / §E.4.4.9 |
 | `onCuePoint` script tag (Annex A embedded cue point) | `script::write_on_cue_point(w, ts_ms, &CuePointParams)` | Annex A.2 |
@@ -530,6 +531,32 @@ recovers the typed `OnStatusInfo` from the command bytes, closing the
 read↔write loop: the Info Object string properties are routed back into
 `code` / `level` / `description` / `tcUrl`, every other string property
 into `extra` in bitstream order, and non-string properties are ignored.
+
+The `connect` module wires the *client→server* side of the same
+handshake: the Enhanced-RTMP-v2 §"Enhancing NetConnection connect
+Command" capability declaration the client sends so the server knows
+which enhanced codecs and protocol features it supports — the same
+declaration a server reads before deciding whether it may issue a
+`NetConnection.Connect.ReconnectRequest`. The typed
+[`ConnectCommandObject`] builder carries the four E-RTMP-new Command
+Object properties: `fourCcList` (legacy strict-array codec list, `["*"]`
+wildcard supported), `videoFourCcInfoMap` / `audioFourCcInfoMap`
+(per-codec [`FourCcInfoMask`] flags `CanDecode` / `CanEncode` /
+`CanForward`, keyed by FourCC string with the `"*"` catch-all), and
+`capsEx` ([`CapsExMask`] `Reconnect` / `Multitrack` / `ModEx` /
+`TimestampNanoOffset`). Any other Command Object property (`app` /
+`tcUrl` / `flashVer` / `objectEncoding` / `audioCodecs` / `videoCodecs`
+…) is preserved in `extra` (String / Number / Boolean) in insertion
+order. `connect::write_connect_command(txn, &obj)` emits the full AMF0
+command sequence (`"connect"`, transaction id, Command Object);
+`connect::parse_connect_command(&bytes)` closes the read↔write loop —
+routing the four E-RTMP properties back into their typed fields,
+preserving reserved capability bits verbatim, and clamping a forged
+out-of-range `capsEx` Number to `0` rather than panicking the cast.
+`ConnectCommandObject::supports_reconnect()` / `supports_multitrack()`
+answer the spec's capability question directly. Since `connect` is an
+RTMP command message (not an FLV `SCRIPTDATA` tag), the writers emit the
+bare AMF0 sequence with no FLV tag framing, mirroring `on_status`.
 
 The video tag writers all share the same `VideoTagHeader` / `FrameType`
 model the demuxer uses; `write_avc_nalu_tag` packs `pts - dts` as the

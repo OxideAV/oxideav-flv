@@ -390,6 +390,27 @@ pub fn write_strict_array_number<W: Write + ?Sized>(w: &mut W, values: &[f64]) -
     Ok(())
 }
 
+/// Write an AMF0 Strict-array value of Strings — marker `0x0A`, UI32 BE
+/// `StrictArrayLength`, then `len(values)` String values each emitted
+/// with the standard String marker (spec §E.4.4.9 SCRIPTDATASTRICTARRAY,
+/// §E.4.4.2 type 10, String §2.4). No terminator follows the list per
+/// the spec. Used for the Enhanced-RTMP-v2 `connect` Command Object
+/// `fourCcList` property (a strict array of dense ordinal FourCC strings).
+pub fn write_strict_array_string<W: Write + ?Sized>(w: &mut W, values: &[&str]) -> Result<()> {
+    if values.len() > u32::MAX as usize {
+        return Err(Error::invalid(format!(
+            "AMF0: strict-array length {} exceeds UI32 max",
+            values.len()
+        )));
+    }
+    w.write_all(&[0x0A])?;
+    w.write_all(&(values.len() as u32).to_be_bytes())?;
+    for s in values {
+        write_string(w, s)?;
+    }
+    Ok(())
+}
+
 /// Shared helper: UI16 BE length + UTF-8 bytes.
 fn write_utf8_u16<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
     let bytes = s.as_bytes();
