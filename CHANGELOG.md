@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-flv/compare/v0.0.5...v0.0.6) - 2026-06-18
+
+### Other
+
+- AMF0 Date (SCRIPTDATADATE §E.4.4.3) muxer support
+- connect per-codec capability queries (FourCcInfoMap wildcard-override)
+- legacy AAC sequence-header muxer writer (write_aac_sequence_header)
+- Enhanced-RTMP-v2 NetConnection connect command capability declaration
+- Enhanced-RTMP-v2 onStatus command + Reconnect Request (on_status module)
+- join_tracks body serialiser — write-side inverse of split_tracks
+
 ### Other
 
 - AMF0 Date (`SCRIPTDATADATE`, §E.4.4.3) muxer support — closes the read↔write asymmetry where the demuxer parsed an `onMetaData` Date value (surfaced as the `"date:<ms>tz:<offset>"` carrier the typed `creationdate_as_date` accessor decodes) but the muxer could not emit one. New `amf0::write_date(w, time_ms, tz)` (marker `0x0B` + f64 BE ms + i16 BE `LocalDateTimeOffset` in minutes), a `MetaValue::Date { time_ms, tz }` variant, and a `MetadataBag::date(key, time_ms, tz)` builder so a producer can stamp `creationdate` as an AMF0 Date. Non-finite `time_ms` is rejected with `Error::invalid`. Round-trips bit-exactly through `FlvDemuxer` into the `metadata["creationdate"] = "date:<ms>tz:<offset>"` carrier and back through `TypedMetadata::creationdate_as_date`. 6 new tests (2 `amf0` writer round-trips incl. negative tz, 3 `script` body parse / negative-tz / non-finite-reject, 1 `roundtrip_muxer` mux→demux→typed-accessor)
