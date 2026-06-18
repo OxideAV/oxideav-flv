@@ -333,6 +333,21 @@ pub fn write_string<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
     write_utf8_u16(w, s)
 }
 
+/// Write an AMF0 Date value — marker `0x0B` + 8-byte BE IEEE-754 double
+/// `DateTime` (milliseconds since Jan 1 1970 UTC) + SI16 BE
+/// `LocalDateTimeOffset` (local time offset in minutes from UTC, spec
+/// SCRIPTDATADATE / §E.4.4.3). The offset is negative for time zones
+/// west of Greenwich and positive for zones east of it. This is the
+/// write-side inverse of the [`AmfValue::Date`] parse arm — the
+/// `(time_ms, tz)` pair round-trips byte-for-byte through
+/// [`parse_amf0_value`].
+pub fn write_date<W: Write + ?Sized>(w: &mut W, time_ms: f64, tz: i16) -> Result<()> {
+    w.write_all(&[0x0B])?;
+    w.write_all(&time_ms.to_be_bytes())?;
+    w.write_all(&tz.to_be_bytes())?;
+    Ok(())
+}
+
 /// Write a bare AMF0 property name — the UI16-length-prefixed UTF-8
 /// string that precedes each value inside an Object / ECMA array body
 /// (SCRIPTDATASTRING, spec E.4.4.10). No type marker.
@@ -691,6 +706,43 @@ mod tests {
         assert_eq!(u16::from_be_bytes([b[1], b[2]]), 10);
         let (v, p) = parse_amf0_value(&b, 0).unwrap();
         assert_eq!(v, AmfValue::String("onMetaData".into()));
+        assert_eq!(p, b.len());
+    }
+
+    #[test]
+    fn write_date_round_trips_through_parse() {
+        // 2025-01-01T00:00:00Z = 1_735_689_600_000 ms; JST = +540 min.
+        let mut b = Vec::new();
+        write_date(&mut b, 1_735_689_600_000.0, 540).unwrap();
+        // marker 0x0B + 8-byte BE double + SI16 BE offset = 11 bytes.
+        assert_eq!(b.len(), 11);
+        assert_eq!(b[0], 0x0B);
+        assert_eq!(i16::from_be_bytes([b[9], b[10]]), 540);
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(
+            v,
+            AmfValue::Date {
+                time_ms: 1_735_689_600_000.0,
+                tz: 540
+            }
+        );
+        assert_eq!(p, b.len());
+    }
+
+    #[test]
+    fn write_date_round_trips_negative_offset() {
+        // A zone west of Greenwich carries a negative SI16 offset
+        // (spec SCRIPTDATADATE: "west of Greenwich … negative number").
+        let mut b = Vec::new();
+        write_date(&mut b, 0.0, -480).unwrap();
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(
+            v,
+            AmfValue::Date {
+                time_ms: 0.0,
+                tz: -480
+            }
+        );
         assert_eq!(p, b.len());
     }
 

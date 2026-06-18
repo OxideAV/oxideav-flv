@@ -472,7 +472,7 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | Ex-video HDR `colorInfo` metadata tag | `tag::write_ex_video_color_info(w, ts_ms, fourcc, &ColorInfo)` | enhanced-rtmp v2 §"Metadata Frame" |
 | Ex-video HDR `colorInfo` reset (`Undefined`) | `tag::write_ex_video_color_info_reset(w, ts_ms, fourcc)` | enhanced-rtmp v2 §"Metadata Frame" |
 | Typed `colorInfo` AMF body encoder | `color_info::{ColorInfo, ColorConfig, HdrCll, HdrMdcv}::encode_amf()` / `encode_amf_into` / `encode_amf_reset` | enhanced-rtmp v2 §`ColorInfo` |
-| AMF0 writers | `amf0::{write_number, write_boolean, write_null, write_string, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 |
+| AMF0 writers | `amf0::{write_number, write_boolean, write_null, write_string, write_date, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 / SCRIPTDATADATE §E.4.4.3 |
 | NetConnection `onStatus` command (incl. reconnect request) | `on_status::write_on_status_command(&OnStatusInfo)` / `write_on_status_command_body` / `reconnect_request(tc_url, description)` | enhanced-rtmp v2 §"Reconnect Request" |
 | NetConnection `connect` command (E-RTMP capability declaration) | `connect::write_connect_command(txn, &ConnectCommandObject)` / `write_command_object` / `parse_connect_command` | enhanced-rtmp v2 §"Enhancing NetConnection connect Command" |
 | `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |
@@ -482,8 +482,11 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 
 `write_tag` returns the total bytes written (`11 + body.len() + 4`) and
 emits the trailing `PreviousTagSize = 11 + DataSize` back-pointer.
-`MetadataBag` is an ordered bag of the three AMF0 scalar property types
-(Number / Boolean / String) plus the `keyframes` seek-table composite
+`MetadataBag` is an ordered bag of the four AMF0 scalar property types
+(Number / Boolean / String / Date — `MetadataBag::date(key, time_ms, tz)`
+emits a SCRIPTDATADATE the demuxer surfaces under the
+`"date:<ms>tz:<offset>"` carrier and `TypedMetadata::creationdate_as_date`
+decodes back into the `(time_ms, tz)` pair) plus the `keyframes` seek-table composite
 (`MetaValue::Keyframes { file_positions: Vec<u64>, times_seconds:
 Vec<f64> }`, emitted as an anonymous AMF0 Object carrying two parallel
 SCRIPTDATASTRICTARRAY properties `filepositions` and `times`); insertion

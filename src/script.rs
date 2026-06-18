@@ -63,6 +63,21 @@ pub enum MetaValue {
     Boolean(bool),
     /// AMF0 String — e.g. `encoder`, `metadatacreator`.
     String(String),
+    /// AMF0 Date (SCRIPTDATADATE, spec §E.4.4.3) — e.g. a `creationdate`
+    /// the producer stamps as a typed date rather than a free-form
+    /// string. `time_ms` is the DOUBLE `DateTime` (milliseconds since
+    /// Jan 1 1970 UTC); `tz` is the SI16 `LocalDateTimeOffset` (local
+    /// time offset in minutes from UTC — negative west of Greenwich,
+    /// positive east). The demuxer flattens this on the read side into
+    /// the `"date:<ms>tz:<offset>"` carrier string surfaced under the
+    /// property name, which [`crate::TypedMetadata::creationdate_as_date`]
+    /// decodes back into the `(time_ms, tz)` pair.
+    Date {
+        /// Milliseconds since Jan 1 1970 UTC.
+        time_ms: f64,
+        /// Local time offset in minutes from UTC.
+        tz: i16,
+    },
     /// `onMetaData.keyframes` seek-table — two parallel arrays of equal
     /// length. `file_positions[i]` is the absolute byte offset of the
     /// i-th video keyframe tag (the TagType byte, *not* the preceding
@@ -120,6 +135,21 @@ impl MetadataBag {
     pub fn string(mut self, key: &str, s: &str) -> Self {
         self.entries
             .push((key.to_string(), MetaValue::String(s.to_string())));
+        self
+    }
+
+    /// Append an AMF0 Date property (SCRIPTDATADATE, spec §E.4.4.3) and
+    /// return `self` for chaining. `time_ms` is the milliseconds-since-
+    /// epoch `DateTime`; `tz` is the `LocalDateTimeOffset` in minutes
+    /// from UTC (negative west of Greenwich, positive east). Producers
+    /// use this for a typed `creationdate` — the demuxer surfaces it as
+    /// the `"date:<ms>tz:<offset>"` carrier the regular
+    /// [`crate::TypedMetadata::creationdate`] accessor returns and
+    /// [`crate::TypedMetadata::creationdate_as_date`] decodes into the
+    /// `(time_ms, tz)` pair.
+    pub fn date(mut self, key: &str, time_ms: f64, tz: i16) -> Self {
+        self.entries
+            .push((key.to_string(), MetaValue::Date { time_ms, tz }));
         self
     }
 
@@ -183,6 +213,15 @@ pub fn write_on_metadata_body(out: &mut Vec<u8>, bag: &MetadataBag) -> Result<()
             MetaValue::Number(n) => amf0::write_number(out, *n)?,
             MetaValue::Boolean(b) => amf0::write_boolean(out, *b)?,
             MetaValue::String(s) => amf0::write_string(out, s)?,
+            MetaValue::Date { time_ms, tz } => {
+                if !time_ms.is_finite() {
+                    return Err(Error::invalid(format!(
+                        "FLV onMetaData Date property {key:?}: \
+                         time_ms must be finite (saw {time_ms})"
+                    )));
+                }
+                amf0::write_date(out, *time_ms, *tz)?;
+            }
             MetaValue::Keyframes {
                 file_positions,
                 times_seconds,
@@ -505,6 +544,51 @@ mod tests {
             }
             other => panic!("expected ecma array, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn date_property_round_trips_through_parser() {
+        // creationdate stamped as an AMF0 Date (2025-01-01T00:00:00Z,
+        // JST +540 min) rather than a free-form string.
+        let bag = MetadataBag::new().number("duration", 2.0).date(
+            "creationdate",
+            1_735_689_600_000.0,
+            540,
+        );
+        let mut body = Vec::new();
+        write_on_metadata_body(&mut body, &bag).unwrap();
+
+        let (name, p) = parse_amf0_value(&body, 0).unwrap();
+        assert_eq!(name, AmfValue::String("onMetaData".into()));
+        let (value, np) = parse_amf0_value(&body, p).unwrap();
+        assert_eq!(np, body.len());
+        match value {
+            AmfValue::EcmaArray(props) => {
+                assert_eq!(props.len(), 2);
+                assert_eq!(props[0], ("duration".into(), AmfValue::Number(2.0)));
+                assert_eq!(
+                    props[1],
+                    (
+                        "creationdate".into(),
+                        AmfValue::Date {
+                            time_ms: 1_735_689_600_000.0,
+                            tz: 540
+                        }
+                    )
+                );
+            }
+            other => panic!("expected ecma array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn date_property_rejects_non_finite_time() {
+        let bag = MetadataBag::new().date("creationdate", f64::NAN, 0);
+        let mut body = Vec::new();
+        assert!(matches!(
+            write_on_metadata_body(&mut body, &bag),
+            Err(Error::InvalidData(_))
+        ));
     }
 
     #[test]

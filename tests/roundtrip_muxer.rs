@@ -112,6 +112,59 @@ fn on_metadata_keys_read_back_identically() {
 }
 
 #[test]
+fn on_metadata_date_property_round_trips_through_typed_accessor() {
+    use oxideav_flv::TypedMetadata;
+
+    // Mux a `creationdate` stamped as an AMF0 Date (SCRIPTDATADATE,
+    // §E.4.4.3) rather than a free-form string: 2025-01-01T00:00:00Z
+    // = 1_735_689_600_000 ms, JST local offset +540 min.
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let bag =
+        MetadataBag::new()
+            .number("duration", 1.0)
+            .date("creationdate", 1_735_689_600_000.0, 540);
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+    tag::write_mp3_tag(&mut buf, 0, 3, true, true, &mp3_frames()[0]).unwrap();
+
+    let dmx = open(buf);
+    let md = dmx.metadata();
+
+    // The demuxer surfaces the Date under the `"date:<ms>tz:<offset>"`
+    // carrier, exactly as it does for an externally-produced FLV.
+    let raw = md
+        .iter()
+        .find(|(k, _)| k == "creationdate")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(raw, Some("date:1735689600000tz:540"));
+
+    // The typed accessor decodes the carrier back into the (ms, tz) pair.
+    let typed = TypedMetadata::new(md);
+    assert_eq!(
+        typed.creationdate_as_date(),
+        Some((1_735_689_600_000.0, 540))
+    );
+}
+
+#[test]
+fn on_metadata_date_round_trips_negative_offset() {
+    use oxideav_flv::TypedMetadata;
+
+    // A zone west of Greenwich carries a negative LocalDateTimeOffset.
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let bag = MetadataBag::new().date("creationdate", 0.0, -480);
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+    tag::write_mp3_tag(&mut buf, 0, 3, true, true, &mp3_frames()[0]).unwrap();
+
+    let dmx = open(buf);
+    let typed = TypedMetadata::new(dmx.metadata());
+    assert_eq!(typed.creationdate_as_date(), Some((0.0, -480)));
+}
+
+#[test]
 fn single_audio_stream_is_mp3() {
     let (bytes, _) = build_flv();
     let dmx = open(bytes);
