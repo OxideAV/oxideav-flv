@@ -229,6 +229,90 @@ impl ConnectCommandObject {
         self.caps_ex
             .is_some_and(|c| c & CapsExMask::MULTITRACK != 0)
     }
+
+    /// `true` when this Command Object advertises that the peer can parse
+    /// the ModEx signal via `capsEx & CapsExMask.ModEx`.
+    pub fn supports_mod_ex(&self) -> bool {
+        self.caps_ex.is_some_and(|c| c & CapsExMask::MOD_EX != 0)
+    }
+
+    /// `true` when this Command Object advertises nanosecond
+    /// timestamp-offset support via `capsEx & CapsExMask.TimestampNanoOffset`.
+    pub fn supports_timestamp_nano_offset(&self) -> bool {
+        self.caps_ex
+            .is_some_and(|c| c & CapsExMask::TIMESTAMP_NANO_OFFSET != 0)
+    }
+
+    /// The *effective* [`FourCcInfoMask`] capability flags for a video
+    /// FourCC, honouring the wildcard-override rule of the §"Enhancing
+    /// NetConnection connect Command" extension: a `"*"` key, when present,
+    /// "overrides the flags set on properties for specific codecs". A bit
+    /// is set in the result when it is set on the codec's own
+    /// `videoFourCcInfoMap` entry **or** on the wildcard `"*"` entry, so a
+    /// `"*": CanForward` declaration reports `CanForward` for every codec
+    /// regardless of its individual flags.
+    ///
+    /// Returns `0` when neither the codec nor the wildcard is present, or
+    /// when no `videoFourCcInfoMap` was sent.
+    pub fn video_codec_caps(&self, fourcc: &str) -> u32 {
+        info_map_caps(self.video_four_cc_info_map.as_deref(), fourcc)
+    }
+
+    /// The *effective* [`FourCcInfoMask`] capability flags for an audio
+    /// FourCC, honouring the same wildcard-override rule as
+    /// [`video_codec_caps`](Self::video_codec_caps).
+    pub fn audio_codec_caps(&self, fourcc: &str) -> u32 {
+        info_map_caps(self.audio_four_cc_info_map.as_deref(), fourcc)
+    }
+
+    /// `true` when the peer declares it can decode the given video FourCC
+    /// (`video_codec_caps(fourcc) & FourCcInfoMask::CAN_DECODE`).
+    pub fn can_decode_video(&self, fourcc: &str) -> bool {
+        self.video_codec_caps(fourcc) & FourCcInfoMask::CAN_DECODE != 0
+    }
+
+    /// `true` when the peer declares it can encode the given video FourCC.
+    pub fn can_encode_video(&self, fourcc: &str) -> bool {
+        self.video_codec_caps(fourcc) & FourCcInfoMask::CAN_ENCODE != 0
+    }
+
+    /// `true` when the peer declares it can forward the given video FourCC.
+    pub fn can_forward_video(&self, fourcc: &str) -> bool {
+        self.video_codec_caps(fourcc) & FourCcInfoMask::CAN_FORWARD != 0
+    }
+
+    /// `true` when the peer declares it can decode the given audio FourCC
+    /// (`audio_codec_caps(fourcc) & FourCcInfoMask::CAN_DECODE`).
+    pub fn can_decode_audio(&self, fourcc: &str) -> bool {
+        self.audio_codec_caps(fourcc) & FourCcInfoMask::CAN_DECODE != 0
+    }
+
+    /// `true` when the peer declares it can encode the given audio FourCC.
+    pub fn can_encode_audio(&self, fourcc: &str) -> bool {
+        self.audio_codec_caps(fourcc) & FourCcInfoMask::CAN_ENCODE != 0
+    }
+
+    /// `true` when the peer declares it can forward the given audio FourCC.
+    pub fn can_forward_audio(&self, fourcc: &str) -> bool {
+        self.audio_codec_caps(fourcc) & FourCcInfoMask::CAN_FORWARD != 0
+    }
+}
+
+/// Resolve the effective capability mask for `fourcc` against a
+/// `[audio|video]FourCcInfoMap`, OR-folding the codec's own entry with the
+/// wildcard `"*"` entry per the spec's wildcard-override rule. Returns `0`
+/// when the map is absent or carries neither the codec nor the wildcard.
+fn info_map_caps(map: Option<&[(String, u32)]>, fourcc: &str) -> u32 {
+    let Some(map) = map else {
+        return 0;
+    };
+    let mut caps = 0;
+    for (key, mask) in map {
+        if key == fourcc || key == FOURCC_WILDCARD {
+            caps |= *mask;
+        }
+    }
+    caps
 }
 
 /// Serialise just the `connect` Command Object (the anonymous AMF0
@@ -493,6 +577,90 @@ mod tests {
                 FourCcInfoMask::CAN_DECODE | FourCcInfoMask::CAN_ENCODE
             )
         );
+    }
+
+    #[test]
+    fn codec_caps_query_honours_own_entry() {
+        let obj = ConnectCommandObject::new()
+            .video_codec(
+                "vp09",
+                FourCcInfoMask::CAN_DECODE | FourCcInfoMask::CAN_ENCODE,
+            )
+            .audio_codec("Opus", FourCcInfoMask::CAN_DECODE);
+        assert_eq!(
+            obj.video_codec_caps("vp09"),
+            FourCcInfoMask::CAN_DECODE | FourCcInfoMask::CAN_ENCODE
+        );
+        assert!(obj.can_decode_video("vp09"));
+        assert!(obj.can_encode_video("vp09"));
+        assert!(!obj.can_forward_video("vp09"));
+        assert!(obj.can_decode_audio("Opus"));
+        assert!(!obj.can_encode_audio("Opus"));
+        // A codec not declared (and no wildcard) reports no capability.
+        assert_eq!(obj.video_codec_caps("av01"), 0);
+        assert!(!obj.can_decode_video("av01"));
+    }
+
+    #[test]
+    fn wildcard_overrides_per_codec_caps() {
+        // Spec example: "*": CanForward means all codecs are forwarded
+        // regardless of their individual flags. The wildcard ORs into
+        // every codec's effective mask.
+        let obj = ConnectCommandObject::new()
+            .video_codec(FOURCC_WILDCARD, FourCcInfoMask::CAN_FORWARD)
+            .video_codec("vp09", FourCcInfoMask::CAN_DECODE);
+        // vp09: its own CanDecode plus the wildcard CanForward.
+        assert_eq!(
+            obj.video_codec_caps("vp09"),
+            FourCcInfoMask::CAN_DECODE | FourCcInfoMask::CAN_FORWARD
+        );
+        assert!(obj.can_decode_video("vp09"));
+        assert!(obj.can_forward_video("vp09"));
+        // A codec with no explicit entry still inherits the wildcard.
+        assert_eq!(obj.video_codec_caps("hvc1"), FourCcInfoMask::CAN_FORWARD);
+        assert!(obj.can_forward_video("hvc1"));
+        assert!(!obj.can_decode_video("hvc1"));
+    }
+
+    #[test]
+    fn codec_caps_absent_map_is_zero() {
+        let obj = ConnectCommandObject::new().caps_ex(CapsExMask::RECONNECT);
+        assert_eq!(obj.video_codec_caps("vp09"), 0);
+        assert_eq!(obj.audio_codec_caps("Opus"), 0);
+        assert!(!obj.can_decode_video("vp09"));
+        assert!(!obj.can_forward_audio("Opus"));
+    }
+
+    #[test]
+    fn codec_caps_survive_round_trip() {
+        let obj = ConnectCommandObject::new()
+            .video_codec(FOURCC_WILDCARD, FourCcInfoMask::CAN_FORWARD)
+            .video_codec("av01", FourCcInfoMask::CAN_DECODE)
+            .audio_codec(
+                "Opus",
+                FourCcInfoMask::CAN_DECODE | FourCcInfoMask::CAN_ENCODE,
+            );
+        let bytes = write_connect_command(1.0, &obj).unwrap();
+        let back = parse_connect_command(&bytes).unwrap();
+        assert!(back.can_decode_video("av01"));
+        assert!(back.can_forward_video("av01")); // via wildcard
+        assert!(back.can_forward_video("hvc1")); // wildcard catch-all
+        assert!(back.can_encode_audio("Opus"));
+    }
+
+    #[test]
+    fn caps_ex_mod_ex_and_nano_offset_queries() {
+        let obj = ConnectCommandObject::new()
+            .caps_ex(CapsExMask::MOD_EX | CapsExMask::TIMESTAMP_NANO_OFFSET);
+        assert!(obj.supports_mod_ex());
+        assert!(obj.supports_timestamp_nano_offset());
+        assert!(!obj.supports_reconnect());
+        assert!(!obj.supports_multitrack());
+        // Round-trips through the wire form.
+        let bytes = write_connect_command(1.0, &obj).unwrap();
+        let back = parse_connect_command(&bytes).unwrap();
+        assert!(back.supports_mod_ex());
+        assert!(back.supports_timestamp_nano_offset());
     }
 
     #[test]

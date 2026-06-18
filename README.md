@@ -554,8 +554,17 @@ command sequence (`"connect"`, transaction id, Command Object);
 routing the four E-RTMP properties back into their typed fields,
 preserving reserved capability bits verbatim, and clamping a forged
 out-of-range `capsEx` Number to `0` rather than panicking the cast.
-`ConnectCommandObject::supports_reconnect()` / `supports_multitrack()`
-answer the spec's capability question directly. Since `connect` is an
+`ConnectCommandObject::supports_reconnect()` / `supports_multitrack()` /
+`supports_mod_ex()` / `supports_timestamp_nano_offset()` answer the
+`capsEx` protocol-capability questions directly, and the per-codec
+`video_codec_caps(fourcc)` / `audio_codec_caps(fourcc)` (plus the
+`can_decode_video` / `can_encode_video` / `can_forward_video` +
+audio-side booleans) resolve the *effective* [`FourCcInfoMask`] for a
+given FourCC honouring the spec's wildcard-override rule: a `"*"` key,
+when present, OR-folds its flags into every codec's mask, so a
+`videoFourCcInfoMap = {"*": CanForward, "vp09": CanDecode}` reports
+`CanDecode | CanForward` for `vp09` and a bare `CanForward` for any
+codec without its own entry. Since `connect` is an
 RTMP command message (not an FLV `SCRIPTDATA` tag), the writers emit the
 bare AMF0 sequence with no FLV tag framing, mirroring `on_status`.
 
