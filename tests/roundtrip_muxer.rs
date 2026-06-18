@@ -112,6 +112,36 @@ fn on_metadata_keys_read_back_identically() {
 }
 
 #[test]
+fn on_metadata_date_creationdate_round_trips() {
+    use oxideav_flv::TypedMetadata;
+
+    // 14 Nov 2023 22:13:20 UTC, +120 min (UTC+2) offset.
+    const MS: f64 = 1_700_000_000_000.0;
+    const TZ: i16 = 120;
+
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let bag = MetadataBag::new()
+        .number("duration", 2.0)
+        .date("creationdate", MS, TZ);
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+    // One MP3 tag so a stream is minted.
+    tag::write_mp3_tag(&mut buf, 0, 3, true, true, &[0xFF, 0xFB, 0x90, 0x00]).unwrap();
+
+    let dmx = open(buf);
+    let md = dmx.metadata();
+    let lookup = |k: &str| md.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+    // The demuxer flattens an AMF0 Date to the `date:<ms>tz:<offset>`
+    // carrier — exactly what the writer must round-trip into.
+    assert_eq!(lookup("creationdate"), Some("date:1700000000000tz:120"));
+
+    // And the typed accessor decodes the carrier back to (ms, tz).
+    let typed = TypedMetadata::new(md);
+    assert_eq!(typed.creationdate_as_date(), Some((MS, TZ)));
+}
+
+#[test]
 fn single_audio_stream_is_mp3() {
     let (bytes, _) = build_flv();
     let dmx = open(bytes);

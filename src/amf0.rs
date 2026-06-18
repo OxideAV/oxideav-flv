@@ -333,6 +333,23 @@ pub fn write_string<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
     write_utf8_u16(w, s)
 }
 
+/// Write an AMF0 Date value — marker `0x0B`, an 8-byte BE IEEE-754
+/// double carrying milliseconds since the Unix epoch (1 Jan 1970 UTC),
+/// then a UI16-slot SI16 BE `LocalDateTimeOffset` in minutes from UTC
+/// (negative west of Greenwich, positive east), per spec §E.4.4.3
+/// SCRIPTDATADATE / AMF0 §2.13. The inverse of the `0x0B` arm in
+/// [`parse_amf0_value`], which surfaces the pair as
+/// [`AmfValue::Date`]; emitting `time_ms` / `tz` here and parsing it
+/// back yields the identical pair, and the demuxer flattens it to the
+/// `"date:<ms>tz:<offset>"` carrier the typed `creationdate_as_date`
+/// accessor decodes.
+pub fn write_date<W: Write + ?Sized>(w: &mut W, time_ms: f64, tz: i16) -> Result<()> {
+    w.write_all(&[0x0B])?;
+    w.write_all(&time_ms.to_be_bytes())?;
+    w.write_all(&tz.to_be_bytes())?;
+    Ok(())
+}
+
 /// Write a bare AMF0 property name — the UI16-length-prefixed UTF-8
 /// string that precedes each value inside an Object / ECMA array body
 /// (SCRIPTDATASTRING, spec E.4.4.10). No type marker.
@@ -680,6 +697,39 @@ mod tests {
         let (v, p) = parse_amf0_value(&b, 0).unwrap();
         assert_eq!(v, AmfValue::Null);
         assert_eq!(p, 1);
+    }
+
+    #[test]
+    fn write_date_round_trips() {
+        let mut b = Vec::new();
+        write_date(&mut b, 1_700_000_000_000.0, 120).unwrap();
+        // marker 0x0B + 8-byte f64 BE ms + 2-byte i16 BE tz.
+        assert_eq!(b[0], 0x0B);
+        assert_eq!(b.len(), 11);
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(
+            v,
+            AmfValue::Date {
+                time_ms: 1_700_000_000_000.0,
+                tz: 120
+            }
+        );
+        assert_eq!(p, b.len());
+    }
+
+    #[test]
+    fn write_date_round_trips_negative_tz() {
+        let mut b = Vec::new();
+        write_date(&mut b, 0.0, -480).unwrap();
+        let (v, p) = parse_amf0_value(&b, 0).unwrap();
+        assert_eq!(
+            v,
+            AmfValue::Date {
+                time_ms: 0.0,
+                tz: -480
+            }
+        );
+        assert_eq!(p, b.len());
     }
 
     #[test]

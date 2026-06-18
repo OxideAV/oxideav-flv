@@ -476,6 +476,7 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | NetConnection `onStatus` command (incl. reconnect request) | `on_status::write_on_status_command(&OnStatusInfo)` / `write_on_status_command_body` / `reconnect_request(tc_url, description)` | enhanced-rtmp v2 §"Reconnect Request" |
 | NetConnection `connect` command (E-RTMP capability declaration) | `connect::write_connect_command(txn, &ConnectCommandObject)` / `write_command_object` / `parse_connect_command` | enhanced-rtmp v2 §"Enhancing NetConnection connect Command" |
 | `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |
+| AMF0 Date `onMetaData` property | `MetadataBag::date(key, time_ms, tz)` + `amf0::write_date(w, time_ms, tz)` | §E.4.4.3 SCRIPTDATADATE |
 | `onMetaData.keyframes` seek-table composite | `MetadataBag::keyframes(file_positions, times_seconds)` + AMF0 `write_strict_array_number` | §E.4.4.7 / §E.4.4.9 |
 | `onCuePoint` script tag (Annex A embedded cue point) | `script::write_on_cue_point(w, ts_ms, &CuePointParams)` | Annex A.2 |
 | `onXMPData` script tag (XMP metadata) | `script::write_on_xmp_data(w, ts_ms, live_xml)` | §E.6 |
@@ -483,7 +484,11 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 `write_tag` returns the total bytes written (`11 + body.len() + 4`) and
 emits the trailing `PreviousTagSize = 11 + DataSize` back-pointer.
 `MetadataBag` is an ordered bag of the three AMF0 scalar property types
-(Number / Boolean / String) plus the `keyframes` seek-table composite
+(Number / Boolean / String), the AMF0 Date type (`MetaValue::Date`, §E.4.4.3
+SCRIPTDATADATE — `time_ms` since the Unix epoch + `tz` minutes-from-UTC,
+the read-side inverse of the demuxer's `"date:<ms>tz:<offset>"` carrier for
+a `creationdate` stamped as a Date rather than a free-form String), plus the
+`keyframes` seek-table composite
 (`MetaValue::Keyframes { file_positions: Vec<u64>, times_seconds:
 Vec<f64> }`, emitted as an anonymous AMF0 Object carrying two parallel
 SCRIPTDATASTRICTARRAY properties `filepositions` and `times`); insertion
