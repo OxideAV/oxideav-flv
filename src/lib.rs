@@ -42,7 +42,7 @@ pub mod typed_meta;
 use oxideav_core::ContainerRegistry;
 
 pub use amf0::{parse_amf0_value, AmfValue};
-pub use amf3::{parse_amf3_value, Amf3Array, Amf3Object, Amf3Value};
+pub use amf3::{parse_amf3_value, write_amf3_value, Amf3Array, Amf3Object, Amf3Value};
 pub use color_info::{ColorConfig, ColorInfo, HdrCll, HdrMdcv};
 pub use connect::{
     parse_command_object, parse_connect_command, write_command_object, write_connect_command,

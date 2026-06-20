@@ -1,4 +1,4 @@
-//! Minimal AMF3 (Action Message Format 3, "AVM+") decoder.
+//! AMF3 (Action Message Format 3, "AVM+") decoder + encoder.
 //!
 //! Reference: Adobe *AMF 3 Specification* (Dec 2007), staged at
 //! `docs/container/adobe/amf3_spec_121207.pdf`. AMF3 is the on-wire
@@ -68,10 +68,31 @@
 //! callers can detect that the producer used the custom encoding and
 //! handle the class themselves if they know its private grammar.
 //!
+//! ## Encoding
+//!
+//! [`write_amf3_value`] is the inverse of [`parse_amf3_value`]: it
+//! serialises an [`Amf3Value`] tree back to AMF3 bytes. The encoder is
+//! a **literal-first** serialiser — every complex value (Array / Date /
+//! Object / XML / XMLDocument / ByteArray) is emitted as a fresh literal
+//! rather than a back-reference, because the [`Amf3Value`] model is a
+//! tree (no shared identity to dedup against) and an all-literal stream
+//! is a valid AMF3 message that decodes to the identical value graph.
+//! The one place references are used is the **string table** (§3.8):
+//! repeated non-empty string literals (sealed-property names, class
+//! aliases, assoc / dynamic keys, and `String` values) are emitted by
+//! reference the second time they appear, exactly mirroring the order in
+//! which the decoder populates its string table, so `parse ∘ write` and
+//! `write ∘ parse` are both identity. The empty string is always a
+//! literal (§3.8: "never sent by reference").
+//!
+//! Externalizable objects round-trip the flag and class name but carry
+//! no body (the decoder reads zero body bytes; the encoder writes zero),
+//! matching the module's no-recipe stance.
+//!
 //! ## What is intentionally NOT implemented
 //!
-//! * Re-encoding — this is a decoder only. AMF3 muxing is unused by FLV
-//!   in the wild; if a user ever needs it we can extend the module then.
+//! * Complex-object / traits back-references on the encode side — see
+//!   "Encoding" above; the tree model has no shared identity to dedup.
 //! * IExternalizable bodies — see above.
 //! * The `flash.utils.IDataInput` / `flash.utils.IDataOutput` callbacks
 //!   for ByteArray (spec §4.2). The ByteArray bytes are surfaced raw.
@@ -665,6 +686,277 @@ fn read_utf8(data: &[u8], pos: usize, len: usize) -> Result<String> {
         .map_err(|_| Error::invalid("AMF3: invalid UTF-8 in string body"))
 }
 
+// ---------------------------------------------------------------------------
+// Encoder
+// ---------------------------------------------------------------------------
+
+/// Encoder-side string reference table.
+///
+/// The decoder appends every non-empty string literal it reads to its
+/// string table (in encounter order). For `write ∘ parse` and
+/// `parse ∘ write` to both be identity, the encoder must append in the
+/// exact same encounter order and emit the second-and-later occurrences
+/// by reference. This table tracks the strings already written so a
+/// repeat can be encoded as `(idx << 1)` (low bit clear = reference).
+#[derive(Debug, Default)]
+struct EncState {
+    /// Strings already written as literals, in write order. The index of
+    /// a string here is its AMF3 string-table index.
+    strings: Vec<String>,
+}
+
+impl EncState {
+    /// Index of `s` in the string table, if it has already been written
+    /// as a literal during this message.
+    fn string_index(&self, s: &str) -> Option<usize> {
+        self.strings.iter().position(|t| t == s)
+    }
+}
+
+/// Serialise a single [`Amf3Value`] to AMF3 bytes (the inverse of
+/// [`parse_amf3_value`]).
+///
+/// The bytes are appended to `out`. A fresh string-reference table is
+/// allocated for this call, matching the decoder's "tables reset per
+/// message" rule (§4.1) — a scriptdata payload is one message.
+///
+/// `Ok(())` on success. The only failure mode is a value that cannot be
+/// represented in AMF3 at all: a string / array / object / byte-array
+/// whose length exceeds the 28-bit `U29` size field (`2^28 - 1`), which
+/// raises [`Error::InvalidData`] before any partial bytes for that value
+/// reach `out` beyond the marker. (28 bits because the low bit of the
+/// length `U29` is the literal/reference flag, leaving 28 for the size.)
+pub fn write_amf3_value(out: &mut Vec<u8>, value: &Amf3Value) -> Result<()> {
+    let mut state = EncState::default();
+    write_value(out, value, &mut state)
+}
+
+/// Largest length representable in the 28-bit size field of a UTF-8-vr /
+/// array / byte-array `U29` header (`(len << 1) | 1` must stay <= U29_MAX).
+const U29_LEN_MAX: usize = (1 << 28) - 1;
+
+fn write_value(out: &mut Vec<u8>, value: &Amf3Value, state: &mut EncState) -> Result<()> {
+    match value {
+        Amf3Value::Undefined => out.push(0x00),
+        Amf3Value::Null => out.push(0x01),
+        Amf3Value::Boolean(false) => out.push(0x02),
+        Amf3Value::Boolean(true) => out.push(0x03),
+        Amf3Value::Integer(i) => {
+            out.push(0x04);
+            write_integer(out, *i)?;
+        }
+        Amf3Value::Double(d) => {
+            out.push(0x05);
+            out.extend_from_slice(&d.to_be_bytes());
+        }
+        Amf3Value::String(s) => {
+            out.push(0x06);
+            write_utf8_vr(out, s, state)?;
+        }
+        Amf3Value::XmlDocument(s) => {
+            out.push(0x07);
+            // xml-doc / xml are NOT part of the string table (the decoder
+            // pushes them to the OBJECT table). Always a fresh literal.
+            write_xml_like(out, s)?;
+        }
+        Amf3Value::Date(ms) => {
+            out.push(0x08);
+            // Literal: U29 = 1 (low bit set, no significant high bits),
+            // followed by the 8-byte BE double.
+            out.push(0x01);
+            out.extend_from_slice(&ms.to_be_bytes());
+        }
+        Amf3Value::Array(arr) => {
+            out.push(0x09);
+            write_array(out, arr, state)?;
+        }
+        Amf3Value::Object(obj) => {
+            out.push(0x0A);
+            write_object(out, obj, state)?;
+        }
+        Amf3Value::Xml(s) => {
+            out.push(0x0B);
+            write_xml_like(out, s)?;
+        }
+        Amf3Value::ByteArray(bytes) => {
+            out.push(0x0C);
+            if bytes.len() > U29_LEN_MAX {
+                return Err(Error::invalid("AMF3: byte-array too long to encode"));
+            }
+            write_u29(out, ((bytes.len() as u32) << 1) | 1);
+            out.extend_from_slice(bytes);
+        }
+    }
+    Ok(())
+}
+
+/// Encode an `i32` as the 29-bit `integer-type` body (§3.6). Values
+/// outside the signed 29-bit range cannot be represented as an AMF3
+/// integer; a real producer would emit them as a Double, so this is a
+/// caller error surfaced as [`Error::InvalidData`].
+fn write_integer(out: &mut Vec<u8>, i: i32) -> Result<()> {
+    // Signed 29-bit range is -2^28 ..= 2^28 - 1.
+    const MIN: i32 = -(1 << 28);
+    const MAX: i32 = (1 << 28) - 1;
+    if !(MIN..=MAX).contains(&i) {
+        return Err(Error::invalid(
+            "AMF3: integer out of signed 29-bit range — encode as Double",
+        ));
+    }
+    // Mask to the low 29 bits; this is the exact inverse of
+    // `sign_extend_29` (a negative value wraps to its 29-bit two's
+    // complement, e.g. -1 → 0x1FFF_FFFF).
+    let u = (i as u32) & U29_MAX;
+    write_u29(out, u);
+    Ok(())
+}
+
+/// Append a `U29` (§1.3.1) for `v` (which must be `<= U29_MAX`). Mirrors
+/// the test-helper `u29_encode` byte-for-byte so the decoder's
+/// `read_u29` recovers `v` exactly.
+fn write_u29(out: &mut Vec<u8>, v: u32) {
+    debug_assert!(v <= U29_MAX);
+    if v < 0x80 {
+        out.push(v as u8);
+    } else if v < 0x4000 {
+        out.push((((v >> 7) & 0x7F) | 0x80) as u8);
+        out.push((v & 0x7F) as u8);
+    } else if v < 0x20_0000 {
+        out.push((((v >> 14) & 0x7F) | 0x80) as u8);
+        out.push((((v >> 7) & 0x7F) | 0x80) as u8);
+        out.push((v & 0x7F) as u8);
+    } else {
+        // 4-byte form: first 3 bytes carry 7 bits each + continuation
+        // flag; the 4th carries all 8 bits (7+7+7+8 = 29).
+        out.push((((v >> 22) & 0x7F) | 0x80) as u8);
+        out.push((((v >> 15) & 0x7F) | 0x80) as u8);
+        out.push((((v >> 8) & 0x7F) | 0x80) as u8);
+        out.push((v & 0xFF) as u8);
+    }
+}
+
+/// Write a UTF-8-vr (§1.3.2 / §3.8): emit a string-table reference if
+/// `s` was already written as a literal this message; otherwise emit a
+/// literal (length-prefixed body) and append it to the table. The empty
+/// string is always a literal and never enters the table.
+fn write_utf8_vr(out: &mut Vec<u8>, s: &str, state: &mut EncState) -> Result<()> {
+    if s.is_empty() {
+        // Literal, length 0: `(0 << 1) | 1` = 1.
+        write_u29(out, 1);
+        return Ok(());
+    }
+    if let Some(idx) = state.string_index(s) {
+        // Reference: `idx << 1` (low bit clear).
+        if idx > (U29_MAX >> 1) as usize {
+            return Err(Error::invalid(
+                "AMF3: string-table index too large to encode",
+            ));
+        }
+        write_u29(out, (idx as u32) << 1);
+        return Ok(());
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() > U29_LEN_MAX {
+        return Err(Error::invalid("AMF3: string too long to encode"));
+    }
+    write_u29(out, ((bytes.len() as u32) << 1) | 1);
+    out.extend_from_slice(bytes);
+    state.strings.push(s.to_owned());
+    Ok(())
+}
+
+/// Write an xml / xml-doc body as a fresh literal (these types live in
+/// the object table on the decode side, so the string table is never
+/// consulted — every occurrence is a literal).
+fn write_xml_like(out: &mut Vec<u8>, s: &str) -> Result<()> {
+    let bytes = s.as_bytes();
+    if bytes.len() > U29_LEN_MAX {
+        return Err(Error::invalid("AMF3: xml body too long to encode"));
+    }
+    write_u29(out, ((bytes.len() as u32) << 1) | 1);
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Write an array-type body (§3.11): a literal header carrying the dense
+/// count, then the associative `(key, value)*` run terminated by the
+/// empty-string key, then the dense values in order.
+fn write_array(out: &mut Vec<u8>, arr: &Amf3Array, state: &mut EncState) -> Result<()> {
+    if arr.dense.len() > U29_LEN_MAX {
+        return Err(Error::invalid(
+            "AMF3: array dense portion too long to encode",
+        ));
+    }
+    // Literal header: `(dense_count << 1) | 1`.
+    write_u29(out, ((arr.dense.len() as u32) << 1) | 1);
+    for (key, val) in &arr.assoc {
+        // An empty assoc key would be read as the terminator, silently
+        // truncating the assoc run — reject it rather than corrupt.
+        if key.is_empty() {
+            return Err(Error::invalid("AMF3: array assoc key must be non-empty"));
+        }
+        write_utf8_vr(out, key, state)?;
+        write_value(out, val, state)?;
+    }
+    // Associative terminator: empty-string key.
+    write_utf8_vr(out, "", state)?;
+    for val in &arr.dense {
+        write_value(out, val, state)?;
+    }
+    Ok(())
+}
+
+/// Write an object-type body (§3.12) with an inline traits header.
+///
+/// The traits header `U29` low nibble is, from bit 0:
+/// `1` (instance, not object-ref), `1` (traits inline, not traits-ref),
+/// `externalizable`, `dynamic`; bits 4.. carry the sealed-member count.
+fn write_object(out: &mut Vec<u8>, obj: &Amf3Object, state: &mut EncState) -> Result<()> {
+    if obj.externalizable {
+        // traits-ext: bit0=1 (instance), bit1=1 (inline), bit2=1 (ext).
+        // Sealed count must be 0 (§3.12). No body bytes follow the class
+        // name — matching the decoder's no-recipe stance.
+        write_u29(out, 0b0111);
+        write_utf8_vr(out, &obj.class_name, state)?;
+        return Ok(());
+    }
+    if obj.sealed_names.len() != obj.sealed_values.len() {
+        return Err(Error::invalid(
+            "AMF3: object sealed_names / sealed_values length mismatch",
+        ));
+    }
+    let sealed_count = obj.sealed_names.len();
+    // Header value: bit0=1, bit1=1, bit2=0 (not ext), bit3=dynamic,
+    // bits 4.. = sealed_count.
+    let dynamic_bit = if obj.dynamic { 1u32 } else { 0 };
+    let header = (sealed_count as u64) << 4 | (dynamic_bit << 3) as u64 | 0b0011;
+    if header > u64::from(U29_MAX) {
+        return Err(Error::invalid(
+            "AMF3: object has too many sealed members to encode",
+        ));
+    }
+    write_u29(out, header as u32);
+    write_utf8_vr(out, &obj.class_name, state)?;
+    for name in &obj.sealed_names {
+        write_utf8_vr(out, name, state)?;
+    }
+    for val in &obj.sealed_values {
+        write_value(out, val, state)?;
+    }
+    if obj.dynamic {
+        for (key, val) in &obj.dynamic_members {
+            if key.is_empty() {
+                return Err(Error::invalid("AMF3: dynamic-member key must be non-empty"));
+            }
+            write_utf8_vr(out, key, state)?;
+            write_value(out, val, state)?;
+        }
+        // Dynamic terminator: empty-string key.
+        write_utf8_vr(out, "", state)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1171,5 +1463,272 @@ mod tests {
         assert_eq!(Amf3Value::Xml("<n/>".into()).as_str(), Some("<n/>"));
         assert_eq!(Amf3Value::XmlDocument("<n/>".into()).as_str(), Some("<n/>"));
         assert_eq!(Amf3Value::Integer(7).as_str(), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Encoder tests
+    // -----------------------------------------------------------------
+
+    /// Encode `v`, decode the bytes back, and assert the value survives
+    /// and the decoder consumed every emitted byte.
+    fn enc_round_trip(v: &Amf3Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_amf3_value(&mut out, v).expect("encode");
+        let (back, p) = parse_amf3_value(&out, 0).expect("decode");
+        assert_eq!(&back, v, "value did not survive encode→decode");
+        assert_eq!(p, out.len(), "decoder did not consume the whole encoding");
+        out
+    }
+
+    #[test]
+    fn encode_scalar_markers_round_trip() {
+        enc_round_trip(&Amf3Value::Undefined);
+        enc_round_trip(&Amf3Value::Null);
+        enc_round_trip(&Amf3Value::Boolean(false));
+        enc_round_trip(&Amf3Value::Boolean(true));
+        enc_round_trip(&Amf3Value::Double(core::f64::consts::PI));
+        enc_round_trip(&Amf3Value::Double(0.0));
+        enc_round_trip(&Amf3Value::Date(1_700_000_000_000.0));
+    }
+
+    #[test]
+    fn encode_scalar_marker_bytes_are_spec_exact() {
+        let mut out = Vec::new();
+        write_amf3_value(&mut out, &Amf3Value::Undefined).unwrap();
+        assert_eq!(out, [0x00]);
+        out.clear();
+        write_amf3_value(&mut out, &Amf3Value::Null).unwrap();
+        assert_eq!(out, [0x01]);
+        out.clear();
+        write_amf3_value(&mut out, &Amf3Value::Boolean(false)).unwrap();
+        assert_eq!(out, [0x02]);
+        out.clear();
+        write_amf3_value(&mut out, &Amf3Value::Boolean(true)).unwrap();
+        assert_eq!(out, [0x03]);
+    }
+
+    #[test]
+    fn encode_integer_boundaries_round_trip() {
+        for &i in &[0i32, 1, -1, 2, -2, 127, -128, (1 << 28) - 1, -(1 << 28)] {
+            enc_round_trip(&Amf3Value::Integer(i));
+        }
+    }
+
+    #[test]
+    fn encode_negative_one_is_u29_max() {
+        // -1 sign-extends from a 29-bit field of all ones = U29_MAX.
+        let mut out = Vec::new();
+        write_amf3_value(&mut out, &Amf3Value::Integer(-1)).unwrap();
+        let mut expect = vec![0x04];
+        expect.extend_from_slice(&u29_encode(U29_MAX));
+        assert_eq!(out, expect);
+    }
+
+    #[test]
+    fn encode_integer_out_of_29bit_range_errors() {
+        // 2^28 is one past the signed-29-bit max.
+        let mut out = Vec::new();
+        assert!(matches!(
+            write_amf3_value(&mut out, &Amf3Value::Integer(1 << 28)),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn encode_string_round_trip() {
+        enc_round_trip(&Amf3Value::String(String::new()));
+        enc_round_trip(&Amf3Value::String("hello".into()));
+        enc_round_trip(&Amf3Value::String("üñîçödé".into()));
+    }
+
+    #[test]
+    fn encode_empty_string_is_always_literal() {
+        // 0x06 marker + U29 = 1 (literal, length 0).
+        let mut out = Vec::new();
+        write_amf3_value(&mut out, &Amf3Value::String(String::new())).unwrap();
+        assert_eq!(out, [0x06, 0x01]);
+    }
+
+    #[test]
+    fn encode_string_dedup_uses_reference() {
+        // An array whose assoc key and value are the same string: the
+        // value must be emitted as a string-table reference to index 0.
+        let arr = Amf3Value::Array(Amf3Array {
+            assoc: vec![("ab".into(), Amf3Value::String("ab".into()))],
+            dense: vec![],
+        });
+        let out = enc_round_trip(&arr);
+        // 0x09 array, u29(dense=0 lit)=0x01, key "ab" literal
+        // (0x05 0x61 0x62), value 0x06 + ref(0)=0x00, terminator 0x01.
+        assert_eq!(out, [0x09, 0x01, 0x05, b'a', b'b', 0x06, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn encode_array_with_assoc_and_dense_round_trip() {
+        enc_round_trip(&Amf3Value::Array(Amf3Array {
+            assoc: vec![
+                ("x".into(), Amf3Value::Integer(1)),
+                ("flag".into(), Amf3Value::Boolean(true)),
+            ],
+            dense: vec![
+                Amf3Value::Integer(2),
+                Amf3Value::Double(3.5),
+                Amf3Value::String("z".into()),
+            ],
+        }));
+    }
+
+    #[test]
+    fn encode_empty_array_round_trip() {
+        enc_round_trip(&Amf3Value::Array(Amf3Array {
+            assoc: vec![],
+            dense: vec![],
+        }));
+    }
+
+    #[test]
+    fn encode_array_empty_assoc_key_errors() {
+        let mut out = Vec::new();
+        let v = Amf3Value::Array(Amf3Array {
+            assoc: vec![(String::new(), Amf3Value::Null)],
+            dense: vec![],
+        });
+        assert!(matches!(
+            write_amf3_value(&mut out, &v),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn encode_anonymous_dynamic_object_round_trip() {
+        enc_round_trip(&Amf3Value::Object(Amf3Object {
+            class_name: String::new(),
+            dynamic: true,
+            externalizable: false,
+            sealed_names: vec![],
+            sealed_values: vec![],
+            dynamic_members: vec![
+                ("k".into(), Amf3Value::Integer(7)),
+                ("name".into(), Amf3Value::String("v".into())),
+            ],
+        }));
+    }
+
+    #[test]
+    fn encode_typed_sealed_object_round_trip() {
+        enc_round_trip(&Amf3Value::Object(Amf3Object {
+            class_name: "com.example.Point".into(),
+            dynamic: false,
+            externalizable: false,
+            sealed_names: vec!["x".into(), "y".into()],
+            sealed_values: vec![Amf3Value::Integer(3), Amf3Value::Integer(4)],
+            dynamic_members: vec![],
+        }));
+    }
+
+    #[test]
+    fn encode_sealed_and_dynamic_object_round_trip() {
+        enc_round_trip(&Amf3Value::Object(Amf3Object {
+            class_name: "Mixed".into(),
+            dynamic: true,
+            externalizable: false,
+            sealed_names: vec!["a".into()],
+            sealed_values: vec![Amf3Value::Boolean(false)],
+            dynamic_members: vec![("extra".into(), Amf3Value::Double(1.25))],
+        }));
+    }
+
+    #[test]
+    fn encode_externalizable_object_round_trips_flag_only() {
+        // The decoder produces an externalizable Object with empty
+        // sealed/dynamic vectors and dynamic = false; the encoder must
+        // emit exactly that shape so round-trip is identity.
+        enc_round_trip(&Amf3Value::Object(Amf3Object {
+            class_name: "flex.messaging.io.ArrayCollection".into(),
+            dynamic: false,
+            externalizable: true,
+            sealed_names: vec![],
+            sealed_values: vec![],
+            dynamic_members: vec![],
+        }));
+    }
+
+    #[test]
+    fn encode_object_sealed_length_mismatch_errors() {
+        let mut out = Vec::new();
+        let v = Amf3Value::Object(Amf3Object {
+            class_name: String::new(),
+            dynamic: false,
+            externalizable: false,
+            sealed_names: vec!["only".into()],
+            sealed_values: vec![], // mismatch
+            dynamic_members: vec![],
+        });
+        assert!(matches!(
+            write_amf3_value(&mut out, &v),
+            Err(Error::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn encode_xml_and_xml_document_round_trip() {
+        enc_round_trip(&Amf3Value::Xml("<root><a/></root>".into()));
+        enc_round_trip(&Amf3Value::XmlDocument("<legacy/>".into()));
+        enc_round_trip(&Amf3Value::Xml(String::new()));
+    }
+
+    #[test]
+    fn encode_byte_array_round_trip() {
+        enc_round_trip(&Amf3Value::ByteArray(vec![0xDE, 0xAD, 0xBE, 0xEF]));
+        enc_round_trip(&Amf3Value::ByteArray(vec![]));
+    }
+
+    #[test]
+    fn encode_nested_graph_round_trip() {
+        // An object whose member is an array of objects, with shared
+        // string keys to exercise the string-table reference path across
+        // nesting depth.
+        let inner = Amf3Value::Object(Amf3Object {
+            class_name: String::new(),
+            dynamic: true,
+            externalizable: false,
+            sealed_names: vec![],
+            sealed_values: vec![],
+            dynamic_members: vec![("label".into(), Amf3Value::String("label".into()))],
+        });
+        enc_round_trip(&Amf3Value::Object(Amf3Object {
+            class_name: String::new(),
+            dynamic: true,
+            externalizable: false,
+            sealed_names: vec![],
+            sealed_values: vec![],
+            dynamic_members: vec![(
+                "items".into(),
+                Amf3Value::Array(Amf3Array {
+                    assoc: vec![("label".into(), Amf3Value::Integer(1))],
+                    dense: vec![inner.clone(), inner],
+                }),
+            )],
+        }));
+    }
+
+    #[test]
+    fn decode_then_encode_is_byte_identity() {
+        // Build a non-trivial AMF3 stream by hand (string table exercised
+        // via a repeated value), decode it, re-encode, and assert the
+        // bytes match — i.e. `write ∘ parse` is identity for a canonical
+        // literal-first / string-deduped stream.
+        let mut b = vec![0x09]; // array
+        b.extend_from_slice(&u29_lit_len(0)); // dense count 0
+        b.extend_from_slice(&u29_lit_len(2)); // key "ab"
+        b.extend_from_slice(b"ab");
+        b.push(0x06); // string value
+        b.extend_from_slice(&u29_ref(0)); // ref to "ab"
+        b.extend_from_slice(&u29_lit_len(0)); // assoc terminator
+        let (v, p) = parse_amf3_value(&b, 0).unwrap();
+        assert_eq!(p, b.len());
+        let mut out = Vec::new();
+        write_amf3_value(&mut out, &v).unwrap();
+        assert_eq!(out, b, "re-encode did not reproduce the canonical bytes");
     }
 }
