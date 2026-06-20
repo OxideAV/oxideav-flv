@@ -426,6 +426,25 @@ pub fn write_strict_array_string<W: Write + ?Sized>(w: &mut W, values: &[&str]) 
     Ok(())
 }
 
+/// Write an AMF0 AVM+ switch (marker `0x11`, AMF0 spec §3.1) carrying an
+/// AMF3 value. The marker tells the reader the *next* value is encoded
+/// with the AMF3 grammar; [`crate::amf3::write_amf3_value`] then
+/// serialises `inner`. This is the write-side inverse of the
+/// [`AmfValue::AvmPlus`] parse arm — an `AvmPlus` value round-trips
+/// byte-for-byte through [`parse_amf0_value`].
+///
+/// FLV scriptdata switches into AMF3 this way when a producer uses the
+/// ActionScript-3.0 (AMF3) serialiser for an `onMetaData` / `onCuePoint`
+/// payload; the demuxer already lifts the inner tree and flattens it,
+/// so this writer lets a producer round-trip such a payload.
+pub fn write_avm_plus<W: Write + ?Sized>(w: &mut W, inner: &Amf3Value) -> Result<()> {
+    w.write_all(&[0x11])?;
+    let mut buf = Vec::new();
+    crate::amf3::write_amf3_value(&mut buf, inner)?;
+    w.write_all(&buf)?;
+    Ok(())
+}
+
 /// Shared helper: UI16 BE length + UTF-8 bytes.
 fn write_utf8_u16<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
     let bytes = s.as_bytes();
@@ -654,6 +673,41 @@ mod tests {
             }
             other => panic!("expected AvmPlus, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn write_avm_plus_round_trips_through_parse() {
+        // A non-trivial AMF3 inner value (anonymous dynamic object) must
+        // survive the 0x11 switch + AMF3 encode → AMF0 parse loop.
+        let inner = Amf3Value::Object(crate::amf3::Amf3Object {
+            class_name: String::new(),
+            dynamic: true,
+            externalizable: false,
+            sealed_names: vec![],
+            sealed_values: vec![],
+            dynamic_members: vec![
+                ("k".into(), Amf3Value::Integer(42)),
+                ("s".into(), Amf3Value::String("v".into())),
+            ],
+        });
+        let mut buf = Vec::new();
+        write_avm_plus(&mut buf, &inner).unwrap();
+        assert_eq!(buf[0], 0x11, "must lead with the AVM+ switch marker");
+        let (v, p) = parse_amf0_value(&buf, 0).unwrap();
+        assert_eq!(p, buf.len(), "parser must consume the whole encoding");
+        match v {
+            AmfValue::AvmPlus(boxed) => assert_eq!(*boxed, inner),
+            other => panic!("expected AvmPlus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_avm_plus_scalar_bytes_are_exact() {
+        // 0x11 switch + AMF3 true-marker (0x03), matching the decode
+        // fixture above.
+        let mut buf = Vec::new();
+        write_avm_plus(&mut buf, &Amf3Value::Boolean(true)).unwrap();
+        assert_eq!(buf, [0x11, 0x03]);
     }
 
     #[test]
