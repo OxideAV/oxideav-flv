@@ -1713,6 +1713,48 @@ mod tests {
     }
 
     #[test]
+    fn encode_is_a_fixed_point_for_a_value_corpus() {
+        // For a corpus of value shapes, assert the canonical encoding is
+        // a fixed point: encode → decode → encode reproduces the first
+        // encoding byte-for-byte (the deterministic sibling of the
+        // `amf3_roundtrip` differential fuzz target).
+        let corpus = [
+            Amf3Value::Undefined,
+            Amf3Value::Null,
+            Amf3Value::Boolean(true),
+            Amf3Value::Integer(-(1 << 28)),
+            Amf3Value::Double(-0.0),
+            Amf3Value::String("repeat".into()),
+            Amf3Value::Xml("<x/>".into()),
+            Amf3Value::XmlDocument("<y/>".into()),
+            Amf3Value::Date(42.0),
+            Amf3Value::ByteArray(vec![1, 2, 3]),
+            Amf3Value::Array(Amf3Array {
+                assoc: vec![("k".into(), Amf3Value::String("k".into()))],
+                dense: vec![Amf3Value::Integer(9), Amf3Value::Null],
+            }),
+            Amf3Value::Object(Amf3Object {
+                class_name: "C".into(),
+                dynamic: true,
+                externalizable: false,
+                sealed_names: vec!["s".into()],
+                sealed_values: vec![Amf3Value::Boolean(false)],
+                dynamic_members: vec![("d".into(), Amf3Value::Double(1.0))],
+            }),
+        ];
+        for v in &corpus {
+            let mut e1 = Vec::new();
+            write_amf3_value(&mut e1, v).unwrap();
+            let (back, p) = parse_amf3_value(&e1, 0).unwrap();
+            assert_eq!(p, e1.len(), "value {v:?} left trailing bytes");
+            assert_eq!(&back, v, "value {v:?} drifted across encode→decode");
+            let mut e2 = Vec::new();
+            write_amf3_value(&mut e2, &back).unwrap();
+            assert_eq!(e1, e2, "value {v:?} encoding is not a fixed point");
+        }
+    }
+
+    #[test]
     fn decode_then_encode_is_byte_identity() {
         // Build a non-trivial AMF3 stream by hand (string table exercised
         // via a repeated value), decode it, re-encode, and assert the

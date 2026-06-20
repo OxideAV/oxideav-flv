@@ -110,7 +110,25 @@ oxideav-flv = "0.0"
   `onCuePoint` or `VideoPacketType.Metadata` lowers through a
   symmetric `flatten_amf3_value` walker so callers see AVM+ payloads
   under the same `metadata["prefix.key"]` shape as their AMF0
-  counterparts.
+  counterparts. The read↔write loop is closed: `amf3::write_amf3_value`
+  is the inverse of `parse_amf3_value`, serialising any `Amf3Value`
+  tree back to AMF3 bytes for all 13 markers. It is **literal-first**
+  (the tree model has no shared identity to dedup, so complex values are
+  fresh literals), but non-empty string literals (§3.8) are deduped
+  through a write-side string table that mirrors the decoder's encounter
+  order — so `parse ∘ write` and `write ∘ parse` are both identity and a
+  canonical literal-first / string-deduped stream re-encodes byte-for-byte.
+  The U29 emitter (§1.3.1) matches the decoder's `read_u29`; the
+  signed-29-bit `integer-type` (§3.6) round-trips its full
+  `-2^28 ..= 2^28 - 1` range and rejects an out-of-range int (a real
+  producer would emit it as a Double); inline-traits Object headers carry
+  the sealed-count + dynamic / externalizable flags; an externalizable
+  object emits the flag + class name with zero body bytes (matching the
+  no-recipe decode stance). On the AMF0 side, `amf0::write_avm_plus`
+  emits the `0x11` AVM+ switch marker (AMF0 §3.1) then the inner AMF3
+  value, the write-side inverse of the `AmfValue::AvmPlus` parse arm — an
+  AMF3-encoded scriptdata payload round-trips byte-for-byte through
+  `parse_amf0_value`, which the demuxer already lifts and flattens.
 - FrameType 5 "video info / command" tags (spec E.4.3.1) are surfaced
   as packets with `flags.header = true` + `flags.discard = true` and a
   1-byte body carrying the command (0 = start of client-side-seeking
@@ -415,7 +433,7 @@ exceeds the remaining bytes of the underlying `Read + Seek` stream
 *before* committing the `Vec`.
 
 A `fuzz/` sub-crate (cargo-fuzz / libfuzzer) backs the hand-crafted
-suite with four targets:
+suite with five targets:
 
 * `demuxer_open_next` — arbitrary bytes through `open_demuxer` and
   drain `next_packet` until error or EOF, with a per-iteration step
@@ -430,6 +448,12 @@ suite with four targets:
   slice, re-parse with `open_demuxer`, assert every property the
   muxer emitted survives in `metadata()`; surfaces any
   writer/parser disagreement.
+* `amf3_roundtrip` — differential test of the AMF3 encoder against
+  the decoder: decode arbitrary bytes, and for any value the decoder
+  accepts, re-encode via `write_amf3_value`, decode again, and assert
+  the value is unchanged and the canonical encoding is a fixed point
+  (`encode == encode ∘ decode ∘ encode`). Catches any asymmetry
+  between the two halves.
 
 The fuzz crate carries its own `[workspace]` table so the umbrella
 build is unaffected; `Cargo.lock` is gitignored.

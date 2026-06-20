@@ -37,6 +37,12 @@ cargo-fuzz = true
 #                          and that any property the fuzzer put into
 #                          the bag survives in `metadata()` or is
 #                          dropped cleanly (no panic).
+#  * `amf3_roundtrip`    — decode arbitrary bytes; for any value the
+#                          decoder accepts, re-encode via
+#                          `write_amf3_value`, decode again, and assert
+#                          the value is unchanged and the canonical
+#                          encoding is a fixed point. Differential test
+#                          of the encoder against the decoder.
 #
 # The fuzz crate links `oxideav-flv` via path-dep with default features
 # and depends on `oxideav-core` only transitively. No external codec
@@ -78,5 +84,11 @@ doc = false
 [[bin]]
 name = "script_metadata_roundtrip"
 path = "fuzz_targets/script_metadata_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "amf3_roundtrip"
+path = "fuzz_targets/amf3_roundtrip.rs"
 test = false
 doc = false
