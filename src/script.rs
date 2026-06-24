@@ -103,6 +103,27 @@ pub enum MetaValue {
     /// nest recursively, so a map-of-objects (each trackId keying a
     /// per-track descriptor) is expressible directly.
     Object(Vec<(String, MetaValue)>),
+    /// An AMF0 ECMA array (`0x08`) — the same `(name, value)*` body as an
+    /// Object but with the type marker the demuxer reads back identically
+    /// (it flattens both under `metadata["<key>.<subkey>"]`). The wire
+    /// difference is the `0x08` marker + a UI32 associative-count hint
+    /// (emitted as the true pair count). Use this when a producer's
+    /// schema specifically calls for the ECMA-array marker.
+    EcmaArray(Vec<(String, MetaValue)>),
+    /// An AMF0 strict array (`0x0A`) of mixed-type, dense-indexed values
+    /// (spec §2.12) — the demuxer flattens it under `metadata["<key>[i]"]`.
+    /// Unlike Object / EcmaArray there are no property names and no
+    /// object-end terminator; a UI32 length prefix delimits the run.
+    StrictArray(Vec<MetaValue>),
+    /// An AMF0 Null value (`0x05`, §2.7). The demuxer flattens it to the
+    /// `"null"` sentinel string.
+    Null,
+    /// An AMF0 Undefined value (`0x06`, §2.8). The demuxer flattens it to
+    /// the `"undefined"` sentinel string.
+    Undefined,
+    /// An AMF0 XMLDocument value (`0x0F`, §2.17). Carries a UTF-8 XML
+    /// string; the demuxer surfaces it verbatim under its property name.
+    Xml(String),
 }
 
 /// Ordered set of `onMetaData` properties to serialise.
@@ -217,6 +238,37 @@ impl MetadataBag {
         self
     }
 
+    /// Append an AMF0 Null property (`0x05`) and return `self`. The
+    /// demuxer flattens it to the `"null"` sentinel string.
+    pub fn null(mut self, key: &str) -> Self {
+        self.entries.push((key.to_string(), MetaValue::Null));
+        self
+    }
+
+    /// Append an AMF0 Undefined property (`0x06`) and return `self`. The
+    /// demuxer flattens it to the `"undefined"` sentinel string.
+    pub fn undefined(mut self, key: &str) -> Self {
+        self.entries.push((key.to_string(), MetaValue::Undefined));
+        self
+    }
+
+    /// Append an AMF0 XMLDocument property (`0x0F`) and return `self`.
+    /// The demuxer surfaces the XML string verbatim under `key`.
+    pub fn xml(mut self, key: &str, s: &str) -> Self {
+        self.entries
+            .push((key.to_string(), MetaValue::Xml(s.to_string())));
+        self
+    }
+
+    /// Append an AMF0 strict-array property (`0x0A`) of mixed-type
+    /// `items` and return `self`. The demuxer flattens each element under
+    /// `metadata["<key>[i]"]`.
+    pub fn strict_array(mut self, key: &str, items: Vec<MetaValue>) -> Self {
+        self.entries
+            .push((key.to_string(), MetaValue::StrictArray(items)));
+        self
+    }
+
     /// Append the Enhanced-RTMP-v2 `videoTrackIdInfoMap` property — the
     /// per-track metadata map for the additional (non-default) video
     /// tracks of a multitrack stream (§"Enhancing onMetaData"). The
@@ -318,6 +370,25 @@ impl ObjectBuilder {
     /// Append a nested-Object child property.
     pub fn object(mut self, key: &str, value: MetaValue) -> Self {
         self.entries.push((key.to_string(), value));
+        self
+    }
+
+    /// Append an AMF0 Null child property.
+    pub fn null(mut self, key: &str) -> Self {
+        self.entries.push((key.to_string(), MetaValue::Null));
+        self
+    }
+
+    /// Append an AMF0 Undefined child property.
+    pub fn undefined(mut self, key: &str) -> Self {
+        self.entries.push((key.to_string(), MetaValue::Undefined));
+        self
+    }
+
+    /// Append an AMF0 XMLDocument child property.
+    pub fn xml(mut self, key: &str, s: &str) -> Self {
+        self.entries
+            .push((key.to_string(), MetaValue::Xml(s.to_string())));
         self
     }
 
@@ -585,6 +656,29 @@ fn write_meta_value(out: &mut Vec<u8>, key: &str, value: &MetaValue) -> Result<(
             }
             amf0::write_object_end(out)?;
         }
+        MetaValue::EcmaArray(pairs) => {
+            amf0::write_ecma_array_start(out, pairs.len() as u32)?;
+            for (k, v) in pairs {
+                amf0::write_property_name(out, k)?;
+                write_meta_value(out, k, v)?;
+            }
+            amf0::write_object_end(out)?;
+        }
+        MetaValue::StrictArray(items) => {
+            if items.len() > u32::MAX as usize {
+                return Err(Error::invalid(format!(
+                    "FLV onMetaData strict-array {key:?}: length {} exceeds UI32 max",
+                    items.len()
+                )));
+            }
+            amf0::write_strict_array_start(out, items.len() as u32)?;
+            for v in items {
+                write_meta_value(out, key, v)?;
+            }
+        }
+        MetaValue::Null => amf0::write_null(out)?,
+        MetaValue::Undefined => amf0::write_undefined(out)?,
+        MetaValue::Xml(s) => amf0::write_xml(out, s)?,
     }
     Ok(())
 }
@@ -1382,6 +1476,67 @@ mod tests {
         match &props[0] {
             (k, AmfValue::Object(b)) if k == "videoTrackIdInfoMap" => assert!(b.is_empty()),
             other => panic!("expected empty videoTrackIdInfoMap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_undefined_xml_round_trip_through_parser() {
+        let bag = MetadataBag::new()
+            .null("a")
+            .undefined("b")
+            .xml("c", "<x>hi</x>");
+        let mut body = Vec::new();
+        write_on_metadata_body(&mut body, &bag).unwrap();
+        let props = parse_meta_props(&body);
+        assert_eq!(props[0], ("a".into(), AmfValue::Null));
+        assert_eq!(props[1], ("b".into(), AmfValue::Undefined));
+        assert_eq!(props[2], ("c".into(), AmfValue::Xml("<x>hi</x>".into())));
+    }
+
+    #[test]
+    fn ecma_array_value_round_trips_through_parser() {
+        let bag = MetadataBag::new().object(
+            "wrapped",
+            MetaValue::EcmaArray(vec![
+                ("k1".into(), MetaValue::Number(1.0)),
+                ("k2".into(), MetaValue::String("v".into())),
+            ]),
+        );
+        let mut body = Vec::new();
+        write_on_metadata_body(&mut body, &bag).unwrap();
+        let props = parse_meta_props(&body);
+        match &props[0] {
+            (k, AmfValue::EcmaArray(inner)) if k == "wrapped" => {
+                assert_eq!(inner[0], ("k1".into(), AmfValue::Number(1.0)));
+                assert_eq!(inner[1], ("k2".into(), AmfValue::String("v".into())));
+            }
+            other => panic!("expected ecma array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_array_mixed_values_round_trips_through_parser() {
+        let bag = MetadataBag::new().strict_array(
+            "list",
+            vec![
+                MetaValue::Number(3.0),
+                MetaValue::String("x".into()),
+                MetaValue::Boolean(true),
+                MetaValue::Null,
+            ],
+        );
+        let mut body = Vec::new();
+        write_on_metadata_body(&mut body, &bag).unwrap();
+        let props = parse_meta_props(&body);
+        match &props[0] {
+            (k, AmfValue::StrictArray(items)) if k == "list" => {
+                assert_eq!(items.len(), 4);
+                assert_eq!(items[0], AmfValue::Number(3.0));
+                assert_eq!(items[1], AmfValue::String("x".into()));
+                assert_eq!(items[2], AmfValue::Boolean(true));
+                assert_eq!(items[3], AmfValue::Null);
+            }
+            other => panic!("expected strict array, got {other:?}"),
         }
     }
 }

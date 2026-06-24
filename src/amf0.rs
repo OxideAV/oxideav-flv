@@ -324,6 +324,16 @@ pub fn write_null<W: Write + ?Sized>(w: &mut W) -> Result<()> {
     Ok(())
 }
 
+/// Write an AMF0 Undefined value (marker `0x06`, §2.8). The marker
+/// stands on its own with no payload — the write-side inverse of the
+/// [`AmfValue::Undefined`] parse arm. Producers use it for an explicit
+/// "no value" `onMetaData` property the demuxer flattens to the
+/// `"undefined"` sentinel string.
+pub fn write_undefined<W: Write + ?Sized>(w: &mut W) -> Result<()> {
+    w.write_all(&[0x06])?;
+    Ok(())
+}
+
 /// Write an AMF0 String value (marker `0x02` + UI16 BE length + UTF-8
 /// bytes, §2.4). Errors if `s` exceeds 65535 bytes — a longer payload
 /// requires the Long String type (`0x0C`), which `onMetaData` property
@@ -331,6 +341,22 @@ pub fn write_null<W: Write + ?Sized>(w: &mut W) -> Result<()> {
 pub fn write_string<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
     w.write_all(&[0x02])?;
     write_utf8_u16(w, s)
+}
+
+/// Write an AMF0 XMLDocument value (marker `0x0F` + UI32 BE length +
+/// UTF-8 bytes, §2.17). The payload uses the long-string length form per
+/// spec. Write-side inverse of the [`AmfValue::Xml`] parse arm.
+pub fn write_xml<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
+    if s.len() > u32::MAX as usize {
+        return Err(Error::invalid(format!(
+            "AMF0: XMLDocument length {} exceeds UI32 max",
+            s.len()
+        )));
+    }
+    w.write_all(&[0x0F])?;
+    w.write_all(&(s.len() as u32).to_be_bytes())?;
+    w.write_all(s.as_bytes())?;
+    Ok(())
 }
 
 /// Write an AMF0 Date value — marker `0x0B` + 8-byte BE IEEE-754 double
@@ -423,6 +449,20 @@ pub fn write_strict_array_string<W: Write + ?Sized>(w: &mut W, values: &[&str]) 
     for s in values {
         write_string(w, s)?;
     }
+    Ok(())
+}
+
+/// Write the AMF0 Strict-array header for a mixed-type array — marker
+/// `0x0A` followed by the UI32 BE `StrictArrayLength` (spec §E.4.4.9
+/// SCRIPTDATASTRICTARRAY, §2.12). The caller then emits exactly `count`
+/// values (any AMF0 type). Unlike Object / ECMA-array bodies, a strict
+/// array has NO trailing object-end terminator — the length prefix is
+/// the sole delimiter. Use this when the element types are heterogeneous
+/// (the Number-only / String-only helpers above are the homogeneous
+/// fast paths).
+pub fn write_strict_array_start<W: Write + ?Sized>(w: &mut W, count: u32) -> Result<()> {
+    w.write_all(&[0x0A])?;
+    w.write_all(&count.to_be_bytes())?;
     Ok(())
 }
 

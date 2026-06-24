@@ -283,6 +283,41 @@ fn on_metadata_nested_object_round_trips_flattened() {
 }
 
 #[test]
+fn on_metadata_amf0_value_types_round_trip_flattened() {
+    use oxideav_flv::script::MetaValue;
+
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let bag = MetadataBag::new()
+        .null("a")
+        .undefined("b")
+        .xml("c", "<x>hi</x>")
+        .strict_array(
+            "list",
+            vec![
+                MetaValue::Number(7.0),
+                MetaValue::String("z".into()),
+                MetaValue::Null,
+            ],
+        );
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+    tag::write_mp3_tag(&mut buf, 0, 3, true, true, &mp3_frames()[0]).unwrap();
+
+    let dmx = open(buf);
+    let md = dmx.metadata();
+    let lookup = |k: &str| md.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+    // Null / Undefined flatten to sentinel strings; Xml verbatim.
+    assert_eq!(lookup("a"), Some("null"));
+    assert_eq!(lookup("b"), Some("undefined"));
+    assert_eq!(lookup("c"), Some("<x>hi</x>"));
+    // Strict array flattens under `<key>[i]`.
+    assert_eq!(lookup("list[0]"), Some("7"));
+    assert_eq!(lookup("list[1]"), Some("z"));
+    assert_eq!(lookup("list[2]"), Some("null"));
+}
+
+#[test]
 fn single_audio_stream_is_mp3() {
     let (bytes, _) = build_flv();
     let dmx = open(bytes);
