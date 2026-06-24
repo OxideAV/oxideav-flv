@@ -1677,6 +1677,42 @@ fn on_cue_point_writer_round_trips_per_cue_fields() {
 }
 
 #[test]
+fn on_cue_point_typed_parameters_round_trip_through_demuxer() {
+    use oxideav_flv::script::{MetaValue, ObjectBuilder};
+
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let bag = MetadataBag::new().number("duration", 0.04);
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+
+    // A cue with mixed-type parameters: a String, a Number, a Boolean,
+    // and a nested Object — all flatten through the demuxer.
+    let cue = CuePointParams::new("ad-break", 0.0, CuePointType::Event)
+        .parameter("label", "midroll")
+        .parameter_typed("duration", MetaValue::Number(15.0))
+        .parameter_typed("skippable", MetaValue::Boolean(true))
+        .parameter_typed(
+            "meta",
+            ObjectBuilder::new().string("campaign", "summer").build(),
+        );
+    script::write_on_cue_point(&mut buf, 0, &cue).unwrap();
+    tag::write_mp3_tag(&mut buf, 0, 3, true, true, &mp3_frames()[0]).unwrap();
+
+    let dmx = open(buf);
+    let md = dmx.metadata();
+    let lookup = |k: &str| md.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+    assert_eq!(lookup("cuepoint.0.parameters.label"), Some("midroll"));
+    assert_eq!(lookup("cuepoint.0.parameters.duration"), Some("15"));
+    assert_eq!(lookup("cuepoint.0.parameters.skippable"), Some("true"));
+    // Nested object fans out under `.<subkey>`.
+    assert_eq!(
+        lookup("cuepoint.0.parameters.meta.campaign"),
+        Some("summer")
+    );
+}
+
+#[test]
 fn cue_point_and_xmp_tags_do_not_disturb_audio_packets() {
     // Inserting cuepoint / XMP script tags between media tags must not
     // affect the audio packet stream the demuxer yields.

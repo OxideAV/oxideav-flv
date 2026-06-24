@@ -808,18 +808,19 @@ impl CuePointType {
 /// * `name` — opaque identifier the producer assigns to this cue.
 /// * `time` — wall-clock time in **seconds**, as an AMF0 Number.
 /// * `type` — `"event"` or `"navigation"` (see [`CuePointType`]).
-/// * `parameters` — an anonymous Object of user-defined name → string
+/// * `parameters` — an anonymous Object of user-defined name → value
 ///   pairs (Annex A models cue parameters as a free-form bag; the
-///   demuxer surfaces them under `cuepoint.<n>.parameters.<key>`).
+///   demuxer surfaces them under `cuepoint.<n>.parameters.<key>` via
+///   `flatten_amf_value`, which handles any AMF0 value type).
 ///
-/// The parameter bag is intentionally limited to `(name, String)`
-/// pairs because that is what the existing demuxer
-/// (`flatten_amf_value` → `metadata["cuepoint.N.parameters.<key>"]`)
-/// already round-trips through. Producers needing richer typed
-/// parameters can stitch them in at the AMF0 level themselves — this
-/// helper covers the common case (chapter markers, ad-insertion
-/// triggers, captions) without dragging an AMF builder API into the
-/// public surface.
+/// String parameters are the common case (chapter markers, ad-insertion
+/// triggers, captions) and have a dedicated `parameter(name, &str)`
+/// fast-path setter. Producers needing typed parameters (a Number
+/// duration, a Boolean flag, a nested Object) use the
+/// [`Self::parameter_typed`] setter with any [`MetaValue`]; both kinds
+/// emit into the same `parameters` Object in insertion order, and the
+/// demuxer's flatten walk round-trips them under
+/// `metadata["cuepoint.<n>.parameters.<key>"]` regardless of type.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CuePointParams {
     /// Producer-assigned identifier (`name` property).
@@ -828,9 +829,12 @@ pub struct CuePointParams {
     pub time_seconds: f64,
     /// Event / Navigation (`type` property).
     pub kind: CuePointType,
-    /// User-defined name → string parameter pairs (`parameters`
-    /// property). Empty when the cue carries no extra parameters.
-    pub parameters: Vec<(String, String)>,
+    /// User-defined parameter pairs (`parameters` property), each a
+    /// `(name, MetaValue)`. A string parameter is stored as
+    /// [`MetaValue::String`]; richer types ride the same vec. Empty when
+    /// the cue carries no extra parameters. Insertion order is preserved
+    /// on the wire so the round-trip is deterministic.
+    pub parameters: Vec<(String, MetaValue)>,
 }
 
 impl CuePointParams {
@@ -844,9 +848,21 @@ impl CuePointParams {
         }
     }
 
-    /// Append a user parameter `(name, value)` pair.
+    /// Append a user String parameter `(name, value)` pair — the common
+    /// case. Equivalent to `parameter_typed(name, MetaValue::String(..))`.
     pub fn parameter(mut self, name: &str, value: &str) -> Self {
-        self.parameters.push((name.to_string(), value.to_string()));
+        self.parameters
+            .push((name.to_string(), MetaValue::String(value.to_string())));
+        self
+    }
+
+    /// Append a typed user parameter `(name, value)` pair, where `value`
+    /// is any [`MetaValue`] (Number / Boolean / Date / nested Object /
+    /// …). The demuxer flattens it under
+    /// `metadata["cuepoint.<n>.parameters.<name>"]` (composite values
+    /// fan out with `.<subkey>` / `[i]` suffixes).
+    pub fn parameter_typed(mut self, name: &str, value: MetaValue) -> Self {
+        self.parameters.push((name.to_string(), value));
         self
     }
 }
@@ -884,7 +900,7 @@ pub fn write_on_cue_point_body(out: &mut Vec<u8>, params: &CuePointParams) -> Re
     amf0::write_object_start(out)?;
     for (k, v) in &params.parameters {
         amf0::write_property_name(out, k)?;
-        amf0::write_string(out, v)?;
+        write_meta_value(out, k, v)?;
     }
     amf0::write_object_end(out)?;
     amf0::write_object_end(out)?;
@@ -1213,6 +1229,49 @@ mod tests {
             ("title".into(), AmfValue::String("Intro".into()))
         );
         assert_eq!(params[1], ("section".into(), AmfValue::String("A".into())));
+    }
+
+    #[test]
+    fn on_cue_point_typed_parameters_round_trip_through_parser() {
+        // A mix of typed parameters: a Number duration, a Boolean flag,
+        // and a nested Object, alongside the legacy string fast-path.
+        let cue = CuePointParams::new("ad-break", 30.0, CuePointType::Event)
+            .parameter("label", "midroll")
+            .parameter_typed("duration", MetaValue::Number(15.0))
+            .parameter_typed("skippable", MetaValue::Boolean(true))
+            .parameter_typed(
+                "meta",
+                ObjectBuilder::new().string("campaign", "summer").build(),
+            );
+        let mut body = Vec::new();
+        write_on_cue_point_body(&mut body, &cue).unwrap();
+        let (_, p) = parse_amf0_value(&body, 0).unwrap();
+        let (value, np) = parse_amf0_value(&body, p).unwrap();
+        assert_eq!(np, body.len());
+        let entries = match value {
+            AmfValue::Object(b) => b,
+            other => panic!("expected object, got {other:?}"),
+        };
+        let params = match &entries[3].1 {
+            AmfValue::Object(b) => b,
+            other => panic!("parameters: expected object, got {other:?}"),
+        };
+        assert_eq!(params.len(), 4);
+        assert_eq!(
+            params[0],
+            ("label".into(), AmfValue::String("midroll".into()))
+        );
+        assert_eq!(params[1], ("duration".into(), AmfValue::Number(15.0)));
+        assert_eq!(params[2], ("skippable".into(), AmfValue::Boolean(true)));
+        match &params[3].1 {
+            AmfValue::Object(inner) => {
+                assert_eq!(
+                    inner[0],
+                    ("campaign".into(), AmfValue::String("summer".into()))
+                );
+            }
+            other => panic!("meta: expected object, got {other:?}"),
+        }
     }
 
     #[test]
