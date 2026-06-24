@@ -92,6 +92,17 @@ pub enum MetaValue {
         /// Wall-clock time of each keyframe in seconds.
         times_seconds: Vec<f64>,
     },
+    /// An anonymous AMF0 Object (`0x03`) carrying nested
+    /// `(property-name, value)` pairs in insertion order, terminated by
+    /// the `0x00 0x00 0x09` object-end marker. This is the muxer mirror
+    /// of the demuxer's structural `flatten_amf_value` walk: a producer
+    /// `onMetaData` property whose value is a sub-object (HDR config,
+    /// producer telemetry, the Enhanced-RTMP-v2 `videoTrackIdInfoMap` /
+    /// `audioTrackIdInfoMap` per-track maps, …) round-trips back through
+    /// `FlvDemuxer` flattened under `metadata["<key>.<subkey>"]`. Values
+    /// nest recursively, so a map-of-objects (each trackId keying a
+    /// per-track descriptor) is expressible directly.
+    Object(Vec<(String, MetaValue)>),
 }
 
 /// Ordered set of `onMetaData` properties to serialise.
@@ -181,6 +192,63 @@ impl MetadataBag {
         self
     }
 
+    /// Append a nested AMF0 Object property and return `self` for
+    /// chaining. The `value` is a [`MetaValue::Object`] carrying its own
+    /// ordered `(name, MetaValue)` pairs (themselves possibly nested),
+    /// so a producer-defined sub-object — an HDR config block, a
+    /// telemetry struct, or the Enhanced-RTMP-v2 per-track info maps —
+    /// round-trips back through [`crate::FlvDemuxer`] flattened under
+    /// `metadata["<key>.<subkey>"]`. Use [`ObjectBuilder`] to build the
+    /// nested value ergonomically:
+    ///
+    /// ```
+    /// use oxideav_flv::script::{MetadataBag, ObjectBuilder};
+    /// let bag = MetadataBag::new().object(
+    ///     "producerInfo",
+    ///     ObjectBuilder::new()
+    ///         .string("name", "oxideav")
+    ///         .number("buildno", 42.0)
+    ///         .build(),
+    /// );
+    /// assert_eq!(bag.len(), 1);
+    /// ```
+    pub fn object(mut self, key: &str, value: MetaValue) -> Self {
+        self.entries.push((key.to_string(), value));
+        self
+    }
+
+    /// Append the Enhanced-RTMP-v2 `videoTrackIdInfoMap` property — the
+    /// per-track metadata map for the additional (non-default) video
+    /// tracks of a multitrack stream (§"Enhancing onMetaData"). The
+    /// default track (trackId 0) is described by the top-level fields;
+    /// this map keys the variants by trackId 1, 2, …. Each entry's typed
+    /// scalars (`width` / `height` / `videodatarate` / `framerate` /
+    /// `videocodecid`) are written under the spec property names the
+    /// demuxer flattens to `metadata["videotrackidinfomap.<id>.<field>"]`
+    /// and [`crate::TypedMetadata::video_track_info_map`] reads back.
+    /// trackId 0 is rejected (it is the default track, never a map key).
+    pub fn video_track_info_map(mut self, map: &TrackInfoMap) -> Self {
+        self.entries.push((
+            "videoTrackIdInfoMap".to_string(),
+            map.to_meta_value(MediaKind::Video),
+        ));
+        self
+    }
+
+    /// Append the Enhanced-RTMP-v2 `audioTrackIdInfoMap` property — the
+    /// audio-side twin of [`Self::video_track_info_map`]. Each entry's
+    /// typed scalars (`audiodatarate` / `channels` / `samplerate` /
+    /// `audiocodecid`) are written under the spec property names the
+    /// demuxer flattens to `metadata["audiotrackidinfomap.<id>.<field>"]`
+    /// and [`crate::TypedMetadata::audio_track_info_map`] reads back.
+    pub fn audio_track_info_map(mut self, map: &TrackInfoMap) -> Self {
+        self.entries.push((
+            "audioTrackIdInfoMap".to_string(),
+            map.to_meta_value(MediaKind::Audio),
+        ));
+        self
+    }
+
     /// Number of properties in the bag.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -197,6 +265,277 @@ impl MetadataBag {
     }
 }
 
+/// Ergonomic builder for a [`MetaValue::Object`] — an ordered set of
+/// nested `(name, MetaValue)` pairs. Use it to construct producer-defined
+/// `onMetaData` sub-objects (HDR config, telemetry, per-track maps) that
+/// round-trip back through [`crate::FlvDemuxer`] flattened under
+/// `metadata["<prefix>.<key>"]`.
+///
+/// ```
+/// use oxideav_flv::script::ObjectBuilder;
+/// let obj = ObjectBuilder::new()
+///     .number("width", 1024.0)
+///     .number("height", 768.0)
+///     .build();
+/// ```
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ObjectBuilder {
+    entries: Vec<(String, MetaValue)>,
+}
+
+impl ObjectBuilder {
+    /// An empty object builder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a Number child property.
+    pub fn number(mut self, key: &str, n: f64) -> Self {
+        self.entries.push((key.to_string(), MetaValue::Number(n)));
+        self
+    }
+
+    /// Append a Boolean child property.
+    pub fn boolean(mut self, key: &str, b: bool) -> Self {
+        self.entries.push((key.to_string(), MetaValue::Boolean(b)));
+        self
+    }
+
+    /// Append a String child property.
+    pub fn string(mut self, key: &str, s: &str) -> Self {
+        self.entries
+            .push((key.to_string(), MetaValue::String(s.to_string())));
+        self
+    }
+
+    /// Append a Date child property (SCRIPTDATADATE, spec §E.4.4.3).
+    pub fn date(mut self, key: &str, time_ms: f64, tz: i16) -> Self {
+        self.entries
+            .push((key.to_string(), MetaValue::Date { time_ms, tz }));
+        self
+    }
+
+    /// Append a nested-Object child property.
+    pub fn object(mut self, key: &str, value: MetaValue) -> Self {
+        self.entries.push((key.to_string(), value));
+        self
+    }
+
+    /// Finish the builder into a [`MetaValue::Object`].
+    pub fn build(self) -> MetaValue {
+        MetaValue::Object(self.entries)
+    }
+}
+
+/// Which media side a [`TrackInfoMap`] describes — chooses the spec
+/// property names (`videodatarate` vs `audiodatarate`, etc.) emitted for
+/// each track entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MediaKind {
+    Video,
+    Audio,
+}
+
+/// One non-default track's metadata for an Enhanced-RTMP-v2
+/// `videoTrackIdInfoMap` / `audioTrackIdInfoMap` entry (§"Enhancing
+/// onMetaData"). Every field is `Option`, so a producer may emit a
+/// delta-style entry (only the fields that differ from the default
+/// track) or a full per-track descriptor — both are spec-valid. Build
+/// one with the chained setters; the relevant fields are written under
+/// the spec property names the demuxer flattens and
+/// [`crate::TypedVideoTrackInfo`] / [`crate::TypedAudioTrackInfo`] read
+/// back. Setting a field that belongs to the other media kind is a
+/// no-op on emit (a video-only `channels`, say, is simply not written).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrackInfo {
+    /// Video: pixel width (`width`).
+    pub width: Option<u32>,
+    /// Video: pixel height (`height`).
+    pub height: Option<u32>,
+    /// Video: frames per second (`framerate`).
+    pub framerate: Option<f64>,
+    /// Video: bitrate in kbps (`videodatarate`).
+    pub video_data_rate_kbps: Option<f64>,
+    /// Video: codec id — a legacy CodecID nibble or a FourCc UI32
+    /// (`videocodecid`).
+    pub video_codec_id: Option<u32>,
+    /// Audio: bitrate in kbps (`audiodatarate`).
+    pub audio_data_rate_kbps: Option<f64>,
+    /// Audio: channel count (`channels`).
+    pub channels: Option<u32>,
+    /// Audio: sample rate in Hz (`samplerate` — the per-track spelling,
+    /// distinct from the top-level `audiosamplerate`).
+    pub audio_sample_rate: Option<f64>,
+    /// Audio: codec id — a legacy CodecID nibble or a FourCc UI32
+    /// (`audiocodecid`).
+    pub audio_codec_id: Option<u32>,
+}
+
+impl TrackInfo {
+    /// An all-absent (delta-style empty) track entry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the video pixel width.
+    pub fn width(mut self, w: u32) -> Self {
+        self.width = Some(w);
+        self
+    }
+
+    /// Set the video pixel height.
+    pub fn height(mut self, h: u32) -> Self {
+        self.height = Some(h);
+        self
+    }
+
+    /// Set the video frame rate (fps).
+    pub fn framerate(mut self, fps: f64) -> Self {
+        self.framerate = Some(fps);
+        self
+    }
+
+    /// Set the video bitrate (kbps).
+    pub fn video_data_rate_kbps(mut self, kbps: f64) -> Self {
+        self.video_data_rate_kbps = Some(kbps);
+        self
+    }
+
+    /// Set the video codec id (legacy nibble or FourCc UI32).
+    pub fn video_codec_id(mut self, id: u32) -> Self {
+        self.video_codec_id = Some(id);
+        self
+    }
+
+    /// Set the audio bitrate (kbps).
+    pub fn audio_data_rate_kbps(mut self, kbps: f64) -> Self {
+        self.audio_data_rate_kbps = Some(kbps);
+        self
+    }
+
+    /// Set the audio channel count.
+    pub fn channels(mut self, c: u32) -> Self {
+        self.channels = Some(c);
+        self
+    }
+
+    /// Set the audio sample rate (Hz).
+    pub fn audio_sample_rate(mut self, hz: f64) -> Self {
+        self.audio_sample_rate = Some(hz);
+        self
+    }
+
+    /// Set the audio codec id (legacy nibble or FourCc UI32).
+    pub fn audio_codec_id(mut self, id: u32) -> Self {
+        self.audio_codec_id = Some(id);
+        self
+    }
+
+    /// Lower this entry into the ordered `(name, MetaValue)` pairs for
+    /// the chosen media kind, in the spec example's field order. Codec
+    /// ids and other integer-valued scalars all serialise as AMF0
+    /// Numbers (doubles) per the spec.
+    fn to_pairs(&self, kind: MediaKind) -> Vec<(String, MetaValue)> {
+        let mut out: Vec<(String, MetaValue)> = Vec::new();
+        match kind {
+            MediaKind::Video => {
+                if let Some(v) = self.width {
+                    out.push(("width".into(), MetaValue::Number(v as f64)));
+                }
+                if let Some(v) = self.height {
+                    out.push(("height".into(), MetaValue::Number(v as f64)));
+                }
+                if let Some(v) = self.video_data_rate_kbps {
+                    out.push(("videodatarate".into(), MetaValue::Number(v)));
+                }
+                if let Some(v) = self.framerate {
+                    out.push(("framerate".into(), MetaValue::Number(v)));
+                }
+                if let Some(v) = self.video_codec_id {
+                    out.push(("videocodecid".into(), MetaValue::Number(v as f64)));
+                }
+            }
+            MediaKind::Audio => {
+                if let Some(v) = self.audio_data_rate_kbps {
+                    out.push(("audiodatarate".into(), MetaValue::Number(v)));
+                }
+                if let Some(v) = self.channels {
+                    out.push(("channels".into(), MetaValue::Number(v as f64)));
+                }
+                if let Some(v) = self.audio_sample_rate {
+                    out.push(("samplerate".into(), MetaValue::Number(v)));
+                }
+                if let Some(v) = self.audio_codec_id {
+                    out.push(("audiocodecid".into(), MetaValue::Number(v as f64)));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The Enhanced-RTMP-v2 per-track info map (`videoTrackIdInfoMap` /
+/// `audioTrackIdInfoMap`, §"Enhancing onMetaData"): an ordered set of
+/// `(trackId, TrackInfo)` entries keyed by the non-default trackIds
+/// (1, 2, …). The wire shape is an anonymous AMF0 Object whose property
+/// names are the decimal trackId strings and whose values are the
+/// per-track descriptor sub-objects. Insertion order is preserved on the
+/// wire so the round-trip bytes are deterministic.
+///
+/// ```
+/// use oxideav_flv::script::{MetadataBag, TrackInfo, TrackInfoMap};
+/// let map = TrackInfoMap::new()
+///     .track(1, TrackInfo::new().width(1024).height(768))
+///     .track(2, TrackInfo::new().width(3840).height(2160));
+/// let bag = MetadataBag::new().video_track_info_map(&map);
+/// assert_eq!(bag.len(), 1);
+/// ```
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrackInfoMap {
+    entries: Vec<(u32, TrackInfo)>,
+}
+
+impl TrackInfoMap {
+    /// An empty map.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add (or, if `track_id` is already present, append a duplicate
+    /// entry for) a non-default track. trackId 0 is the default track —
+    /// described by the top-level `onMetaData` fields — and is never a
+    /// map key; passing it makes [`MetadataBag::video_track_info_map`] /
+    /// [`MetadataBag::audio_track_info_map`] emit a `"0"` key the
+    /// demuxer's `TypedMetadata` track iterators deliberately skip, so
+    /// callers should start at 1.
+    pub fn track(mut self, track_id: u32, info: TrackInfo) -> Self {
+        self.entries.push((track_id, info));
+        self
+    }
+
+    /// Number of track entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when no track entries have been added.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Lower the whole map into a [`MetaValue::Object`] keyed by the
+    /// decimal trackId strings, each value the per-track descriptor for
+    /// the chosen media kind.
+    fn to_meta_value(&self, kind: MediaKind) -> MetaValue {
+        let pairs = self
+            .entries
+            .iter()
+            .map(|(id, info)| (id.to_string(), MetaValue::Object(info.to_pairs(kind))))
+            .collect();
+        MetaValue::Object(pairs)
+    }
+}
+
 /// Serialise just the `onMetaData` `ScriptTagBody` (no tag framing) into
 /// `out`: the String name `"onMetaData"` followed by an ECMA array of
 /// the bag's properties (spec §E.4.1 ScriptTagBody, §E.5).
@@ -209,26 +548,44 @@ pub fn write_on_metadata_body(out: &mut Vec<u8>, bag: &MetadataBag) -> Result<()
     amf0::write_ecma_array_start(out, bag.len() as u32)?;
     for (key, value) in bag.entries() {
         amf0::write_property_name(out, key)?;
-        match value {
-            MetaValue::Number(n) => amf0::write_number(out, *n)?,
-            MetaValue::Boolean(b) => amf0::write_boolean(out, *b)?,
-            MetaValue::String(s) => amf0::write_string(out, s)?,
-            MetaValue::Date { time_ms, tz } => {
-                if !time_ms.is_finite() {
-                    return Err(Error::invalid(format!(
-                        "FLV onMetaData Date property {key:?}: \
-                         time_ms must be finite (saw {time_ms})"
-                    )));
-                }
-                amf0::write_date(out, *time_ms, *tz)?;
-            }
-            MetaValue::Keyframes {
-                file_positions,
-                times_seconds,
-            } => write_keyframes_object(out, file_positions, times_seconds)?,
-        }
+        write_meta_value(out, key, value)?;
     }
     amf0::write_object_end(out)?;
+    Ok(())
+}
+
+/// Serialise a single [`MetaValue`] into `out`. `key` is the property
+/// name it was bound to (used only for error context). Recurses for
+/// [`MetaValue::Object`] so arbitrarily nested producer sub-objects —
+/// including the per-track info maps — serialise to the AMF0 anonymous
+/// Object shape the demuxer's `flatten_amf_value` walk reads back.
+fn write_meta_value(out: &mut Vec<u8>, key: &str, value: &MetaValue) -> Result<()> {
+    match value {
+        MetaValue::Number(n) => amf0::write_number(out, *n)?,
+        MetaValue::Boolean(b) => amf0::write_boolean(out, *b)?,
+        MetaValue::String(s) => amf0::write_string(out, s)?,
+        MetaValue::Date { time_ms, tz } => {
+            if !time_ms.is_finite() {
+                return Err(Error::invalid(format!(
+                    "FLV onMetaData Date property {key:?}: \
+                     time_ms must be finite (saw {time_ms})"
+                )));
+            }
+            amf0::write_date(out, *time_ms, *tz)?;
+        }
+        MetaValue::Keyframes {
+            file_positions,
+            times_seconds,
+        } => write_keyframes_object(out, file_positions, times_seconds)?,
+        MetaValue::Object(pairs) => {
+            amf0::write_object_start(out)?;
+            for (k, v) in pairs {
+                amf0::write_property_name(out, k)?;
+                write_meta_value(out, k, v)?;
+            }
+            amf0::write_object_end(out)?;
+        }
+    }
     Ok(())
 }
 
@@ -854,5 +1211,177 @@ mod tests {
     fn cue_point_type_wire_strings_match_demuxer_expectation() {
         assert_eq!(CuePointType::Event.as_str(), "event");
         assert_eq!(CuePointType::Navigation.as_str(), "navigation");
+    }
+
+    // Helper: parse the `onMetaData` body and return the ECMA-array
+    // properties (skipping the name string).
+    fn parse_meta_props(body: &[u8]) -> Vec<(String, AmfValue)> {
+        let (name, p) = parse_amf0_value(body, 0).unwrap();
+        assert_eq!(name, AmfValue::String("onMetaData".into()));
+        let (value, np) = parse_amf0_value(body, p).unwrap();
+        assert_eq!(np, body.len(), "ECMA array must consume the body exactly");
+        match value {
+            AmfValue::EcmaArray(props) => props,
+            other => panic!("expected ecma array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_object_property_round_trips_through_parser() {
+        let bag = MetadataBag::new().number("duration", 2.0).object(
+            "producerInfo",
+            ObjectBuilder::new()
+                .string("name", "oxideav")
+                .number("buildno", 42.0)
+                .build(),
+        );
+        let mut body = Vec::new();
+        write_on_metadata_body(&mut body, &bag).unwrap();
+
+        let props = parse_meta_props(&body);
+        assert_eq!(props.len(), 2);
+        assert_eq!(props[0], ("duration".into(), AmfValue::Number(2.0)));
+        match &props[1] {
+            (k, AmfValue::Object(inner)) if k == "producerInfo" => {
+                assert_eq!(
+                    inner[0],
+                    ("name".into(), AmfValue::String("oxideav".into()))
+                );
+                assert_eq!(inner[1], ("buildno".into(), AmfValue::Number(42.0)));
+            }
+            other => panic!("expected producerInfo object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_object_recurses() {
+        let bag = MetadataBag::new().object(
+            "outer",
+            ObjectBuilder::new()
+                .object("inner", ObjectBuilder::new().number("leaf", 7.0).build())
+                .build(),
+        );
+        let mut body = Vec::new();
+        write_on_metadata_body(&mut body, &bag).unwrap();
+        let props = parse_meta_props(&body);
+        let outer = match &props[0] {
+            (k, AmfValue::Object(b)) if k == "outer" => b,
+            other => panic!("expected outer, got {other:?}"),
+        };
+        let inner = match &outer[0] {
+            (k, AmfValue::Object(b)) if k == "inner" => b,
+            other => panic!("expected inner, got {other:?}"),
+        };
+        assert_eq!(inner[0], ("leaf".into(), AmfValue::Number(7.0)));
+    }
+
+    #[test]
+    fn video_track_info_map_emits_spec_property_names_and_keys() {
+        // Mirrors the spec example (§"Enhancing onMetaData"): trackId 1
+        // is a full descriptor, trackId 2 a delta-style entry.
+        let map = TrackInfoMap::new()
+            .track(
+                1,
+                TrackInfo::new()
+                    .width(1024)
+                    .height(768)
+                    .video_data_rate_kbps(2000.0)
+                    .video_codec_id(1_635_135_537), // makeFourCc("av01")
+            )
+            .track(2, TrackInfo::new().width(3840).height(2160));
+        let bag = MetadataBag::new().video_track_info_map(&map);
+        let mut body = Vec::new();
+        write_on_metadata_body(&mut body, &bag).unwrap();
+
+        let props = parse_meta_props(&body);
+        assert_eq!(props.len(), 1);
+        let outer = match &props[0] {
+            (k, AmfValue::Object(b)) if k == "videoTrackIdInfoMap" => b,
+            other => panic!("expected videoTrackIdInfoMap, got {other:?}"),
+        };
+        // Keys are decimal trackId strings in insertion order.
+        assert_eq!(outer[0].0, "1");
+        assert_eq!(outer[1].0, "2");
+        let t1 = match &outer[0].1 {
+            AmfValue::Object(b) => b,
+            other => panic!("expected track1 object, got {other:?}"),
+        };
+        assert_eq!(t1[0], ("width".into(), AmfValue::Number(1024.0)));
+        assert_eq!(t1[1], ("height".into(), AmfValue::Number(768.0)));
+        assert_eq!(t1[2], ("videodatarate".into(), AmfValue::Number(2000.0)));
+        assert_eq!(
+            t1[3],
+            ("videocodecid".into(), AmfValue::Number(1_635_135_537.0))
+        );
+        // Delta-style track 2 carries only width / height.
+        let t2 = match &outer[1].1 {
+            AmfValue::Object(b) => b,
+            other => panic!("expected track2 object, got {other:?}"),
+        };
+        assert_eq!(t2.len(), 2);
+        assert_eq!(t2[0], ("width".into(), AmfValue::Number(3840.0)));
+        assert_eq!(t2[1], ("height".into(), AmfValue::Number(2160.0)));
+    }
+
+    #[test]
+    fn audio_track_info_map_emits_audio_property_names() {
+        let map = TrackInfoMap::new().track(
+            1,
+            TrackInfo::new()
+                .audio_data_rate_kbps(256.0)
+                .channels(2)
+                .audio_sample_rate(44_100.0)
+                .audio_codec_id(1_297_377_380), // makeFourCc("Mp4a")-style UI32
+        );
+        let bag = MetadataBag::new().audio_track_info_map(&map);
+        let mut body = Vec::new();
+        write_on_metadata_body(&mut body, &bag).unwrap();
+        let props = parse_meta_props(&body);
+        let outer = match &props[0] {
+            (k, AmfValue::Object(b)) if k == "audioTrackIdInfoMap" => b,
+            other => panic!("expected audioTrackIdInfoMap, got {other:?}"),
+        };
+        let t1 = match &outer[0].1 {
+            AmfValue::Object(b) => b,
+            other => panic!("expected track1 object, got {other:?}"),
+        };
+        assert_eq!(t1[0], ("audiodatarate".into(), AmfValue::Number(256.0)));
+        assert_eq!(t1[1], ("channels".into(), AmfValue::Number(2.0)));
+        assert_eq!(t1[2], ("samplerate".into(), AmfValue::Number(44_100.0)));
+        assert_eq!(t1[3].0, "audiocodecid");
+    }
+
+    #[test]
+    fn track_info_map_ignores_cross_kind_fields() {
+        // A `channels` set on a *video* entry must not be written
+        // (it belongs to the audio side); and vice-versa.
+        let map = TrackInfoMap::new().track(1, TrackInfo::new().width(640).channels(6));
+        let bag = MetadataBag::new().video_track_info_map(&map);
+        let mut body = Vec::new();
+        write_on_metadata_body(&mut body, &bag).unwrap();
+        let props = parse_meta_props(&body);
+        let outer = match &props[0] {
+            (_, AmfValue::Object(b)) => b,
+            other => panic!("expected object, got {other:?}"),
+        };
+        let t1 = match &outer[0].1 {
+            AmfValue::Object(b) => b,
+            other => panic!("expected track object, got {other:?}"),
+        };
+        // Only `width` survives — `channels` is an audio field.
+        assert_eq!(t1.len(), 1);
+        assert_eq!(t1[0].0, "width");
+    }
+
+    #[test]
+    fn empty_track_info_map_emits_empty_object() {
+        let bag = MetadataBag::new().video_track_info_map(&TrackInfoMap::new());
+        let mut body = Vec::new();
+        write_on_metadata_body(&mut body, &bag).unwrap();
+        let props = parse_meta_props(&body);
+        match &props[0] {
+            (k, AmfValue::Object(b)) if k == "videoTrackIdInfoMap" => assert!(b.is_empty()),
+            other => panic!("expected empty videoTrackIdInfoMap, got {other:?}"),
+        }
     }
 }

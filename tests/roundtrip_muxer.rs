@@ -165,6 +165,124 @@ fn on_metadata_date_round_trips_negative_offset() {
 }
 
 #[test]
+fn on_metadata_video_track_info_map_round_trips_through_typed_accessor() {
+    use oxideav_flv::{TrackInfo, TrackInfoMap, TypedMetadata};
+
+    // Mux the spec's `videoTrackIdInfoMap` example (§"Enhancing
+    // onMetaData"): trackId 1 a full descriptor, trackId 2 delta-style.
+    let map = TrackInfoMap::new()
+        .track(
+            1,
+            TrackInfo::new()
+                .width(1024)
+                .height(768)
+                .video_data_rate_kbps(2000.0)
+                .video_codec_id(1_635_135_537), // makeFourCc("av01")
+        )
+        .track(2, TrackInfo::new().width(3840).height(2160));
+
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let bag = MetadataBag::new()
+        .number("width", 640.0)
+        .video_track_info_map(&map);
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+    // A video keyframe so stream discovery succeeds.
+    tag::write_h263_tag(&mut buf, 0, true, &[0xAA, 0xBB, 0xCC]).unwrap();
+
+    let dmx = open(buf);
+    let md = dmx.metadata();
+
+    // Raw flattened keys appear exactly as for an external producer.
+    let lookup = |k: &str| md.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+    assert_eq!(lookup("videotrackidinfomap.1.width"), Some("1024"));
+    assert_eq!(
+        lookup("videotrackidinfomap.1.videocodecid"),
+        Some("1635135537")
+    );
+    assert_eq!(lookup("videotrackidinfomap.2.height"), Some("2160"));
+
+    // The typed iterator re-types each non-zero trackId entry.
+    let typed = TypedMetadata::new(md);
+    let tracks: Vec<_> = typed.video_track_info_map().collect();
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].track_id(), 1);
+    assert_eq!(tracks[0].width(), Some(1024));
+    assert_eq!(tracks[0].height(), Some(768));
+    assert_eq!(tracks[0].video_data_rate_kbps(), Some(2000.0));
+    // FourCc-packed codec id resolves to the canonical short id.
+    assert_eq!(tracks[0].video_codec_id_str().as_deref(), Some("av1"));
+    assert_eq!(tracks[1].track_id(), 2);
+    assert_eq!(tracks[1].width(), Some(3840));
+    // Delta-style entry: track 2 sent no datarate.
+    assert_eq!(tracks[1].video_data_rate_kbps(), None);
+}
+
+#[test]
+fn on_metadata_audio_track_info_map_round_trips_through_typed_accessor() {
+    use oxideav_flv::{TrackInfo, TrackInfoMap, TypedMetadata};
+
+    let map = TrackInfoMap::new()
+        .track(
+            1,
+            TrackInfo::new()
+                .audio_data_rate_kbps(256.0)
+                .channels(2)
+                .audio_sample_rate(44_100.0)
+                .audio_codec_id(1_332_770_163), // makeFourCc("Opus")
+        )
+        .track(2, TrackInfo::new().audio_data_rate_kbps(320.0));
+
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let bag = MetadataBag::new().audio_track_info_map(&map);
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+    tag::write_mp3_tag(&mut buf, 0, 3, true, true, &mp3_frames()[0]).unwrap();
+
+    let dmx = open(buf);
+    let typed = TypedMetadata::new(dmx.metadata());
+    let tracks: Vec<_> = typed.audio_track_info_map().collect();
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].track_id(), 1);
+    assert_eq!(tracks[0].audio_data_rate_kbps(), Some(256.0));
+    assert_eq!(tracks[0].channels(), Some(2));
+    assert_eq!(tracks[0].audio_sample_rate(), Some(44_100.0));
+    assert_eq!(tracks[0].audio_codec_id_str().as_deref(), Some("opus"));
+    assert_eq!(tracks[1].track_id(), 2);
+    assert_eq!(tracks[1].audio_data_rate_kbps(), Some(320.0));
+    // Delta-style: track 2 sent no channels.
+    assert_eq!(tracks[1].channels(), None);
+}
+
+#[test]
+fn on_metadata_nested_object_round_trips_flattened() {
+    use oxideav_flv::script::ObjectBuilder;
+
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let bag = MetadataBag::new().object(
+        "producerInfo",
+        ObjectBuilder::new()
+            .string("name", "oxideav")
+            .number("buildno", 42.0)
+            .build(),
+    );
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+    tag::write_mp3_tag(&mut buf, 0, 3, true, true, &mp3_frames()[0]).unwrap();
+
+    let dmx = open(buf);
+    let md = dmx.metadata();
+    let lookup = |k: &str| md.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+    // The demuxer's flatten walker exposes nested leaves under
+    // `<key>.<subkey>` — exactly as for an external producer.
+    assert_eq!(lookup("producerInfo.name"), Some("oxideav"));
+    assert_eq!(lookup("producerInfo.buildno"), Some("42"));
+}
+
+#[test]
 fn single_audio_stream_is_mp3() {
     let (bytes, _) = build_flv();
     let dmx = open(bytes);
