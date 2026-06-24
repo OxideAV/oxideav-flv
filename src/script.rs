@@ -21,18 +21,23 @@
 //! The spec does not mandate property ordering; [`MetadataBag`]
 //! preserves insertion order so the emitted bytes are deterministic and
 //! a byte-exact round-trip through [`crate::FlvDemuxer`] is reproducible.
-//! In addition to the three AMF0 scalar types ([`MetaValue::Number`] /
-//! [`MetaValue::Boolean`] / [`MetaValue::String`]), the bag also models
-//! the `onMetaData.keyframes` seek-table composite via
-//! [`MetaValue::Keyframes`] — an anonymous AMF0 Object carrying two
-//! parallel SCRIPTDATASTRICTARRAY properties (`filepositions[]` and
-//! `times[]`) that the demuxer harvests for the O(log n) seek-by-pts
-//! bisect path (see [`crate::FlvDemuxer`] `seek_to`). The wire layout
-//! follows §E.4.4 / §E.4.4.7 / §E.4.4.9 (StrictArray); the property
-//! name `"keyframes"` and the inner field names `"filepositions"` /
-//! `"times"` are the de-facto convention every keyframe-indexed FLV
-//! producer follows and which `FlvDemuxer` parses on the read side.
-//! Per-track info maps remain out of scope for this slice.
+//! [`MetaValue`]'s type matrix mirrors the matrix the demuxer parses:
+//! the AMF0 scalars ([`MetaValue::Number`] / [`MetaValue::Boolean`] /
+//! [`MetaValue::String`] / [`MetaValue::Date`] / [`MetaValue::Null`] /
+//! [`MetaValue::Undefined`] / [`MetaValue::Xml`]) plus the composites
+//! [`MetaValue::Object`] / [`MetaValue::EcmaArray`] /
+//! [`MetaValue::StrictArray`] (round-tripped flattened under
+//! `metadata["<key>.<subkey>"]` / `metadata["<key>[i]"]`) and the
+//! `onMetaData.keyframes` seek-table via [`MetaValue::Keyframes`] — an
+//! anonymous AMF0 Object carrying two parallel SCRIPTDATASTRICTARRAY
+//! properties (`filepositions[]` and `times[]`) the demuxer harvests for
+//! the O(log n) seek-by-pts bisect path (see [`crate::FlvDemuxer`]
+//! `seek_to`). The keyframes wire layout follows §E.4.4 / §E.4.4.7 /
+//! §E.4.4.9; the property name `"keyframes"` and the inner field names
+//! `"filepositions"` / `"times"` are the de-facto convention every
+//! keyframe-indexed FLV producer follows and which `FlvDemuxer` parses.
+//! The Enhanced-RTMP-v2 §"Enhancing onMetaData" per-track info maps
+//! ([`TrackInfoMap`] / [`TrackInfo`]) build on [`MetaValue::Object`].
 
 use std::io::Write;
 

@@ -501,20 +501,33 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | NetConnection `connect` command (E-RTMP capability declaration) | `connect::write_connect_command(txn, &ConnectCommandObject)` / `write_command_object` / `parse_connect_command` | enhanced-rtmp v2 §"Enhancing NetConnection connect Command" |
 | `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |
 | `onMetaData.keyframes` seek-table composite | `MetadataBag::keyframes(file_positions, times_seconds)` + AMF0 `write_strict_array_number` | §E.4.4.7 / §E.4.4.9 |
+| `onMetaData` nested object / per-track info maps | `MetadataBag::object` / `video_track_info_map` / `audio_track_info_map` (+ `ObjectBuilder` / `TrackInfo` / `TrackInfoMap`) | enhanced-rtmp v2 §"Enhancing onMetaData" |
+| `onMetaData` AMF0 Null / Undefined / Xml / EcmaArray / StrictArray values | `MetadataBag::null` / `undefined` / `xml` / `strict_array` (+ `amf0::write_undefined` / `write_xml` / `write_strict_array_start`) | AMF0 §2.7 / §2.8 / §2.12 / §2.17 |
 | `onCuePoint` script tag (Annex A embedded cue point) | `script::write_on_cue_point(w, ts_ms, &CuePointParams)` | Annex A.2 |
 | `onXMPData` script tag (XMP metadata) | `script::write_on_xmp_data(w, ts_ms, live_xml)` | §E.6 |
 
 `write_tag` returns the total bytes written (`11 + body.len() + 4`) and
 emits the trailing `PreviousTagSize = 11 + DataSize` back-pointer.
-`MetadataBag` is an ordered bag of the four AMF0 scalar property types
-(Number / Boolean / String / Date — `MetadataBag::date(key, time_ms, tz)`
-emits a SCRIPTDATADATE the demuxer surfaces under the
-`"date:<ms>tz:<offset>"` carrier and `TypedMetadata::creationdate_as_date`
-decodes back into the `(time_ms, tz)` pair) plus the `keyframes` seek-table composite
-(`MetaValue::Keyframes { file_positions: Vec<u64>, times_seconds:
-Vec<f64> }`, emitted as an anonymous AMF0 Object carrying two parallel
-SCRIPTDATASTRICTARRAY properties `filepositions` and `times`); insertion
-order is preserved on the wire so the output is deterministic. The
+`MetadataBag` is an ordered bag whose value-type matrix now mirrors the
+matrix the demuxer parses on the read side. Scalars: Number / Boolean /
+String / Date (`MetadataBag::date(key, time_ms, tz)` emits a
+SCRIPTDATADATE the demuxer surfaces under the `"date:<ms>tz:<offset>"`
+carrier and `TypedMetadata::creationdate_as_date` decodes back into the
+`(time_ms, tz)` pair) / Null / Undefined / XMLDocument
+(`MetadataBag::null` / `undefined` / `xml`, flattened by the demuxer to
+the `"null"` / `"undefined"` sentinels and the verbatim XML string).
+Composites: the `keyframes` seek-table (`MetaValue::Keyframes {
+file_positions, times_seconds }`, two parallel SCRIPTDATASTRICTARRAY
+properties); arbitrary nested objects (`MetadataBag::object` +
+`ObjectBuilder`, round-tripped flattened under
+`metadata["<key>.<subkey>"]`); the Enhanced-RTMP-v2 §"Enhancing
+onMetaData" per-track info maps (`MetadataBag::video_track_info_map` /
+`audio_track_info_map` from a typed `TrackInfoMap` of `TrackInfo`
+entries keyed by trackId, read back through
+`TypedMetadata::video_track_info_map` / `audio_track_info_map`); a
+mixed-type ECMA array (`MetaValue::EcmaArray`) and dense strict array
+(`MetadataBag::strict_array`, flattened under `metadata["<key>[i]"]`).
+Insertion order is preserved on the wire so the output is deterministic. The
 `keyframes` writer validates the toc invariants the demuxer enforces on
 the read side (non-empty, parallel-length, ascending finite `times`,
 `filepositions` ≤ `2^53` so they survive the AMF0 Number round-trip)
@@ -530,9 +543,13 @@ Annex A embedded cue point. The typed [`CuePointParams`] pack carries
 the four spec-conventional properties — `name` (producer identifier),
 `time_seconds` (Number, validated finite), `kind` (
 [`CuePointType::Event`] / [`CuePointType::Navigation`], wire-spelled
-`"event"` / `"navigation"`), and a `parameters` Object of `(name,
-string)` pairs the demuxer surfaces under
-`metadata["cuepoint.<n>.parameters.<key>"]`. `timestamp_ms` is the
+`"event"` / `"navigation"`), and a `parameters` Object of typed
+`(name, MetaValue)` pairs the demuxer surfaces under
+`metadata["cuepoint.<n>.parameters.<key>"]`. The
+`CuePointParams::parameter(name, &str)` setter is the string fast-path;
+`parameter_typed(name, MetaValue)` accepts a Number / Boolean / Date /
+nested Object / array parameter (composite values fan out with
+`.<subkey>` / `[i]` on the read side). `timestamp_ms` is the
 playback alignment timestamp the runtime dispatches on (Annex A.4:
 the AMF data track is interleaved at the right time alongside audio
 and video). `script::write_on_xmp_data(w, ts_ms, live_xml)` emits an
