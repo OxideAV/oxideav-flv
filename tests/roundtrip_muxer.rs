@@ -21,7 +21,7 @@ use oxideav_flv::{
     tag, FlvDemuxer, FlvHeader,
 };
 use oxideav_flv::{
-    write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_aac_raw_tag,
+    join_tracks, write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_aac_raw_tag,
     write_aac_sequence_header, write_ac3_coded_frames, write_av1_coded_frames,
     write_av1_sequence_start, write_avc_nalu_tag, write_avc_sequence_header,
     write_eac3_coded_frames, write_ex_audio_multichannel_config, write_ex_audio_sequence_end,
@@ -33,8 +33,8 @@ use oxideav_flv::{
     write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
     write_vvc_sequence_start, AudioChannel, AudioChannelOrder, AvMultitrackType, ColorConfig,
     ColorInfo, ExAudioPacketType, ExAudioTagHeader, ExFrameType, ExPacketType, ExVideoTagHeader,
-    HdrCll, HdrMdcv, ModExEntry, ModExPayload, MultichannelConfig, FOURCC_AUDIO_AAC, FOURCC_AV01,
-    FOURCC_OPUS,
+    HdrCll, HdrMdcv, JoinTrack, ModExEntry, ModExPayload, MultichannelConfig, FOURCC_AUDIO_AAC,
+    FOURCC_AV01, FOURCC_OPUS, FOURCC_VP09,
 };
 
 /// Three distinct synthetic MP3 frame payloads. The demuxer treats an
@@ -1495,6 +1495,172 @@ fn ex_audio_multitrack_many_tracks_round_trips_default_track() {
         "ManyTracks default-track payload (trackId 0) must surface verbatim"
     );
     assert_eq!(p.pts, Some(46));
+}
+
+// ---- Multitrack write (join_tracks) → demux side-channel round-trip --------
+//
+// The prior multitrack tests hand-rolled the `[FourCc?] trackId UI8
+// sizeOfTrack UI24 payload` body bytes and only asserted the default
+// track on the trait-object packet. These close the *write-side* loop:
+// the body is produced by the `join_tracks` serialiser (the documented
+// inverse of `split_tracks`), threaded through `write_ex_*_tag`, demuxed
+// via the concrete `FlvDemuxer`, and EVERY track is recovered through
+// `last_multitrack_tracks()` — the per-track trackId, FourCc, resolved
+// codec name, and payload all survive end to end.
+
+#[test]
+fn video_many_tracks_join_round_trips_all_tracks_via_side_channel() {
+    // ManyTracks (shared AV1 codec) — 3 variants. `join_tracks` writes
+    // the UI24-delimited per-track loop; the demuxer surfaces the default
+    // track as the packet and the full set on the side-channel.
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0x81, 0x05, 0x0C];
+    write_av1_sequence_start(&mut buf, 0, &config).unwrap();
+
+    let payloads = [
+        vec![0xA0, 0xA1, 0xA2],             // trackId 0 (default, 4K)
+        vec![0xB0, 0xB1, 0xB2, 0xB3],       // trackId 1 (1080p)
+        vec![0xC0, 0xC1, 0xC2, 0xC3, 0xC4], // trackId 2 (720p)
+    ];
+    let tracks: Vec<JoinTrack> = payloads
+        .iter()
+        .enumerate()
+        .map(|(i, p)| JoinTrack::new(i as u8, FOURCC_AV01, p.clone()))
+        .collect();
+    let mt_body = join_tracks(AvMultitrackType::ManyTracks, &tracks).unwrap();
+
+    let header_struct = ExVideoTagHeader {
+        frame_type: ExFrameType::KeyFrame,
+        packet_type: ExPacketType::CodedFrames,
+        fourcc: Some(FOURCC_AV01),
+        multitrack: Some(AvMultitrackType::ManyTracks),
+        bytes_consumed: 0,
+        composition_time_offset_ms: None,
+        timestamp_offset_nano: 0,
+        mod_ex_entries: Vec::new(),
+        video_command: None,
+    };
+    write_ex_video_tag(&mut buf, 70, &header_struct, &mt_body).unwrap();
+
+    let mut dmx = open_concrete(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "av1");
+    let _seq = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, payloads[0], "default track surfaces as the packet");
+    assert_eq!(p.pts, Some(70));
+
+    let tracks = dmx
+        .last_multitrack_tracks()
+        .expect("multitrack side-channel populated");
+    assert_eq!(tracks.len(), 3);
+    for (i, t) in tracks.iter().enumerate() {
+        assert_eq!(t.track_id, i as u8);
+        assert_eq!(t.fourcc, FOURCC_AV01, "shared FourCc on every track");
+        assert_eq!(t.codec_name, "av1");
+        assert_eq!(t.payload, payloads[i], "track {i} payload verbatim");
+    }
+}
+
+#[test]
+fn video_many_tracks_many_codecs_join_round_trips_per_track_fourcc() {
+    // ManyTracksManyCodecs — each track carries its own FourCc on the
+    // wire. Mix AV1 (default) + VP9 so the per-track FourCc recovery is
+    // observable (a shared-codec test couldn't tell them apart).
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0x81, 0x05, 0x0C];
+    write_av1_sequence_start(&mut buf, 0, &config).unwrap();
+
+    let av1_payload = vec![0xAA, 0xBB, 0xCC];
+    let vp9_payload = vec![0xDD, 0xEE, 0xFF, 0x00];
+    let tracks = vec![
+        JoinTrack::new(0, FOURCC_AV01, av1_payload.clone()),
+        JoinTrack::new(1, FOURCC_VP09, vp9_payload.clone()),
+    ];
+    let mt_body = join_tracks(AvMultitrackType::ManyTracksManyCodecs, &tracks).unwrap();
+
+    let header_struct = ExVideoTagHeader {
+        frame_type: ExFrameType::KeyFrame,
+        packet_type: ExPacketType::CodedFrames,
+        // ManyTracksManyCodecs: no shared header FourCc (each track
+        // carries its own). The Ex header FourCc field is `None`.
+        fourcc: None,
+        multitrack: Some(AvMultitrackType::ManyTracksManyCodecs),
+        bytes_consumed: 0,
+        composition_time_offset_ms: None,
+        timestamp_offset_nano: 0,
+        mod_ex_entries: Vec::new(),
+        video_command: None,
+    };
+    write_ex_video_tag(&mut buf, 70, &header_struct, &mt_body).unwrap();
+
+    let mut dmx = open_concrete(buf);
+    let _seq = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, av1_payload, "default (AV1) track is the packet");
+
+    let tracks = dmx
+        .last_multitrack_tracks()
+        .expect("multitrack side-channel populated");
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].fourcc, FOURCC_AV01);
+    assert_eq!(tracks[0].codec_name, "av1");
+    assert_eq!(tracks[0].payload, av1_payload);
+    assert_eq!(tracks[1].fourcc, FOURCC_VP09);
+    assert_eq!(tracks[1].codec_name, "vp9");
+    assert_eq!(tracks[1].payload, vp9_payload);
+}
+
+#[test]
+fn audio_many_tracks_many_codecs_join_round_trips_per_track_fourcc() {
+    // Audio ManyTracksManyCodecs — Opus (default) + FLAC. Confirms the
+    // audio FourCc name table resolves per-track on the side-channel.
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let opus_head = vec![b'O', b'p', b'u', b's', b'H', b'e', b'a', b'd'];
+    write_opus_sequence_start(&mut buf, 0, &opus_head).unwrap();
+
+    let opus_au = vec![0x10, 0x20, 0x30];
+    let flac_au = vec![0x40, 0x50, 0x60, 0x70];
+    let flac_fourcc = u32::from_be_bytes(*b"fLaC");
+    let tracks = vec![
+        JoinTrack::new(0, FOURCC_OPUS, opus_au.clone()),
+        JoinTrack::new(1, flac_fourcc, flac_au.clone()),
+    ];
+    let mt_body = join_tracks(AvMultitrackType::ManyTracksManyCodecs, &tracks).unwrap();
+
+    let header_struct = ExAudioTagHeader {
+        packet_type: ExAudioPacketType::CodedFrames,
+        fourcc: None,
+        multitrack: Some(AvMultitrackType::ManyTracksManyCodecs),
+        timestamp_offset_nano: 0,
+        mod_ex_entries: Vec::new(),
+        bytes_consumed: 0,
+    };
+    write_ex_audio_tag(&mut buf, 30, &header_struct, &mt_body).unwrap();
+
+    let mut dmx = open_concrete(buf);
+    let _seq = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, opus_au, "default (Opus) track is the packet");
+
+    let tracks = dmx
+        .last_multitrack_tracks()
+        .expect("multitrack side-channel populated");
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].fourcc, FOURCC_OPUS);
+    assert_eq!(tracks[0].codec_name, "opus");
+    assert_eq!(tracks[0].payload, opus_au);
+    assert_eq!(tracks[1].fourcc, flac_fourcc);
+    assert_eq!(tracks[1].codec_name, "flac");
+    assert_eq!(tracks[1].payload, flac_au);
 }
 
 // ---- HDR colorInfo encode-side wiring round-trip --------------------------
