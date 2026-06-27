@@ -26,15 +26,15 @@ use oxideav_flv::{
     write_av1_sequence_start, write_avc_nalu_tag, write_avc_sequence_header,
     write_eac3_coded_frames, write_ex_audio_multichannel_config, write_ex_audio_sequence_end,
     write_ex_audio_tag, write_ex_video_color_info, write_ex_video_color_info_reset,
-    write_ex_video_metadata, write_ex_video_sequence_end, write_ex_video_tag,
+    write_ex_video_metadata, write_ex_video_sequence_end, write_ex_video_tag, write_filtered_tag,
     write_flac_coded_frames, write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames,
     write_hevc_coded_frames_x, write_hevc_sequence_start, write_mp3_ex_coded_frames,
     write_opus_coded_frames, write_opus_sequence_start, write_vp6_tag, write_vp6a_tag,
     write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
     write_vvc_sequence_start, AudioChannel, AudioChannelOrder, AvMultitrackType, ColorConfig,
-    ColorInfo, ExAudioPacketType, ExAudioTagHeader, ExFrameType, ExPacketType, ExVideoTagHeader,
-    HdrCll, HdrMdcv, JoinTrack, ModExEntry, ModExPayload, MultichannelConfig, FOURCC_AUDIO_AAC,
-    FOURCC_AV01, FOURCC_OPUS, FOURCC_VP09,
+    ColorInfo, EncryptedTagPreamble, ExAudioPacketType, ExAudioTagHeader, ExFrameType,
+    ExPacketType, ExVideoTagHeader, HdrCll, HdrMdcv, JoinTrack, ModExEntry, ModExPayload,
+    MultichannelConfig, TagType, FOURCC_AUDIO_AAC, FOURCC_AV01, FOURCC_OPUS, FOURCC_VP09,
 };
 
 /// Three distinct synthetic MP3 frame payloads. The demuxer treats an
@@ -1661,6 +1661,70 @@ fn audio_many_tracks_many_codecs_join_round_trips_per_track_fourcc() {
     assert_eq!(tracks[1].fourcc, flac_fourcc);
     assert_eq!(tracks[1].codec_name, "flac");
     assert_eq!(tracks[1].payload, flac_au);
+}
+
+// ---- Filtered (encrypted) tag write → demux round-trip (Annex F.3) ----------
+//
+// `write_filtered_tag` sets the tag-header Filter bit, frames the
+// `EncryptionTagHeader` + `FilterParams` preamble, and appends the
+// (cipher)text body. The demuxer's filtered-tag path strips the preamble
+// and surfaces the trailing body as a discard-flagged packet. These close
+// the container-level encryption loop (the crate carries no DRM client —
+// the body is whatever the caller's filter chain produced).
+
+#[test]
+fn write_filtered_video_tag_round_trips_through_demuxer() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    // Unencrypted SequenceStart mints the video stream (encrypted tags
+    // don't mint streams; the codec is signalled in the clear first).
+    let config = vec![0x81, 0x05, 0x0C];
+    write_av1_sequence_start(&mut buf, 0, &config).unwrap();
+
+    // Full ("Encryption", v1) filtered video tag.
+    let iv: [u8; 16] = std::array::from_fn(|i| 0x20 + i as u8);
+    let pre = EncryptedTagPreamble::encryption(iv);
+    let cipher = vec![0xCA, 0xFE, 0xD0, 0x0D, 0x99];
+    write_filtered_tag(&mut buf, TagType::Video, 33, 0, &pre, &cipher).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "av1");
+    let _seq = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    // The ciphertext body survives the preamble strip verbatim; the
+    // packet is discard-flagged (we don't decrypt).
+    assert_eq!(p.data, cipher, "ciphertext body survives demux verbatim");
+    assert!(p.flags.discard, "encrypted body is discard-flagged");
+    assert_eq!(p.pts, Some(33));
+}
+
+#[test]
+fn write_filtered_audio_se_cleartext_tag_round_trips_through_demuxer() {
+    // Selective Encryption wrapper with EncryptedAU=0 — the body is
+    // plaintext but still framed through the SE preamble. The demuxer
+    // strips the preamble and surfaces the plaintext body.
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let asc = vec![0x12, 0x10];
+    write_aac_ex_sequence_start(&mut buf, 0, &asc).unwrap();
+
+    let pre = EncryptedTagPreamble::selective(None);
+    let plain = vec![0x01, 0x02, 0x03, 0x04];
+    write_filtered_tag(&mut buf, TagType::Audio, 23, 0, &pre, &plain).unwrap();
+
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "aac");
+    let _seq = dmx.next_packet().unwrap();
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(
+        p.data, plain,
+        "SE-cleartext body survives the preamble strip"
+    );
+    assert_eq!(p.pts, Some(23));
 }
 
 // ---- HDR colorInfo encode-side wiring round-trip --------------------------

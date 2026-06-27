@@ -82,7 +82,7 @@ pub use tag::{
     write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_multichannel_config,
     write_ex_audio_sequence_end, write_ex_audio_tag, write_ex_video_color_info,
     write_ex_video_color_info_reset, write_ex_video_metadata, write_ex_video_sequence_end,
-    write_ex_video_tag, write_first_previous_tag_size, write_flac_coded_frames,
+    write_ex_video_tag, write_filtered_tag, write_first_previous_tag_size, write_flac_coded_frames,
     write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames, write_hevc_coded_frames_x,
     write_hevc_sequence_start, write_mp3_ex_coded_frames, write_mp3_tag, write_opus_coded_frames,
     write_opus_sequence_start, write_tag, write_video_info_command_tag, write_video_tag,

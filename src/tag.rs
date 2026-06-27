@@ -1400,6 +1400,159 @@ impl EncryptedTagPreamble {
             bytes_consumed: params_start + params_len,
         })
     }
+
+    /// Construct a non-selective `"Encryption"` (version 1) preamble from
+    /// the AES-CBC IV — every packet carrying this filter is fully
+    /// encrypted (spec Annex F.3.2 `EncryptionFilterParams`).
+    pub fn encryption(iv: [u8; 16]) -> Self {
+        Self {
+            filter_name: "Encryption".to_string(),
+            full_encryption: true,
+            is_encrypted: true,
+            iv: Some(iv),
+            // `to_bytes` recomputes this; the value here is the
+            // serialised length so a freshly-built preamble reports the
+            // same `bytes_consumed` a parsed one would.
+            bytes_consumed: encrypted_preamble_len("Encryption", true),
+        }
+    }
+
+    /// Construct a `"SE"` (Selective Encryption, version 2) preamble.
+    /// When `iv` is `Some`, the `EncryptedAU` bit is set and the IV is
+    /// emitted; when `None`, the tag is in-the-clear under the SE wrapper
+    /// (`EncryptedAU = 0`, no IV) — spec Annex F.3.2
+    /// `SelectiveEncryptionFilterParams`.
+    pub fn selective(iv: Option<[u8; 16]>) -> Self {
+        Self {
+            filter_name: "SE".to_string(),
+            full_encryption: false,
+            is_encrypted: iv.is_some(),
+            iv,
+            bytes_consumed: encrypted_preamble_len("SE", iv.is_some()),
+        }
+    }
+
+    /// Serialise the `EncryptionTagHeader` + `FilterParams` preamble — the
+    /// exact inverse of [`Self::parse`]. Layout (spec Annex F.3.1 / F.3.2):
+    ///
+    /// ```text
+    ///   NumFilters  UI8  = 1
+    ///   FilterName  STRING (UTF-8, NUL-terminated)
+    ///   Length      UI24 BE = bytes of FilterParams
+    ///   FilterParams
+    ///     "Encryption": IV UI8[16]
+    ///     "SE":         EncryptedAU UB[1] + Reserved UB[7]
+    ///                   + IF EncryptedAU IV UI8[16]
+    /// ```
+    ///
+    /// Returns `Err` when `"Encryption"` (or an `is_encrypted` `"SE"`) is
+    /// missing its IV, or the `FilterName` is neither spec value.
+    pub fn to_bytes(&self, out: &mut Vec<u8>) -> Result<()> {
+        // FilterParams body first (so the UI24 Length is exact).
+        let mut params = Vec::new();
+        match self.filter_name.as_str() {
+            "Encryption" => {
+                let iv = self.iv.ok_or_else(|| {
+                    Error::invalid("FLV Encryption preamble: missing IV (full encryption)")
+                })?;
+                params.extend_from_slice(&iv);
+            }
+            "SE" => {
+                // EncryptedAU UB[1] in the high bit; Reserved UB[7] = 0.
+                if self.is_encrypted {
+                    let iv = self.iv.ok_or_else(|| {
+                        Error::invalid("FLV SE preamble: EncryptedAU=1 needs an IV")
+                    })?;
+                    params.push(0x80);
+                    params.extend_from_slice(&iv);
+                } else {
+                    params.push(0x00);
+                }
+            }
+            other => {
+                return Err(Error::invalid(format!(
+                    "FLV encrypted preamble: unknown FilterName {other:?}"
+                )));
+            }
+        }
+        if params.len() as u64 > UI24_MAX as u64 {
+            return Err(Error::invalid(
+                "FLV encrypted preamble: FilterParams exceed UI24 Length",
+            ));
+        }
+        out.push(1); // NumFilters
+        out.extend_from_slice(self.filter_name.as_bytes());
+        out.push(0); // NUL terminator
+        out.extend_from_slice(&u24_to_be(params.len() as u32));
+        out.extend_from_slice(&params);
+        Ok(())
+    }
+}
+
+/// Serialised length (bytes) of an encrypted-tag preamble for a given
+/// FilterName + encrypted state. Used by the [`EncryptedTagPreamble`]
+/// constructors to pre-fill `bytes_consumed` so a built preamble matches
+/// a parsed one. NumFilters(1) + FilterName + NUL(1) + Length(3) +
+/// FilterParams.
+fn encrypted_preamble_len(filter_name: &str, encrypted: bool) -> usize {
+    let params_len = match filter_name {
+        "Encryption" => 16,
+        // SE: 1 flag byte + IV when encrypted.
+        "SE" if encrypted => 17,
+        _ => 1,
+    };
+    1 + filter_name.len() + 1 + 3 + params_len
+}
+
+/// Write a full filtered (encrypted) FLV tag (spec Annex F.3): an
+/// 11-byte tag header with the `Filter` bit (`0x20`) set, the
+/// [`EncryptedTagPreamble`] (`EncryptionTagHeader` + `FilterParams`),
+/// then the `body` bytes (ciphertext for an encrypted tag, plaintext
+/// for an in-the-clear `"SE"` tag), then the trailing `PreviousTagSize`.
+///
+/// This is the write-side inverse of the demuxer's filtered-tag path
+/// (`header.filter` → `EncryptedTagPreamble::parse` → ciphertext body).
+/// The crate does not encrypt — `body` is whatever the caller's filter
+/// chain produced — so this closes the *container* loop (DRM-protected
+/// tag framing round-trips) without implying a DRM client.
+pub fn write_filtered_tag<W: Write + ?Sized>(
+    w: &mut W,
+    tag_type: TagType,
+    timestamp_ms: u32,
+    stream_id: u32,
+    preamble: &EncryptedTagPreamble,
+    body: &[u8],
+) -> Result<u32> {
+    let mut tag_body = Vec::new();
+    preamble.to_bytes(&mut tag_body)?;
+    tag_body.extend_from_slice(body);
+
+    let data_size = tag_body.len();
+    if data_size as u64 > UI24_MAX as u64 {
+        return Err(Error::invalid(format!(
+            "FLV filtered tag: DataSize {data_size} exceeds UI24 max {UI24_MAX}"
+        )));
+    }
+    if stream_id > UI24_MAX {
+        return Err(Error::invalid(format!(
+            "FLV filtered tag: StreamID {stream_id} exceeds UI24 max {UI24_MAX}"
+        )));
+    }
+    let data_size = data_size as u32;
+    let ts_low = timestamp_ms & UI24_MAX;
+    let ts_ext = (timestamp_ms >> 24) as u8;
+    let mut header = [0u8; TAG_HEADER_LEN as usize];
+    // Reserved UB[2]=0, Filter UB[1]=1, TagType UB[5].
+    header[0] = 0x20 | tag_type.to_u8();
+    header[1..4].copy_from_slice(&u24_to_be(data_size));
+    header[4..7].copy_from_slice(&u24_to_be(ts_low));
+    header[7] = ts_ext;
+    header[8..11].copy_from_slice(&u24_to_be(stream_id));
+    w.write_all(&header)?;
+    w.write_all(&tag_body)?;
+    let prev_tag_size = TAG_HEADER_LEN + data_size;
+    w.write_all(&prev_tag_size.to_be_bytes())?;
+    Ok(TAG_HEADER_LEN + data_size + 4)
 }
 
 pub fn video_codec_id_str(id: u8) -> String {
@@ -1572,6 +1725,98 @@ mod tests {
             EncryptedTagPreamble::parse(body),
             Err(Error::InvalidData(_))
         ));
+    }
+
+    #[test]
+    fn encryption_preamble_to_bytes_round_trips_v1() {
+        // Build → serialise → parse identity for the non-selective
+        // "Encryption" (version 1) preamble.
+        let iv: [u8; 16] = std::array::from_fn(|i| 0xE0 + i as u8);
+        let pre = EncryptedTagPreamble::encryption(iv);
+        let mut out = Vec::new();
+        pre.to_bytes(&mut out).unwrap();
+        // Exact wire layout: NumFilters=1, "Encryption\0", Length=16, IV.
+        assert_eq!(out[0], 1);
+        assert_eq!(&out[1..12], b"Encryption\0");
+        assert_eq!(&out[12..15], &[0, 0, 16]);
+        assert_eq!(&out[15..31], &iv);
+        let back = EncryptedTagPreamble::parse(&out).unwrap();
+        assert_eq!(back, pre);
+        assert_eq!(back.bytes_consumed, out.len());
+        assert_eq!(pre.bytes_consumed, out.len());
+    }
+
+    #[test]
+    fn encryption_preamble_to_bytes_round_trips_se_encrypted() {
+        let iv: [u8; 16] = [0x5A; 16];
+        let pre = EncryptedTagPreamble::selective(Some(iv));
+        let mut out = Vec::new();
+        pre.to_bytes(&mut out).unwrap();
+        assert_eq!(&out[1..4], b"SE\0");
+        assert_eq!(&out[4..7], &[0, 0, 17]); // 1 flag + 16 IV
+        assert_eq!(out[7], 0x80); // EncryptedAU=1
+        assert_eq!(&out[8..24], &iv);
+        let back = EncryptedTagPreamble::parse(&out).unwrap();
+        assert_eq!(back, pre);
+        assert!(back.is_encrypted);
+    }
+
+    #[test]
+    fn encryption_preamble_to_bytes_round_trips_se_cleartext() {
+        // SE wrapper with EncryptedAU=0: one flag byte, no IV.
+        let pre = EncryptedTagPreamble::selective(None);
+        let mut out = Vec::new();
+        pre.to_bytes(&mut out).unwrap();
+        assert_eq!(&out[4..7], &[0, 0, 1]); // just the flag byte
+        assert_eq!(out[7], 0x00);
+        assert_eq!(out.len(), 8);
+        let back = EncryptedTagPreamble::parse(&out).unwrap();
+        assert_eq!(back, pre);
+        assert!(!back.is_encrypted);
+        assert_eq!(back.iv, None);
+    }
+
+    #[test]
+    fn encryption_preamble_to_bytes_rejects_missing_iv() {
+        // A hand-built "Encryption" preamble with no IV must fail to
+        // serialise (full encryption requires the IV).
+        let pre = EncryptedTagPreamble {
+            filter_name: "Encryption".to_string(),
+            full_encryption: true,
+            is_encrypted: true,
+            iv: None,
+            bytes_consumed: 0,
+        };
+        let mut out = Vec::new();
+        assert!(matches!(pre.to_bytes(&mut out), Err(Error::InvalidData(_))));
+    }
+
+    #[test]
+    fn write_filtered_tag_sets_filter_bit_and_frames_preamble() {
+        // Full filtered video tag: header Filter bit set, preamble +
+        // ciphertext body, trailing PreviousTagSize.
+        let iv: [u8; 16] = [0x11; 16];
+        let pre = EncryptedTagPreamble::encryption(iv);
+        let cipher = b"\xDE\xAD\xBE\xEF";
+        let mut buf = Vec::new();
+        let written =
+            write_filtered_tag(&mut buf, TagType::Video, 0x010203, 0, &pre, cipher).unwrap();
+        // Filter bit (0x20) OR'd onto the Video tag type (0x09).
+        assert_eq!(buf[0], 0x20 | 0x09);
+        // DataSize = preamble (31) + cipher (4) = 35.
+        assert_eq!(&buf[1..4], &u24_to_be(35));
+        // Timestamp 0x010203 splits into UI24 low + UI8 ext (0).
+        assert_eq!(&buf[4..7], &u24_to_be(0x010203));
+        assert_eq!(buf[7], 0);
+        // Total = 11 header + 35 body + 4 prev-tag-size.
+        assert_eq!(written, 11 + 35 + 4);
+        assert_eq!(buf.len(), written as usize);
+        // The preamble re-parses off the body and the ciphertext tail
+        // survives verbatim.
+        let body = &buf[11..11 + 35];
+        let back = EncryptedTagPreamble::parse(body).unwrap();
+        assert_eq!(back.iv, Some(iv));
+        assert_eq!(&body[back.bytes_consumed..], cipher);
     }
 
     #[test]

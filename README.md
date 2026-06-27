@@ -520,6 +520,8 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | `onMetaData` AMF0 Null / Undefined / Xml / EcmaArray / StrictArray values | `MetadataBag::null` / `undefined` / `xml` / `strict_array` (+ `amf0::write_undefined` / `write_xml` / `write_strict_array_start`) | AMF0 §2.7 / §2.8 / §2.12 / §2.17 |
 | `onCuePoint` script tag (Annex A embedded cue point) | `script::write_on_cue_point(w, ts_ms, &CuePointParams)` | Annex A.2 |
 | `onXMPData` script tag (XMP metadata) | `script::write_on_xmp_data(w, ts_ms, live_xml)` | §E.6 |
+| Multitrack body serialiser | `multitrack::join_tracks(AvMultitrackType, &[JoinTrack])` | enhanced-rtmp v2 §`ExAudioTagBody` / §`ExVideoTagBody` |
+| Filtered (encrypted) tag | `tag::write_filtered_tag(w, type, ts_ms, stream_id, &EncryptedTagPreamble, body)` (+ `EncryptedTagPreamble::{encryption, selective, to_bytes}`) | Annex F.3.1 / F.3.2 |
 
 `write_tag` returns the total bytes written (`11 + body.len() + 4`) and
 emits the trailing `PreviousTagSize = 11 + DataSize` back-pointer.
@@ -692,6 +694,23 @@ body is symmetric with the parser: a follow-up
 entries; a `write_ex_video_color_info_reset` drops them and leaves the
 `metadata["colorinfo"] = "undefined"` sentinel — same shape the parser
 observes when an external producer sends the same payload.
+
+`tag::write_filtered_tag(w, type, ts_ms, stream_id, &EncryptedTagPreamble,
+body)` is the write-side inverse of the demuxer's filtered-tag path: it
+sets the tag-header `Filter` bit (`0x20`), frames the Annex F.3.1/F.3.2
+`EncryptionTagHeader` + `FilterParams` preamble via
+`EncryptedTagPreamble::to_bytes` (the exact inverse of `parse`), then
+appends `body` (ciphertext for an encrypted tag, plaintext for an
+in-the-clear `"SE"` tag). The preamble constructors cover both
+spec-defined FilterNames: `EncryptedTagPreamble::encryption(iv)` for
+non-selective version-1 AES-CBC (`EncryptionFilterParams` — IV only) and
+`EncryptedTagPreamble::selective(Option<iv>)` for version-2 Selective
+Encryption (`SelectiveEncryptionFilterParams` — `EncryptedAU` UB[1] +
+Reserved UB[7] + optional IV). The crate carries no DRM client, so `body`
+is whatever the caller's filter chain produced — this closes the
+*container* loop (protected-tag framing round-trips bit-exactly through
+`FlvDemuxer`, which strips the preamble and forwards the body
+discard-flagged) without implying decryption.
 
 ```rust
 use oxideav_flv::{header, script, script::MetadataBag, tag};
