@@ -2089,6 +2089,34 @@ fn on_xmp_data_writer_round_trips_through_demuxer() {
 }
 
 #[test]
+fn on_xmp_data_promotes_oversized_packet_to_amf0_long_string() {
+    // An XMP packet larger than the 65535-byte UI16 String ceiling must
+    // be emitted via the AMF0 Long String form (0x0C, UI32 length) —
+    // otherwise the ordinary String writer would truncate or overflow.
+    // The demuxer parses both forms into the same value, so the full
+    // packet surfaces verbatim under metadata["xmp"].
+    let big = format!(
+        "<x:xmpmeta>{}</x:xmpmeta>",
+        "<rdf:Description/>".repeat(5000) // ~85 KB, well past 65535
+    );
+    assert!(big.len() > u16::MAX as usize);
+
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let meta = MetadataBag::new().number("duration", 1.0);
+    script::write_on_metadata(&mut buf, &meta).unwrap();
+    script::write_on_xmp_data(&mut buf, 0, &big).unwrap();
+    // A media tag so the demuxer mints a stream (script-only files error).
+    tag::write_mp3_tag(&mut buf, 0, 3, true, true, &[0xFF, 0xFB, 0x90, 0x00]).unwrap();
+
+    let dmx = open(buf);
+    let md = dmx.metadata();
+    let xmp = md.iter().find(|(k, _)| k == "xmp").map(|(_, v)| v.as_str());
+    assert_eq!(xmp, Some(big.as_str()), "oversized XMP survives verbatim");
+}
+
+#[test]
 fn on_cue_point_writer_round_trips_per_cue_fields() {
     let bytes = build_flv_with_cue_and_xmp();
     let dmx = open(bytes);

@@ -511,7 +511,7 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | Ex-video HDR `colorInfo` metadata tag | `tag::write_ex_video_color_info(w, ts_ms, fourcc, &ColorInfo)` | enhanced-rtmp v2 §"Metadata Frame" |
 | Ex-video HDR `colorInfo` reset (`Undefined`) | `tag::write_ex_video_color_info_reset(w, ts_ms, fourcc)` | enhanced-rtmp v2 §"Metadata Frame" |
 | Typed `colorInfo` AMF body encoder | `color_info::{ColorInfo, ColorConfig, HdrCll, HdrMdcv}::encode_amf()` / `encode_amf_into` / `encode_amf_reset` | enhanced-rtmp v2 §`ColorInfo` |
-| AMF0 writers | `amf0::{write_number, write_boolean, write_null, write_string, write_date, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 / SCRIPTDATADATE §E.4.4.3 |
+| AMF0 writers | `amf0::{write_number, write_boolean, write_null, write_string, write_long_string, write_string_auto, write_date, write_property_name, write_object_start, write_ecma_array_start, write_object_end}` | AMF0 §2 / §2.13 / SCRIPTDATADATE §E.4.4.3 |
 | NetConnection `onStatus` command (incl. reconnect request) | `on_status::write_on_status_command(&OnStatusInfo)` / `write_on_status_command_body` / `reconnect_request(tc_url, description)` | enhanced-rtmp v2 §"Reconnect Request" |
 | NetConnection `connect` command (E-RTMP capability declaration) | `connect::write_connect_command(txn, &ConnectCommandObject)` / `write_command_object` / `parse_connect_command` | enhanced-rtmp v2 §"Enhancing NetConnection connect Command" |
 | `onMetaData` script tag | `script::write_on_metadata(w, &MetadataBag)` | §E.4.4 / §E.5 |

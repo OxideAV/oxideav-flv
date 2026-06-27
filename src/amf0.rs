@@ -343,6 +343,41 @@ pub fn write_string<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
     write_utf8_u16(w, s)
 }
 
+/// Write an AMF0 Long String value (marker `0x0C` + UI32 BE length +
+/// UTF-8 bytes, §2.13). The ordinary String type (`0x02`) caps its
+/// payload at the UI16 length ceiling (65535 bytes); the Long String
+/// form carries up to UI32 bytes and is the spec-mandated encoding for
+/// strings beyond that ceiling. Write-side inverse of the `0x0C` parse
+/// arm (which decodes into [`AmfValue::String`], so a Long String and an
+/// ordinary String are indistinguishable once parsed — only the wire
+/// encoding differs).
+pub fn write_long_string<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
+    if s.len() > u32::MAX as usize {
+        return Err(Error::invalid(format!(
+            "AMF0: LongString length {} exceeds UI32 max",
+            s.len()
+        )));
+    }
+    w.write_all(&[0x0C])?;
+    w.write_all(&(s.len() as u32).to_be_bytes())?;
+    w.write_all(s.as_bytes())?;
+    Ok(())
+}
+
+/// Write an AMF0 string using the *narrowest spec-valid* encoding: the
+/// ordinary String type (`0x02`, UI16 length) when the byte length fits
+/// in 65535, otherwise the Long String type (`0x0C`, UI32 length). This
+/// matches what a conforming producer emits — `String` is preferred and
+/// `LongString` is only used when the value overflows the UI16 ceiling
+/// (spec §2.13). Both parse back into [`AmfValue::String`].
+pub fn write_string_auto<W: Write + ?Sized>(w: &mut W, s: &str) -> Result<()> {
+    if s.len() > u16::MAX as usize {
+        write_long_string(w, s)
+    } else {
+        write_string(w, s)
+    }
+}
+
 /// Write an AMF0 XMLDocument value (marker `0x0F` + UI32 BE length +
 /// UTF-8 bytes, §2.17). The payload uses the long-string length form per
 /// spec. Write-side inverse of the [`AmfValue::Xml`] parse arm.
@@ -637,6 +672,45 @@ mod tests {
         let (v, p) = parse_amf0_value(&bytes, 0).unwrap();
         assert_eq!(v, AmfValue::Unsupported);
         assert_eq!(p, 1);
+    }
+
+    #[test]
+    fn write_long_string_round_trips_through_parser() {
+        let s = "a moderately long XMP-ish payload";
+        let mut out = Vec::new();
+        write_long_string(&mut out, s).unwrap();
+        assert_eq!(out[0], 0x0C);
+        assert_eq!(&out[1..5], &(s.len() as u32).to_be_bytes());
+        let (v, p) = parse_amf0_value(&out, 0).unwrap();
+        assert_eq!(v, AmfValue::String(s.into()));
+        assert_eq!(p, out.len());
+    }
+
+    #[test]
+    fn write_string_auto_picks_narrowest_encoding() {
+        // Short string → ordinary String (0x02, UI16 length).
+        let short = "short";
+        let mut out = Vec::new();
+        write_string_auto(&mut out, short).unwrap();
+        assert_eq!(out[0], 0x02);
+        let (v, _) = parse_amf0_value(&out, 0).unwrap();
+        assert_eq!(v, AmfValue::String(short.into()));
+
+        // > 65535 bytes → Long String (0x0C, UI32 length).
+        let long = "x".repeat(70_000);
+        let mut out = Vec::new();
+        write_string_auto(&mut out, &long).unwrap();
+        assert_eq!(out[0], 0x0C);
+        assert_eq!(&out[1..5], &(long.len() as u32).to_be_bytes());
+        let (v, p) = parse_amf0_value(&out, 0).unwrap();
+        assert_eq!(v, AmfValue::String(long.clone()));
+        assert_eq!(p, out.len());
+
+        // Exactly 65535 bytes stays an ordinary String (the UI16 ceiling).
+        let boundary = "y".repeat(65_535);
+        let mut out = Vec::new();
+        write_string_auto(&mut out, &boundary).unwrap();
+        assert_eq!(out[0], 0x02);
     }
 
     #[test]

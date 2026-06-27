@@ -942,7 +942,11 @@ pub fn write_on_xmp_data_body(out: &mut Vec<u8>, live_xml: &str) -> Result<()> {
     amf0::write_string(out, "onXMPData")?;
     amf0::write_object_start(out)?;
     amf0::write_property_name(out, "liveXML")?;
-    amf0::write_string(out, live_xml)?;
+    // XMP packets routinely exceed the 65535-byte UI16 String ceiling;
+    // `write_string_auto` promotes to the AMF0 Long String form (0x0C,
+    // UI32 length) when needed. Both parse back into `AmfValue::String`,
+    // so the demuxer still surfaces the value under `metadata["xmp"]`.
+    amf0::write_string_auto(out, live_xml)?;
     amf0::write_object_end(out)?;
     Ok(())
 }
@@ -954,10 +958,11 @@ pub fn write_on_xmp_data_body(out: &mut Vec<u8>, live_xml: &str) -> Result<()> {
 /// `<x:xmpmeta ...>` envelope a producer hands to the runtime); the
 /// demuxer round-trips it byte-for-byte under `metadata["xmp"]`.
 ///
-/// The AMF0 String wire form caps each value at 65535 bytes; XMP
-/// packets near that ceiling should be emitted as their own tag, or
-/// the AMF0 LongString writer (`0x0C`) reused — that path is left to
-/// callers who need it.
+/// The AMF0 ordinary String wire form caps each value at 65535 bytes;
+/// `write_on_xmp_data_body` promotes oversized packets to the AMF0 Long
+/// String form (`0x0C`, UI32 length) automatically via
+/// [`crate::amf0::write_string_auto`], so XMP packets of any size up to
+/// the UI32 ceiling round-trip without the caller picking the encoding.
 ///
 /// `timestamp_ms` is the cue-style alignment timestamp. Producers
 /// typically place an XMP header tag at the head of the file with
