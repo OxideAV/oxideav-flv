@@ -38,6 +38,7 @@ use crate::ex_video::{
     FOURCC_VVC1,
 };
 use crate::header::FlvHeader;
+use crate::mod_ex::ModExEntry;
 use crate::multichannel::{mask_channel_labels, MultichannelConfig};
 use crate::multitrack::{split_tracks, MultitrackPacketTrack};
 use crate::tag::{
@@ -234,6 +235,7 @@ pub fn open_concrete(
         keyframe_index,
         is_encrypted,
         last_multitrack: None,
+        last_mod_ex: None,
     })
 }
 
@@ -272,6 +274,33 @@ pub struct FlvDemuxer {
     /// `next_packet` returns a packet from a single-track tag, so the
     /// accessor never reports stale tracks from an earlier multitrack tag.
     last_multitrack: Option<Vec<MultitrackPacketTrack>>,
+    /// ModEx state of the Ex tag the most-recently-emitted packet was
+    /// built from (enhanced-rtmp-v2 §`ModEx`). `next_packet` folds the
+    /// `TimestampOffsetNano` accumulator into a millisecond pts/dts but
+    /// the sub-millisecond refinement (and any reserved-subtype ModEx
+    /// blobs) are dropped from the `Packet` because the core `Packet`
+    /// carries no nanosecond field. This side-channel preserves them so
+    /// a remuxer can reconstruct the original `TimestampOffsetNano` ModEx
+    /// (and the nano-refined presentation time). Reset to its empty state
+    /// each time `next_packet` returns a packet from a tag that carried
+    /// no ModEx prefix, so the accessor never reports stale offsets from
+    /// an earlier tag.
+    last_mod_ex: Option<LastModEx>,
+}
+
+/// Captured ModEx state of the Ex tag a packet was built from.
+///
+/// Mirrors the `timestamp_offset_nano` + `mod_ex_entries` fields the
+/// [`ExAudioTagHeader`] / [`ExVideoTagHeader`] parsers expose, lifted
+/// onto the demuxer so a caller can recover the sub-millisecond timing
+/// refinement that the millisecond-quantised [`Packet`] pts/dts cannot
+/// carry.
+#[derive(Clone, Debug, Default)]
+struct LastModEx {
+    /// Sum of `TimestampOffsetNano` ModEx offsets (ns) on the tag.
+    offset_nano: u32,
+    /// Every ModEx entry on the tag, in wire order.
+    entries: Vec<ModExEntry>,
 }
 
 impl FlvDemuxer {
@@ -308,6 +337,81 @@ impl FlvDemuxer {
     pub fn last_multitrack_tracks(&self) -> Option<&[MultitrackPacketTrack]> {
         self.last_multitrack.as_deref()
     }
+
+    /// Sum of `TimestampOffsetNano` ModEx offsets (in nanoseconds) on the
+    /// Enhanced-RTMP Ex tag the most-recently-emitted [`next_packet`]
+    /// packet was built from — or `None` when that tag carried no
+    /// `TimestampOffsetNano` ModEx (every legacy tag, and every Ex tag
+    /// without a ModEx prefix).
+    ///
+    /// The FLV wire timestamp is a 24-bit-plus-8 millisecond value;
+    /// enhanced-rtmp-v2 §`ModEx` layers a `TimestampOffsetNano` refinement
+    /// (0..=999_999 ns, "just over 1 ms" of sub-millisecond precision) on
+    /// top so a receiver can recover the exact presentation time when
+    /// re-targeting formats with finer timescales (MP4, M2TS, MSE).
+    /// [`next_packet`] cannot fold this into the [`Packet`] pts/dts —
+    /// those are integer milliseconds and the core [`Packet`] has no
+    /// nanosecond field — so this accessor surfaces it for a remuxer that
+    /// wants to preserve or re-emit the offset. The nano-refined
+    /// presentation time of the last packet is
+    /// `pts_ms * 1_000_000 + offset_ns`.
+    ///
+    /// Refreshed on every [`next_packet`] call and cleared to `None` as
+    /// soon as a tag without a `TimestampOffsetNano` ModEx is emitted, so
+    /// it never reports a stale offset from an earlier tag. Tags that
+    /// produce no packet (`SequenceEnd`, script tags) do not disturb the
+    /// captured value.
+    ///
+    /// [`next_packet`]: oxideav_core::Demuxer::next_packet
+    pub fn last_timestamp_offset_nano(&self) -> Option<u32> {
+        self.last_mod_ex
+            .as_ref()
+            .map(|m| m.offset_nano)
+            .filter(|&n| n != 0)
+    }
+
+    /// Every ModEx entry parsed off the front of the Enhanced-RTMP Ex tag
+    /// the most-recently-emitted [`next_packet`] packet was built from, in
+    /// wire order — or `None` when that tag carried no ModEx prefix.
+    ///
+    /// Unlike [`last_timestamp_offset_nano`], which collapses to the
+    /// single accumulated nanosecond value, this preserves the full ModEx
+    /// chain including reserved/future subtypes (carried as
+    /// [`crate::mod_ex::ModExPayload::Reserved`] with their raw bytes
+    /// attached). A remuxer that wants byte-exact re-emission of the
+    /// tag's ModEx prefix feeds these straight back into
+    /// [`crate::mod_ex::emit`] (or the `mod_ex_entries` field of the
+    /// [`ExAudioTagHeader`] / [`ExVideoTagHeader`] writers).
+    ///
+    /// Refreshed on every [`next_packet`] call and cleared to `None` for
+    /// any tag without a ModEx prefix, so it never reports stale entries.
+    ///
+    /// [`last_timestamp_offset_nano`]: Self::last_timestamp_offset_nano
+    /// [`next_packet`]: oxideav_core::Demuxer::next_packet
+    pub fn last_mod_ex_entries(&self) -> Option<&[ModExEntry]> {
+        self.last_mod_ex.as_ref().map(|m| m.entries.as_slice())
+    }
+}
+
+/// Extract the ModEx state (nano offset + entries) from an Ex tag body,
+/// or `None` when the body is a legacy tag, a single-track / multitrack
+/// Ex tag without a ModEx prefix, or malformed. `is_video` selects the
+/// Ex header parser.
+fn extract_mod_ex(body: &[u8], is_video: bool) -> Option<LastModEx> {
+    let (offset_nano, entries) = if is_video {
+        let ex = ExVideoTagHeader::parse(body).ok().flatten()?;
+        (ex.timestamp_offset_nano, ex.mod_ex_entries)
+    } else {
+        let ex = ExAudioTagHeader::parse(body).ok().flatten()?;
+        (ex.timestamp_offset_nano, ex.mod_ex_entries)
+    };
+    if entries.is_empty() {
+        return None;
+    }
+    Some(LastModEx {
+        offset_nano,
+        entries,
+    })
 }
 
 /// Resolve every track of a multitrack Ex tag body to an owned
@@ -447,6 +551,11 @@ impl Demuxer for FlvDemuxer {
                         // the side-channel for a single-track tag) for
                         // `last_multitrack_tracks`.
                         self.last_multitrack = extract_multitrack_tracks(&body, false);
+                        // Capture the tag's ModEx state (nano offset +
+                        // entries) for `last_timestamp_offset_nano` /
+                        // `last_mod_ex_entries`, or clear it for a tag
+                        // without a ModEx prefix.
+                        self.last_mod_ex = extract_mod_ex(&body, false);
                         if let Some(p) = pending {
                             self.pending_packet = Some(pkt);
                             return Ok(p);
@@ -478,6 +587,11 @@ impl Demuxer for FlvDemuxer {
                         // the side-channel for a single-track tag) for
                         // `last_multitrack_tracks`.
                         self.last_multitrack = extract_multitrack_tracks(&body, true);
+                        // Capture the tag's ModEx state (nano offset +
+                        // entries) for `last_timestamp_offset_nano` /
+                        // `last_mod_ex_entries`, or clear it for a tag
+                        // without a ModEx prefix.
+                        self.last_mod_ex = extract_mod_ex(&body, true);
                         if let Some(p) = pending {
                             self.pending_packet = Some(pkt);
                             return Ok(p);

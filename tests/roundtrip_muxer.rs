@@ -16,9 +16,9 @@ use std::io::Cursor;
 
 use oxideav_core::{Demuxer, NullCodecResolver, ReadSeek};
 use oxideav_flv::{
-    header, open_demuxer, script,
+    header, open_demuxer, open_demuxer_concrete, script,
     script::{CuePointParams, CuePointType, MetadataBag},
-    tag, FlvHeader,
+    tag, FlvDemuxer, FlvHeader,
 };
 use oxideav_flv::{
     write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_aac_raw_tag,
@@ -523,6 +523,15 @@ fn audio_packet_bodies_survive_byte_for_byte() {
 fn open_video_only(buf: Vec<u8>) -> Box<dyn Demuxer> {
     let input: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
     open_demuxer(input, &NullCodecResolver).expect("open muxed flv")
+}
+
+/// Concrete-typed open so tests can reach the [`FlvDemuxer`]-only
+/// accessors (`last_timestamp_offset_nano`, `last_mod_ex_entries`,
+/// `last_multitrack_tracks`) that the `Box<dyn Demuxer>` trait object
+/// does not expose.
+fn open_concrete(buf: Vec<u8>) -> FlvDemuxer {
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+    open_demuxer_concrete(input, &NullCodecResolver).expect("open muxed flv (concrete)")
 }
 
 #[test]
@@ -1227,6 +1236,162 @@ fn ex_video_modex_reserved_subtype_passthrough_round_trips_through_demuxer() {
     let p = dmx.next_packet().unwrap();
     assert_eq!(p.data, frame);
     assert_eq!(p.pts, Some(60));
+}
+
+// ---- ModEx side-channel (last_timestamp_offset_nano / last_mod_ex_entries) ---
+//
+// The integer-ms FLV timestamp folds into `Packet::pts`/`dts`, but the
+// `TimestampOffsetNano` sub-millisecond refinement (enhanced-rtmp-v2
+// §`ModEx`) has nowhere to live on the core `Packet` (no nanosecond
+// field). The demuxer captures it in a side-channel mirroring
+// `last_multitrack_tracks`. These tests assert a remuxer can recover the
+// exact nano offset + the full ModEx entry chain after demux.
+
+#[test]
+fn demuxer_surfaces_video_timestamp_offset_nano_side_channel() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0x81, 0x05, 0x0C];
+    write_av1_sequence_start(&mut buf, 0, &config).unwrap();
+
+    let frame = vec![0xCA, 0xFE, 0xBA, 0xBE];
+    let header_struct = ExVideoTagHeader {
+        frame_type: ExFrameType::KeyFrame,
+        packet_type: ExPacketType::CodedFrames,
+        fourcc: Some(FOURCC_AV01),
+        multitrack: None,
+        bytes_consumed: 0,
+        composition_time_offset_ms: None,
+        timestamp_offset_nano: 250_000,
+        mod_ex_entries: vec![ModExEntry {
+            subtype_raw: 0,
+            payload: ModExPayload::TimestampOffsetNano { offset_ns: 250_000 },
+            raw: vec![0x03, 0xD0, 0x90],
+        }],
+        video_command: None,
+    };
+    write_ex_video_tag(&mut buf, 40, &header_struct, &frame).unwrap();
+
+    let mut dmx = open_concrete(buf);
+    // SequenceStart header packet: no ModEx prefix → side-channel clear.
+    let _hdr = dmx.next_packet().unwrap();
+    assert_eq!(dmx.last_timestamp_offset_nano(), None);
+    assert!(dmx.last_mod_ex_entries().is_none());
+
+    // CodedFrames packet: side-channel surfaces the nano offset + the
+    // ModEx entry chain byte-for-byte.
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.pts, Some(40));
+    assert_eq!(dmx.last_timestamp_offset_nano(), Some(250_000));
+    // Nano-refined presentation time = pts_ms * 1e6 + offset_ns.
+    let refined_ns = p.pts.unwrap() * 1_000_000 + 250_000;
+    assert_eq!(refined_ns, 40_250_000);
+
+    let entries = dmx.last_mod_ex_entries().expect("entries present");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].timestamp_offset_nano(), Some(250_000));
+    assert_eq!(entries[0].raw, vec![0x03, 0xD0, 0x90]);
+}
+
+#[test]
+fn demuxer_surfaces_chained_audio_nano_offset_and_clears_on_plain_tag() {
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let asc = vec![0x12, 0x10];
+    write_aac_ex_sequence_start(&mut buf, 0, &asc).unwrap();
+
+    // First a ModEx-bearing tag chaining 100 + 200 = 300 ns.
+    let au0 = vec![0xDE, 0xAD, 0xBE, 0xEF];
+    let modex_hdr = ExAudioTagHeader {
+        packet_type: ExAudioPacketType::CodedFrames,
+        fourcc: Some(FOURCC_AUDIO_AAC),
+        multitrack: None,
+        timestamp_offset_nano: 300,
+        mod_ex_entries: vec![
+            ModExEntry {
+                subtype_raw: 0,
+                payload: ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+                raw: vec![0x00, 0x00, 0x64],
+            },
+            ModExEntry {
+                subtype_raw: 0,
+                payload: ModExPayload::TimestampOffsetNano { offset_ns: 200 },
+                raw: vec![0x00, 0x00, 0xC8],
+            },
+        ],
+        bytes_consumed: 0,
+    };
+    write_ex_audio_tag(&mut buf, 23, &modex_hdr, &au0).unwrap();
+
+    // Then a plain (no-ModEx) Ex audio tag — the side-channel MUST clear
+    // so the stale 300 ns offset doesn't bleed onto the next packet.
+    let au1 = vec![0x01, 0x02, 0x03];
+    write_aac_ex_coded_frames(&mut buf, 46, &au1).unwrap();
+
+    let mut dmx = open_concrete(buf);
+    let _hdr = dmx.next_packet().unwrap();
+
+    let p0 = dmx.next_packet().unwrap();
+    assert_eq!(p0.data, au0);
+    assert_eq!(dmx.last_timestamp_offset_nano(), Some(300));
+    assert_eq!(dmx.last_mod_ex_entries().map(|e| e.len()), Some(2));
+
+    let p1 = dmx.next_packet().unwrap();
+    assert_eq!(p1.data, au1);
+    assert_eq!(
+        dmx.last_timestamp_offset_nano(),
+        None,
+        "plain tag must clear the nano side-channel"
+    );
+    assert!(dmx.last_mod_ex_entries().is_none());
+}
+
+#[test]
+fn demuxer_preserves_reserved_modex_subtype_in_side_channel() {
+    // A reserved-subtype ModEx blob has no nano value, but the entry +
+    // its raw bytes still survive on the side-channel so a remuxer can
+    // re-emit the (unrecognised-but-preserved) ModEx prefix verbatim.
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let config = vec![0x81, 0x05, 0x0C];
+    write_av1_sequence_start(&mut buf, 0, &config).unwrap();
+
+    let frame = vec![0x11, 0x22, 0x33];
+    let header_struct = ExVideoTagHeader {
+        frame_type: ExFrameType::InterFrame,
+        packet_type: ExPacketType::CodedFrames,
+        fourcc: Some(FOURCC_AV01),
+        multitrack: None,
+        bytes_consumed: 0,
+        composition_time_offset_ms: None,
+        timestamp_offset_nano: 0,
+        mod_ex_entries: vec![ModExEntry {
+            subtype_raw: 5,
+            payload: ModExPayload::Reserved { subtype_raw: 5 },
+            raw: vec![0xAA, 0xBB, 0xCC, 0xDD],
+        }],
+        video_command: None,
+    };
+    write_ex_video_tag(&mut buf, 60, &header_struct, &frame).unwrap();
+
+    let mut dmx = open_concrete(buf);
+    let _hdr = dmx.next_packet().unwrap();
+    let _p = dmx.next_packet().unwrap();
+    // No TimestampOffsetNano → nano accessor stays None even though a
+    // ModEx prefix is present...
+    assert_eq!(dmx.last_timestamp_offset_nano(), None);
+    // ...but the reserved entry IS preserved for byte-exact re-emission.
+    let entries = dmx.last_mod_ex_entries().expect("reserved entry preserved");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].subtype_raw, 5);
+    assert_eq!(entries[0].timestamp_offset_nano(), None);
+    assert_eq!(entries[0].raw, vec![0xAA, 0xBB, 0xCC, 0xDD]);
 }
 
 #[test]

@@ -312,6 +312,21 @@ oxideav-flv = "0.0"
     the concrete `FlvDemuxer`, so `demuxer::open_concrete` /
     `open_demuxer_concrete` is exposed alongside the trait-object
     `open` (the same handle that exposes `is_encrypted`).
+  - ModEx read access (`FlvDemuxer::last_timestamp_offset_nano` /
+    `last_mod_ex_entries`): the integer-millisecond FLV timestamp folds
+    into `Packet::pts`/`dts`, but the `TimestampOffsetNano` sub-millisecond
+    refinement has nowhere to live on the core `Packet` (no nanosecond
+    field), and reserved-subtype ModEx blobs likewise have no packet home.
+    Mirroring the multitrack side-channel, after each `next_packet` the
+    demuxer exposes the ModEx state of the tag the returned packet was
+    built from: `last_timestamp_offset_nano()` yields the accumulated
+    nanosecond offset (the nano-refined presentation time is
+    `pts_ms * 1_000_000 + offset_ns`), and `last_mod_ex_entries()` yields
+    the full `&[ModExEntry]` chain so a remuxer can feed it straight back
+    into `mod_ex::emit` (or the writers' `mod_ex_entries` field) for
+    byte-exact re-emission. Both refresh on every `next_packet` and clear
+    for any tag without a ModEx prefix, so neither reports a stale offset
+    from an earlier tag.
 
 ### Typed `onMetaData` accessors
 
