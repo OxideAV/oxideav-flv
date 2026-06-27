@@ -17,20 +17,20 @@ use std::io::Cursor;
 use oxideav_core::{Demuxer, NullCodecResolver, ReadSeek};
 use oxideav_flv::{
     header, open_demuxer, open_demuxer_concrete, script,
-    script::{CuePointParams, CuePointType, MetadataBag},
+    script::{CuePointParams, CuePointType, EncryptionHeader, MetadataBag},
     tag, FlvDemuxer, FlvHeader,
 };
 use oxideav_flv::{
     join_tracks, write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_aac_raw_tag,
-    write_aac_sequence_header, write_ac3_coded_frames, write_av1_coded_frames,
-    write_av1_sequence_start, write_avc_nalu_tag, write_avc_sequence_header,
-    write_eac3_coded_frames, write_ex_audio_multichannel_config, write_ex_audio_sequence_end,
-    write_ex_audio_tag, write_ex_video_color_info, write_ex_video_color_info_reset,
-    write_ex_video_metadata, write_ex_video_sequence_end, write_ex_video_tag, write_filtered_tag,
-    write_flac_coded_frames, write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames,
-    write_hevc_coded_frames_x, write_hevc_sequence_start, write_mp3_ex_coded_frames,
-    write_opus_coded_frames, write_opus_sequence_start, write_vp6_tag, write_vp6a_tag,
-    write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
+    write_aac_sequence_header, write_ac3_coded_frames, write_additional_header,
+    write_av1_coded_frames, write_av1_sequence_start, write_avc_nalu_tag,
+    write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_multichannel_config,
+    write_ex_audio_sequence_end, write_ex_audio_tag, write_ex_video_color_info,
+    write_ex_video_color_info_reset, write_ex_video_metadata, write_ex_video_sequence_end,
+    write_ex_video_tag, write_filtered_tag, write_flac_coded_frames, write_flac_sequence_start,
+    write_h263_tag, write_hevc_coded_frames, write_hevc_coded_frames_x, write_hevc_sequence_start,
+    write_mp3_ex_coded_frames, write_opus_coded_frames, write_opus_sequence_start, write_vp6_tag,
+    write_vp6a_tag, write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
     write_vvc_sequence_start, AudioChannel, AudioChannelOrder, AvMultitrackType, ColorConfig,
     ColorInfo, EncryptedTagPreamble, ExAudioPacketType, ExAudioTagHeader, ExFrameType,
     ExPacketType, ExVideoTagHeader, HdrCll, HdrMdcv, JoinTrack, ModExEntry, ModExPayload,
@@ -1725,6 +1725,49 @@ fn write_filtered_audio_se_cleartext_tag_round_trips_through_demuxer() {
         "SE-cleartext body survives the preamble strip"
     );
     assert_eq!(p.pts, Some(23));
+}
+
+#[test]
+fn additional_header_plus_filtered_tags_round_trip_full_encrypted_flv() {
+    // A complete encrypted-FLV head: onMetaData, then the
+    // |AdditionalHeader Encryption Header (F.2.1, timestamp 0), then a
+    // SequenceStart to mint the stream, then a fully-encrypted video
+    // tag. The demuxer must flag the file encrypted and read every
+    // encryption.* field back from the header.
+    let mut buf = Vec::new();
+    header::write(&mut buf, false, true).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+
+    let meta = MetadataBag::new().number("duration", 2.0);
+    script::write_on_metadata(&mut buf, &meta).unwrap();
+
+    // |AdditionalHeader at timestamp 0, right after onMetaData (F.2.1).
+    let hdr = EncryptionHeader::flash_access_v2();
+    write_additional_header(&mut buf, &hdr).unwrap();
+
+    let config = vec![0x81, 0x05, 0x0C];
+    write_av1_sequence_start(&mut buf, 0, &config).unwrap();
+
+    let iv: [u8; 16] = [0x77; 16];
+    let pre = EncryptedTagPreamble::encryption(iv);
+    let cipher = vec![0xAB, 0xCD, 0xEF];
+    write_filtered_tag(&mut buf, TagType::Video, 40, 0, &pre, &cipher).unwrap();
+
+    let dmx = open_concrete(buf);
+    assert!(
+        dmx.is_encrypted(),
+        "|AdditionalHeader marks the file encrypted"
+    );
+    let md = dmx.metadata();
+    assert_eq!(meta_lookup(md, "encryption"), Some("true"));
+    assert_eq!(meta_lookup(md, "encryption.version"), Some("2"));
+    assert_eq!(meta_lookup(md, "encryption.method"), Some("Standard"));
+    assert_eq!(meta_lookup(md, "encryption.algorithm"), Some("AES-CBC"));
+    assert_eq!(meta_lookup(md, "encryption.key_length"), Some("16"));
+    assert_eq!(
+        meta_lookup(md, "encryption.key_subtype"),
+        Some("FlashAccessv2")
+    );
 }
 
 // ---- HDR colorInfo encode-side wiring round-trip --------------------------

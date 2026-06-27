@@ -522,6 +522,7 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | `onXMPData` script tag (XMP metadata) | `script::write_on_xmp_data(w, ts_ms, live_xml)` | §E.6 |
 | Multitrack body serialiser | `multitrack::join_tracks(AvMultitrackType, &[JoinTrack])` | enhanced-rtmp v2 §`ExAudioTagBody` / §`ExVideoTagBody` |
 | Filtered (encrypted) tag | `tag::write_filtered_tag(w, type, ts_ms, stream_id, &EncryptedTagPreamble, body)` (+ `EncryptedTagPreamble::{encryption, selective, to_bytes}`) | Annex F.3.1 / F.3.2 |
+| `\|AdditionalHeader` Encryption Header script tag | `script::write_additional_header(w, &EncryptionHeader)` (+ `EncryptionHeader::{flash_access_v2, fmrms_v1}`) | Annex F.2.1–F.2.5 |
 
 `write_tag` returns the total bytes written (`11 + body.len() + 4`) and
 emits the trailing `PreviousTagSize = 11 + DataSize` back-pointer.
@@ -711,6 +712,19 @@ is whatever the caller's filter chain produced — this closes the
 *container* loop (protected-tag framing round-trips bit-exactly through
 `FlvDemuxer`, which strips the preamble and forwards the body
 discard-flagged) without implying decryption.
+
+`script::write_additional_header(w, &EncryptionHeader)` emits the
+companion `|AdditionalHeader` Encryption Header script tag (Annex
+F.2.1–F.2.5) an encrypted FLV places at the head of the file (timestamp
+0, immediately after `onMetaData`) so a DRM client sees the encryption
+metadata before any filtered tag. `EncryptionHeader::flash_access_v2()`
+/ `fmrms_v1()` build the conventional version-2 / version-1 headers;
+the writer is the exact inverse of the demuxer's `parse_additional_header`,
+so the emitted nested AMF0 object round-trips back into
+`FlvDemuxer::is_encrypted()` plus the `encryption.version` / `.method` /
+`.algorithm` / `.key_length` / `.key_subtype` metadata keys. (Out-of-scope
+DRM blobs — `KeyInfo.Data`, `SigFormat`, `Signature` — are not part of
+the container round-trip and are left to the caller's DRM layer.)
 
 ```rust
 use oxideav_flv::{header, script, script::MetadataBag, tag};

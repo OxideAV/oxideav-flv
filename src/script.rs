@@ -972,6 +972,134 @@ pub fn write_on_xmp_data<W: Write + ?Sized>(
     tag::write_tag(w, TagType::ScriptData, timestamp_ms, 0, &body)
 }
 
+/// Typed `|AdditionalHeader` Encryption Header (spec Annex F.2.1–F.2.5).
+///
+/// Carries the encryption metadata an encrypted FLV places at the head
+/// of the file (immediately after `onMetaData`, timestamp 0) so a DRM
+/// client can fetch the decryption key before reaching any filtered tag.
+/// This is the typed write-side mirror of the demuxer's
+/// `parse_additional_header` — only the fields the demuxer surfaces as
+/// `encryption.*` metadata are modelled; the spec's out-of-scope DRM
+/// blobs (`KeyInfo.Data`, `SigFormat`, `Signature`) are not part of the
+/// container round-trip.
+///
+/// The nested AMF0 object shape `write_additional_header` emits is:
+///
+/// ```text
+///   "|AdditionalHeader"
+///   { Encryption:
+///       { Version, Method, Flags,
+///         Params:
+///           { Version, EncryptionAlgorithm,
+///             EncryptionParams: { KeyLength },
+///             KeyInfo: { SubType } } } }
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncryptionHeader {
+    /// `Encryption.Version` — `1` (FMRMS v1.x) or `2` (Flash Access 2.0).
+    pub version: f64,
+    /// `Encryption.Method` — spec-fixed `"Standard"`.
+    pub method: String,
+    /// `Params.EncryptionAlgorithm` — spec-fixed `"AES-CBC"`.
+    pub algorithm: String,
+    /// `Params.EncryptionParams.KeyLength` — bytes; spec-fixed `16`.
+    pub key_length: f64,
+    /// `Params.KeyInfo.SubType` — `"APS"` (v1) or `"FlashAccessv2"` (v2).
+    pub key_subtype: String,
+}
+
+impl EncryptionHeader {
+    /// Construct the conventional version-2 (Flash Access 2.0) header:
+    /// `Method = "Standard"`, `EncryptionAlgorithm = "AES-CBC"`,
+    /// `KeyLength = 16`, `KeyInfo.SubType = "FlashAccessv2"`.
+    pub fn flash_access_v2() -> Self {
+        Self {
+            version: 2.0,
+            method: "Standard".to_string(),
+            algorithm: "AES-CBC".to_string(),
+            key_length: 16.0,
+            key_subtype: "FlashAccessv2".to_string(),
+        }
+    }
+
+    /// Construct the version-1 (FMRMS v1.x) header with the `"APS"`
+    /// (Adobe Policy Server) key subtype.
+    pub fn fmrms_v1() -> Self {
+        Self {
+            version: 1.0,
+            method: "Standard".to_string(),
+            algorithm: "AES-CBC".to_string(),
+            key_length: 16.0,
+            key_subtype: "APS".to_string(),
+        }
+    }
+}
+
+/// Serialise a `|AdditionalHeader` ScriptTagBody — the AMF0 name string
+/// then the nested Encryption Header object (spec Annex F.2.1–F.2.5).
+/// The write-side inverse of the demuxer's `parse_additional_header`.
+pub fn write_additional_header_body(out: &mut Vec<u8>, hdr: &EncryptionHeader) -> Result<()> {
+    // Note the leading vertical bar in the spec-defined name.
+    amf0::write_string(out, "|AdditionalHeader")?;
+    amf0::write_object_start(out)?;
+    amf0::write_property_name(out, "Encryption")?;
+    {
+        amf0::write_object_start(out)?;
+        amf0::write_property_name(out, "Version")?;
+        amf0::write_number(out, hdr.version)?;
+        amf0::write_property_name(out, "Method")?;
+        amf0::write_string(out, &hdr.method)?;
+        amf0::write_property_name(out, "Flags")?;
+        amf0::write_number(out, 0.0)?; // spec: shall be 0
+        amf0::write_property_name(out, "Params")?;
+        {
+            amf0::write_object_start(out)?;
+            amf0::write_property_name(out, "Version")?;
+            amf0::write_number(out, 1.0)?; // Standard Encoding Params version
+            amf0::write_property_name(out, "EncryptionAlgorithm")?;
+            amf0::write_string(out, &hdr.algorithm)?;
+            amf0::write_property_name(out, "EncryptionParams")?;
+            {
+                amf0::write_object_start(out)?;
+                amf0::write_property_name(out, "KeyLength")?;
+                amf0::write_number(out, hdr.key_length)?;
+                amf0::write_object_end(out)?;
+            }
+            amf0::write_property_name(out, "KeyInfo")?;
+            {
+                amf0::write_object_start(out)?;
+                amf0::write_property_name(out, "SubType")?;
+                amf0::write_string(out, &hdr.key_subtype)?;
+                amf0::write_object_end(out)?;
+            }
+            amf0::write_object_end(out)?;
+        }
+        amf0::write_object_end(out)?;
+    }
+    amf0::write_object_end(out)?;
+    Ok(())
+}
+
+/// Write a complete `|AdditionalHeader` script tag (spec Annex F.2.1).
+///
+/// In an encrypted FLV the `|AdditionalHeader` object SHALL be present
+/// at the head of the file with timestamp 0, immediately after
+/// `onMetaData`, so the runtime sees the encryption metadata before any
+/// filtered tag. The emitted tag round-trips through `FlvDemuxer`:
+/// `is_encrypted()` returns `true` and the `encryption.version` /
+/// `.method` / `.algorithm` / `.key_length` / `.key_subtype` metadata
+/// keys read back the header's fields. Pairs with
+/// [`crate::tag::write_filtered_tag`] for the per-tag filtered bodies.
+pub fn write_additional_header<W: Write + ?Sized>(
+    w: &mut W,
+    hdr: &EncryptionHeader,
+) -> Result<u32> {
+    let mut body = Vec::new();
+    write_additional_header_body(&mut body, hdr)?;
+    // Spec F.2.1: timestamp 0, head of file.
+    tag::write_tag(w, TagType::ScriptData, 0, 0, &body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1016,6 +1144,61 @@ mod tests {
             }
             other => panic!("expected ecma array, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn additional_header_body_parses_back_into_nested_encryption_object() {
+        let hdr = EncryptionHeader::flash_access_v2();
+        let mut body = Vec::new();
+        write_additional_header_body(&mut body, &hdr).unwrap();
+
+        // First value: the "|AdditionalHeader" name string.
+        let (name, p) = parse_amf0_value(&body, 0).unwrap();
+        assert_eq!(name, AmfValue::String("|AdditionalHeader".into()));
+        // Second value: the nested object, consuming the rest exactly.
+        let (value, np) = parse_amf0_value(&body, p).unwrap();
+        assert_eq!(np, body.len());
+
+        // Walk the same path parse_additional_header walks.
+        let enc = value.get("Encryption").expect("Encryption object");
+        assert_eq!(enc.get("Version"), Some(&AmfValue::Number(2.0)));
+        assert_eq!(
+            enc.get("Method"),
+            Some(&AmfValue::String("Standard".into()))
+        );
+        assert_eq!(enc.get("Flags"), Some(&AmfValue::Number(0.0)));
+        let params = enc.get("Params").expect("Params object");
+        assert_eq!(
+            params.get("EncryptionAlgorithm"),
+            Some(&AmfValue::String("AES-CBC".into()))
+        );
+        assert_eq!(
+            params
+                .get("EncryptionParams")
+                .and_then(|q| q.get("KeyLength")),
+            Some(&AmfValue::Number(16.0))
+        );
+        assert_eq!(
+            params.get("KeyInfo").and_then(|q| q.get("SubType")),
+            Some(&AmfValue::String("FlashAccessv2".into()))
+        );
+    }
+
+    #[test]
+    fn additional_header_v1_uses_aps_key_subtype() {
+        let hdr = EncryptionHeader::fmrms_v1();
+        let mut body = Vec::new();
+        write_additional_header_body(&mut body, &hdr).unwrap();
+        let (_name, p) = parse_amf0_value(&body, 0).unwrap();
+        let (value, _np) = parse_amf0_value(&body, p).unwrap();
+        let enc = value.get("Encryption").unwrap();
+        assert_eq!(enc.get("Version"), Some(&AmfValue::Number(1.0)));
+        assert_eq!(
+            enc.get("Params")
+                .and_then(|p| p.get("KeyInfo"))
+                .and_then(|k| k.get("SubType")),
+            Some(&AmfValue::String("APS".into()))
+        );
     }
 
     #[test]

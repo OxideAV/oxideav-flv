@@ -70,9 +70,10 @@ pub use on_status::{
     write_on_status_command_body, OnStatusInfo, CODE_RECONNECT_REQUEST, COMMAND_NAME, LEVEL_STATUS,
 };
 pub use script::{
-    write_on_cue_point, write_on_cue_point_body, write_on_metadata, write_on_metadata_body,
-    write_on_xmp_data, write_on_xmp_data_body, CuePointParams, CuePointType, MetaValue,
-    MetadataBag, ObjectBuilder, TrackInfo, TrackInfoMap,
+    write_additional_header, write_additional_header_body, write_on_cue_point,
+    write_on_cue_point_body, write_on_metadata, write_on_metadata_body, write_on_xmp_data,
+    write_on_xmp_data_body, CuePointParams, CuePointType, EncryptionHeader, MetaValue, MetadataBag,
+    ObjectBuilder, TrackInfo, TrackInfoMap,
 };
 pub use tag::{
     audio_codec_id_str, audio_codec_id_str_u32, video_codec_id_str, video_codec_id_str_u32,
