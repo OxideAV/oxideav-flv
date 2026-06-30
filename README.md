@@ -54,6 +54,17 @@ oxideav-flv = "0.0"
     `onMetaData` surface (Date → `"date:<millis>tz:<offset>"`,
     nested objects → `<key>.<subkey>` paths, Null/Undefined → the
     string sentinels `"null"` / `"undefined"`).
+  - `onImageData` (Annex B.2) — an embedded image sample (the original
+    GIF / PNG / JPEG file as a `data` BYTEARRAY + a `trackid` Number).
+    Because a BYTEARRAY only exists in AMF3, the argument is the `0x11`
+    AVM+ marker wrapping an AMF3 object; the demuxer extracts the image
+    bytes verbatim and the trackid into `EmbeddedImage { track_id, data }`,
+    collected over discovery and exposed via
+    `FlvDemuxer::embedded_images()` (the binary bytes have no place in
+    the string metadata bag). The bag additionally carries
+    `metadata["onimagedata.N.trackid"]` / `["onimagedata.N.length"]`
+    scalars so a caller scanning only the bag still sees an image is
+    present.
   - `onXMPData` (Annex E.6) — `liveXML` body surfaced via
     `metadata["xmp"]`.
   - `onCuePoint` (Annex A) — payload flattened into
@@ -372,6 +383,16 @@ unrecognised FourCc surfaces as `flv:exvideo:<ascii>` /
 stamped the field as an AMF0 `Date`). Missing or malformed entries
 return `None`; the accessor never panics on bag contents.
 
+The Adobe v10.1 Annex B.1 "Stream Properties" properties that have no
+Annex E.5 equivalent get their own typed accessors: `avc_level()` /
+`avc_profile()` (the Number `level_idc` / `profile_idc` a producer
+stamps for AVC-coded video), `moov_position()` (the absolute F4V `moov`
+box offset, finite + non-negative `u64`), and `video_codec_fourcc()` /
+`audio_codec_fourcc()` (the Annex B.1 four-character codec STRING form —
+`"avc1"` / `"mp4a"` / … — returned only when the stored value is
+non-numeric, since Annex E.5 declares the same property a Number that
+`video_codec_id_str` / `audio_codec_id_str` resolve instead).
+
 The Enhanced-RTMP-v2 per-track property maps (`videoTrackIdInfoMap` /
 `audioTrackIdInfoMap` from the §"Enhancing onMetaData" extension) get
 their own typed views — `TypedMetadata::video_track_info_map()` /
@@ -520,6 +541,7 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | `onMetaData` AMF0 Null / Undefined / Xml / EcmaArray / StrictArray values | `MetadataBag::null` / `undefined` / `xml` / `strict_array` (+ `amf0::write_undefined` / `write_xml` / `write_strict_array_start`) | AMF0 §2.7 / §2.8 / §2.12 / §2.17 |
 | `onCuePoint` script tag (Annex A embedded cue point) | `script::write_on_cue_point(w, ts_ms, &CuePointParams)` | Annex A.2 |
 | `onXMPData` script tag (XMP metadata) | `script::write_on_xmp_data(w, ts_ms, live_xml)` | §E.6 |
+| `onImageData` script tag (embedded image) | `script::write_on_image_data(w, ts_ms, image_data, track_id)` | Annex B.2 |
 | Multitrack body serialiser | `multitrack::join_tracks(AvMultitrackType, &[JoinTrack])` | enhanced-rtmp v2 §`ExAudioTagBody` / §`ExVideoTagBody` |
 | Filtered (encrypted) tag | `tag::write_filtered_tag(w, type, ts_ms, stream_id, &EncryptedTagPreamble, body)` (+ `EncryptedTagPreamble::{encryption, selective, to_bytes}`) | Annex F.3.1 / F.3.2 |
 | `\|AdditionalHeader` Encryption Header script tag | `script::write_additional_header(w, &EncryptionHeader)` (+ `EncryptionHeader::{flash_access_v2, fmrms_v1}`) | Annex F.2.1–F.2.5 |

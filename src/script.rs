@@ -977,6 +977,65 @@ pub fn write_on_xmp_data<W: Write + ?Sized>(
     tag::write_tag(w, TagType::ScriptData, timestamp_ms, 0, &body)
 }
 
+/// Serialise an `onImageData` `ScriptTagBody` (no tag framing) into
+/// `out` — the AMF0 String name `"onImageData"` followed by the `0x11`
+/// AVM+ switch marker wrapping an AMF3 anonymous-Object argument
+/// carrying the `data` BYTEARRAY (the compressed image file) and an
+/// optional `trackid` Number (spec Annex B.2 "Image Metadata").
+///
+/// A BYTEARRAY has no AMF0 representation, so the spec-conforming
+/// carriage is an AMF3 payload behind the AMF0 AVM+ marker — the same
+/// shape [`crate::FlvDemuxer::embedded_images`] parses on the read side.
+pub fn write_on_image_data_body(
+    out: &mut Vec<u8>,
+    image_data: &[u8],
+    track_id: Option<u32>,
+) -> Result<()> {
+    use crate::amf3::{Amf3Object, Amf3Value};
+    amf0::write_string(out, "onImageData")?;
+    // Build the AMF3 anonymous dynamic object carrying the two
+    // properties. `data` is mandatory; `trackid` is emitted only when
+    // the caller supplies it (Annex B.2 lists both, but a producer that
+    // does not track-separate may omit trackid).
+    let mut dynamic_members: Vec<(String, Amf3Value)> = Vec::new();
+    dynamic_members.push((
+        "data".to_string(),
+        Amf3Value::ByteArray(image_data.to_vec()),
+    ));
+    if let Some(tid) = track_id {
+        dynamic_members.push(("trackid".to_string(), Amf3Value::Double(f64::from(tid))));
+    }
+    let obj = Amf3Value::Object(Amf3Object {
+        class_name: String::new(),
+        dynamic: true,
+        externalizable: false,
+        sealed_names: Vec::new(),
+        sealed_values: Vec::new(),
+        dynamic_members,
+    });
+    amf0::write_avm_plus(out, &obj)?;
+    Ok(())
+}
+
+/// Write a complete `onImageData` script tag — tag header (TagType
+/// `0x12`, `timestamp_ms`, StreamID `0`), the serialised
+/// `ScriptTagBody`, and the trailing `PreviousTagSize` (spec Annex B.2).
+///
+/// `image_data` is the original compressed image file (a complete GIF /
+/// PNG / JPEG); `track_id` names the track the image sample belongs to
+/// (omit with `None` when the producer does not track-separate). The
+/// demuxer recovers both through [`crate::FlvDemuxer::embedded_images`].
+pub fn write_on_image_data<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    image_data: &[u8],
+    track_id: Option<u32>,
+) -> Result<u32> {
+    let mut body = Vec::new();
+    write_on_image_data_body(&mut body, image_data, track_id)?;
+    tag::write_tag(w, TagType::ScriptData, timestamp_ms, 0, &body)
+}
+
 /// Typed `|AdditionalHeader` Encryption Header (spec Annex F.2.1–F.2.5).
 ///
 /// Carries the encryption metadata an encrypted FLV places at the head
@@ -1790,5 +1849,74 @@ mod tests {
             }
             other => panic!("expected strict array, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn on_image_data_body_carries_avm_plus_bytearray() {
+        // Annex B.2: the argument is the 0x11 AVM+ marker wrapping an
+        // AMF3 object carrying `data` (BYTEARRAY) + `trackid` (Double).
+        let img = [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]; // JPEG SOI + APP0
+        let mut body = Vec::new();
+        write_on_image_data_body(&mut body, &img, Some(3)).unwrap();
+
+        let (name, p) = parse_amf0_value(&body, 0).unwrap();
+        assert_eq!(name, AmfValue::String("onImageData".into()));
+        // The value is the AVM+ marker (0x11) — parse_amf0_value lifts it
+        // into AmfValue::AvmPlus.
+        let (value, np) = parse_amf0_value(&body, p).unwrap();
+        assert_eq!(np, body.len());
+        let inner = match value {
+            AmfValue::AvmPlus(b) => *b,
+            other => panic!("expected AVM+, got {other:?}"),
+        };
+        use crate::amf3::{Amf3Object, Amf3Value};
+        let Amf3Value::Object(Amf3Object {
+            dynamic_members, ..
+        }) = inner
+        else {
+            panic!("expected AMF3 object");
+        };
+        let data = dynamic_members
+            .iter()
+            .find(|(k, _)| k == "data")
+            .map(|(_, v)| v);
+        assert_eq!(data, Some(&Amf3Value::ByteArray(img.to_vec())));
+        let tid = dynamic_members
+            .iter()
+            .find(|(k, _)| k == "trackid")
+            .map(|(_, v)| v);
+        assert_eq!(tid, Some(&Amf3Value::Double(3.0)));
+    }
+
+    #[test]
+    fn on_image_data_omits_trackid_when_none() {
+        let img = [1, 2, 3];
+        let mut body = Vec::new();
+        write_on_image_data_body(&mut body, &img, None).unwrap();
+        let (_, p) = parse_amf0_value(&body, 0).unwrap();
+        let (value, _) = parse_amf0_value(&body, p).unwrap();
+        use crate::amf3::{Amf3Object, Amf3Value};
+        let AmfValue::AvmPlus(b) = value else {
+            panic!("expected AVM+")
+        };
+        let Amf3Value::Object(Amf3Object {
+            dynamic_members, ..
+        }) = *b
+        else {
+            panic!("expected AMF3 object");
+        };
+        assert!(dynamic_members.iter().all(|(k, _)| k != "trackid"));
+        assert_eq!(dynamic_members.len(), 1);
+    }
+
+    #[test]
+    fn on_image_data_full_tag_framing() {
+        let img = [0x89, 0x50, 0x4E, 0x47]; // PNG magic
+        let mut out = Vec::new();
+        let total = write_on_image_data(&mut out, 0, &img, Some(1)).unwrap();
+        assert_eq!(total as usize, out.len());
+        assert_eq!(out[0], 0x12); // TagType = ScriptData
+        let data_size = ((out[1] as u32) << 16) | ((out[2] as u32) << 8) | (out[3] as u32);
+        assert_eq!(data_size, total - 15);
     }
 }

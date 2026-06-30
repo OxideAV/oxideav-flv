@@ -2200,3 +2200,67 @@ fn cue_point_and_xmp_tags_do_not_disturb_audio_packets() {
     }
     assert_eq!(audio_count, 2, "two MP3 frames in fixture");
 }
+
+// ----------------------- Annex B.2 onImageData ----------------------------
+
+/// An `onImageData` script tag (Annex B.2) carrying an embedded JPEG
+/// round-trips through the demuxer: the original image file bytes and
+/// the trackid are recovered via `FlvDemuxer::embedded_images`, and the
+/// string bag gains the `onimagedata.<n>.{trackid,length}` scalars.
+#[test]
+fn on_image_data_round_trips_through_embedded_images() {
+    // A minimal but realistic compressed image payload (JPEG SOI + a few
+    // bytes). The demuxer must surface these bytes verbatim.
+    let img: Vec<u8> = vec![
+        0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0xFF, 0xD9,
+    ];
+
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let bag = MetadataBag::new().number("duration", 1.0);
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+    // onImageData tag at the head, before the first audio tag.
+    script::write_on_image_data(&mut buf, 0, &img, Some(2)).unwrap();
+    tag::write_mp3_tag(&mut buf, 0, 3, true, true, &mp3_frames()[0]).unwrap();
+
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+    let dmx = open_demuxer_concrete(input, &NullCodecResolver).unwrap();
+
+    let images = dmx.embedded_images();
+    assert_eq!(images.len(), 1, "one onImageData tag");
+    assert_eq!(images[0].track_id, Some(2));
+    assert_eq!(images[0].data, img, "image bytes survive verbatim");
+
+    // The string bag carries the scalar summary.
+    let md = dmx.metadata();
+    let lookup = |k: &str| md.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+    assert_eq!(lookup("onimagedata.0.trackid"), Some("2"));
+    assert_eq!(lookup("onimagedata.0.length"), Some("12"));
+}
+
+/// Two `onImageData` tags are collected in discovery order, and a
+/// trackid-less image still surfaces its bytes.
+#[test]
+fn on_image_data_multiple_images_and_no_trackid() {
+    let img_a: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47]; // PNG magic
+    let img_b: Vec<u8> = vec![0x47, 0x49, 0x46, 0x38]; // GIF magic
+
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    let bag = MetadataBag::new().number("duration", 1.0);
+    script::write_on_metadata(&mut buf, &bag).unwrap();
+    script::write_on_image_data(&mut buf, 0, &img_a, Some(1)).unwrap();
+    script::write_on_image_data(&mut buf, 0, &img_b, None).unwrap();
+    tag::write_mp3_tag(&mut buf, 0, 3, true, true, &mp3_frames()[0]).unwrap();
+
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));
+    let dmx = open_demuxer_concrete(input, &NullCodecResolver).unwrap();
+    let images = dmx.embedded_images();
+    assert_eq!(images.len(), 2);
+    assert_eq!(images[0].track_id, Some(1));
+    assert_eq!(images[0].data, img_a);
+    assert_eq!(images[1].track_id, None, "trackid omitted");
+    assert_eq!(images[1].data, img_b);
+}

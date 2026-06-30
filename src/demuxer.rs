@@ -115,6 +115,7 @@ pub fn open_concrete(
     let mut keyframe_index: Option<KeyframeIndex> = None;
     let mut encryption: Option<EncryptionHeadline> = None;
     let mut xmp_metadata: Option<String> = None;
+    let mut embedded_images: Vec<EmbeddedImage> = Vec::new();
     // Scan up to a reasonable cap — we only need one audio + one video tag
     // plus the script tag. Keep a hard limit so pathological files can't
     // force us to pre-read the whole input here.
@@ -153,6 +154,7 @@ pub fn open_concrete(
                     &mut keyframe_index,
                     &mut encryption,
                     &mut xmp_metadata,
+                    &mut embedded_images,
                 );
             }
             TagType::Audio => {
@@ -236,6 +238,7 @@ pub fn open_concrete(
         is_encrypted,
         last_multitrack: None,
         last_mod_ex: None,
+        embedded_images,
     })
 }
 
@@ -286,6 +289,34 @@ pub struct FlvDemuxer {
     /// no ModEx prefix, so the accessor never reports stale offsets from
     /// an earlier tag.
     last_mod_ex: Option<LastModEx>,
+    /// Embedded images harvested from `onImageData` script tags during
+    /// discovery (Adobe FLV spec v10.1 Annex B.2). One entry per
+    /// `onImageData` tag seen, in discovery order. Empty for the common
+    /// case of a file with no embedded images.
+    embedded_images: Vec<EmbeddedImage>,
+}
+
+/// An embedded image harvested from an `onImageData` script tag
+/// (Adobe FLV spec v10.1 Annex B.2 "Image Metadata").
+///
+/// When an F4V/FLV sample is an image type (GIF, PNG, or JPEG) the
+/// producer surfaces the original compressed image file through an
+/// `onImageData` script-data tag carrying two properties: `data` (a
+/// BYTEARRAY of the original GIF/PNG/JPEG bytes) and `trackid` (a
+/// DOUBLE naming the track the sample belongs to). The image bytes are
+/// binary and have no representation in the string `metadata()` bag, so
+/// the demuxer collects each `onImageData` it sees during discovery
+/// into [`FlvDemuxer::embedded_images`]; the bag additionally carries
+/// the `onimagedata.<n>.trackid` / `.length` scalars so a caller
+/// scanning only the string bag still learns an image is present.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedImage {
+    /// The `trackid` (Annex B.2 DOUBLE) the image sample belongs to.
+    /// `None` when the producer omitted the property.
+    pub track_id: Option<u32>,
+    /// The original compressed image file bytes (the `data` BYTEARRAY) —
+    /// a complete GIF, PNG, or JPEG file as the producer embedded it.
+    pub data: Vec<u8>,
 }
 
 /// Captured ModEx state of the Ex tag a packet was built from.
@@ -336,6 +367,24 @@ impl FlvDemuxer {
     /// [`next_packet`]: oxideav_core::Demuxer::next_packet
     pub fn last_multitrack_tracks(&self) -> Option<&[MultitrackPacketTrack]> {
         self.last_multitrack.as_deref()
+    }
+
+    /// Every embedded image harvested from `onImageData` script tags
+    /// during discovery (Adobe FLV spec v10.1 Annex B.2 "Image
+    /// Metadata"), in discovery order. Empty for the common case of a
+    /// file with no embedded images.
+    ///
+    /// When an F4V/FLV sample is an image type (GIF / PNG / JPEG) the
+    /// producer surfaces the original compressed image file through an
+    /// `onImageData` script tag carrying `data` (a BYTEARRAY of the file
+    /// bytes) + `trackid` (a DOUBLE). The binary bytes have no place in
+    /// the string `metadata()` bag, so each [`EmbeddedImage`] carries an
+    /// owned copy of the original file bytes plus its `track_id`. The
+    /// `metadata()` bag still gains an `onimagedata.<n>.trackid` /
+    /// `.length` scalar pair per image so a caller scanning only the bag
+    /// learns an image is present without reaching this accessor.
+    pub fn embedded_images(&self) -> &[EmbeddedImage] {
+        &self.embedded_images
     }
 
     /// Sum of `TimestampOffsetNano` ModEx offsets (in nanoseconds) on the
@@ -1400,6 +1449,7 @@ fn parse_script_body(
     keyframe_index: &mut Option<KeyframeIndex>,
     encryption: &mut Option<EncryptionHeadline>,
     xmp_metadata: &mut Option<String>,
+    embedded_images: &mut Vec<EmbeddedImage>,
 ) {
     // Script tag body = (AMF0 name, AMF0 value). FLV producers in the
     // wild emit several spec-defined names; we recognise:
@@ -1450,6 +1500,33 @@ fn parse_script_body(
                 .map(|m| m + 1)
                 .unwrap_or(0);
             flatten_amf_value(&value, &format!("cuepoint.{n}"), metadata);
+        }
+        "onImageData" => {
+            // Annex B.2 "Image Metadata": when an F4V/FLV sample is an
+            // image type (GIF / PNG / JPEG), the producer surfaces the
+            // original compressed image file through an `onImageData`
+            // script tag carrying `data` (a BYTEARRAY of the file bytes)
+            // and `trackid` (a DOUBLE naming the owning track). The image
+            // bytes are binary and have no representation in the string
+            // metadata bag, so they are collected into a dedicated
+            // side-channel (`FlvDemuxer::embedded_images`). A `data`
+            // BYTEARRAY only exists in AMF3, so the value is the `0x11`
+            // AVM+ object wrapping an AMF3 Object/Array carrying the two
+            // properties. We additionally lift the trackid + byte length
+            // into the metadata bag under an `onimagedata.<n>.` prefix so
+            // a caller scanning only the bag still sees that an image is
+            // present.
+            if let Some(img) = parse_on_image_data(&value) {
+                let n = embedded_images.len();
+                if let Some(tid) = img.track_id {
+                    metadata.push((format!("onimagedata.{n}.trackid"), tid.to_string()));
+                }
+                metadata.push((
+                    format!("onimagedata.{n}.length"),
+                    img.data.len().to_string(),
+                ));
+                embedded_images.push(img);
+            }
         }
         "|AdditionalHeader" => {
             *encryption = parse_additional_header(&value);
@@ -1592,6 +1669,57 @@ fn xmp_liveXML(value: &AmfValue) -> Option<String> {
         }
     }
     None
+}
+
+/// Parse an `onImageData` argument value (Annex B.2) into an
+/// [`EmbeddedImage`].
+///
+/// Annex B.2 lists two properties: `data` (a BYTEARRAY of the
+/// compressed image file) and `trackid` (a DOUBLE). A BYTEARRAY only
+/// exists in AMF3, so the argument is the AMF0 `0x11` AVM+ marker
+/// wrapping an AMF3 Object (or ECMA-style Array) carrying the two
+/// properties. Returns `None` when the value carries no recoverable
+/// `data` byte payload — the trackid alone is not an image.
+fn parse_on_image_data(value: &AmfValue) -> Option<EmbeddedImage> {
+    let inner = match value {
+        AmfValue::AvmPlus(inner) => inner.as_ref(),
+        _ => return None,
+    };
+    let data = amf3_property(inner, "data").and_then(|v| match v {
+        Amf3Value::ByteArray(b) => Some(b.clone()),
+        _ => None,
+    })?;
+    let track_id = amf3_property(inner, "trackid")
+        .and_then(Amf3Value::as_f64)
+        .filter(|n| n.is_finite() && (0.0..=u32::MAX as f64).contains(n))
+        .map(|n| n as u32);
+    Some(EmbeddedImage { track_id, data })
+}
+
+/// Look a named property up in an AMF3 Object (sealed or dynamic
+/// member) or in the associative portion of an AMF3 Array.
+fn amf3_property<'a>(value: &'a Amf3Value, name: &str) -> Option<&'a Amf3Value> {
+    match value {
+        Amf3Value::Object(Amf3Object {
+            sealed_names,
+            sealed_values,
+            dynamic_members,
+            ..
+        }) => sealed_names
+            .iter()
+            .position(|n| n == name)
+            .map(|i| &sealed_values[i])
+            .or_else(|| {
+                dynamic_members
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v)
+            }),
+        Amf3Value::Array(Amf3Array { assoc, .. }) => {
+            assoc.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+        }
+        _ => None,
+    }
 }
 
 fn parse_additional_header(value: &AmfValue) -> Option<EncryptionHeadline> {

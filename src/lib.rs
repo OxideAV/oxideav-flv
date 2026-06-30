@@ -48,7 +48,9 @@ pub use connect::{
     parse_command_object, parse_connect_command, write_command_object, write_connect_command,
     write_connect_command_body, CapsExMask, ConnectCommandObject, FourCcInfoMask, ScalarValue,
 };
-pub use demuxer::{open as open_demuxer, open_concrete as open_demuxer_concrete, FlvDemuxer};
+pub use demuxer::{
+    open as open_demuxer, open_concrete as open_demuxer_concrete, EmbeddedImage, FlvDemuxer,
+};
 pub use ex_audio::{
     fourcc_audio_codec_id_str, AudioPacketModExType, AvMultitrackType, ExAudioPacketType,
     ExAudioTagHeader, FOURCC_AAC as FOURCC_AUDIO_AAC, FOURCC_AC3, FOURCC_EAC3, FOURCC_FLAC,
@@ -71,9 +73,9 @@ pub use on_status::{
 };
 pub use script::{
     write_additional_header, write_additional_header_body, write_on_cue_point,
-    write_on_cue_point_body, write_on_metadata, write_on_metadata_body, write_on_xmp_data,
-    write_on_xmp_data_body, CuePointParams, CuePointType, EncryptionHeader, MetaValue, MetadataBag,
-    ObjectBuilder, TrackInfo, TrackInfoMap,
+    write_on_cue_point_body, write_on_image_data, write_on_image_data_body, write_on_metadata,
+    write_on_metadata_body, write_on_xmp_data, write_on_xmp_data_body, CuePointParams,
+    CuePointType, EncryptionHeader, MetaValue, MetadataBag, ObjectBuilder, TrackInfo, TrackInfoMap,
 };
 pub use tag::{
     audio_codec_id_str, audio_codec_id_str_u32, video_codec_id_str, video_codec_id_str_u32,
