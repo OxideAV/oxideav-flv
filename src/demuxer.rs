@@ -43,7 +43,8 @@ use crate::multichannel::{mask_channel_labels, MultichannelConfig};
 use crate::multitrack::{split_tracks, MultitrackPacketTrack};
 use crate::tag::{
     audio_codec_id_str, video_codec_id_str, AudioTagHeader, EncryptedTagPreamble, TagHeader,
-    TagType, VideoTagHeader, AUDIO_CODEC_AAC, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A,
+    TagType, VideoTagHeader, AUDIO_CODEC_AAC, AUDIO_CODEC_NELLYMOSER_16K_MONO,
+    AUDIO_CODEC_NELLYMOSER_8K_MONO, AUDIO_CODEC_SPEEX, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A,
 };
 
 /// Parsed `keyframes` toc from the `onMetaData` script tag — the
@@ -916,8 +917,30 @@ fn build_audio_stream(
             params.sample_rate = Some(sr);
         }
     }
-    if let Some(b) = metadata_lookup_bool(metadata, "stereo") {
-        params.channels = Some(if b { 2 } else { 1 });
+    // The `onMetaData` `stereo` boolean is normally the more
+    // authoritative channel-count source. But E.4.2.1 pins Nellymoser
+    // 8/16 kHz mono and Speex to a single channel regardless of any
+    // signalling, so a producer that wrongly stamped `stereo = true` for
+    // one of those formats must not upgrade them to 2 channels.
+    let spec_mono = matches!(
+        ah.codec_id,
+        AUDIO_CODEC_NELLYMOSER_8K_MONO | AUDIO_CODEC_NELLYMOSER_16K_MONO | AUDIO_CODEC_SPEEX
+    );
+    if !spec_mono {
+        if let Some(b) = metadata_lookup_bool(metadata, "stereo") {
+            params.channels = Some(if b { 2 } else { 1 });
+        }
+    }
+    // Likewise the `audiosamplerate` override must not move Speex /
+    // Nellymoser 8/16 kHz off their spec-fixed rates (the SoundRate field
+    // "cannot represent" those rates, so a producer's `audiosamplerate`
+    // for these is advisory at best — the codec id is the truth).
+    let spec_fixed_rate = matches!(
+        ah.codec_id,
+        AUDIO_CODEC_NELLYMOSER_8K_MONO | AUDIO_CODEC_NELLYMOSER_16K_MONO | AUDIO_CODEC_SPEEX
+    );
+    if spec_fixed_rate {
+        params.sample_rate = Some(ah.sample_rate_hz());
     }
     // `audiodatarate` is in kilobits-per-second per E.5.
     if let Some(kbps) = metadata_lookup_f64(metadata, "audiodatarate") {
@@ -3861,5 +3884,58 @@ mod tests {
             .metadata()
             .iter()
             .any(|(k, v)| k == "scriptdata.onSomeEvent" && v == "null"));
+    }
+
+    #[test]
+    fn speex_stream_stays_mono_16k_despite_onmetadata_stereo() {
+        // E.4.2.1: Speex is "compressed mono sampled at 16 kHz". A
+        // producer that wrongly stamped `stereo = true` /
+        // `audiosamplerate = 44100` must NOT upgrade the stream — the
+        // codec id pins it to mono / 16 kHz.
+        // SoundFormat 11 (Speex) high nibble, SoundType bit set (wrongly
+        // claims stereo) — 0xB2.
+        let speex_body = vec![0xB2u8, 0x00]; // header + 1 byte
+        let meta = vec![
+            ("stereo".to_string(), "true".to_string()),
+            ("audiosamplerate".to_string(), "44100".to_string()),
+        ];
+        let info = build_audio_stream(STREAM_AUDIO, &speex_body, &meta).unwrap();
+        assert_eq!(info.params.channels, Some(1), "Speex must stay mono");
+        assert_eq!(
+            info.params.sample_rate,
+            Some(16_000),
+            "Speex must stay 16 kHz"
+        );
+    }
+
+    #[test]
+    fn nellymoser_8k_stream_stays_mono_8k_despite_onmetadata() {
+        // Nellymoser 8 kHz mono (codec 5).
+        let body = vec![(5u8 << 4) | (3 << 2) | 0b11, 0x00];
+        let meta = vec![
+            ("stereo".to_string(), "true".to_string()),
+            ("audiosamplerate".to_string(), "48000".to_string()),
+        ];
+        let info = build_audio_stream(STREAM_AUDIO, &body, &meta).unwrap();
+        assert_eq!(info.params.channels, Some(1));
+        assert_eq!(info.params.sample_rate, Some(8_000));
+    }
+
+    #[test]
+    fn mp3_stream_still_honours_onmetadata_overrides() {
+        // A non-pinned format must still pick up the authoritative
+        // onMetaData stereo / samplerate values.
+        let mp3_body = vec![(2u8 << 4) | (3 << 2) | 0b11, 0x00];
+        let meta = vec![
+            ("stereo".to_string(), "false".to_string()),
+            ("audiosamplerate".to_string(), "48000".to_string()),
+        ];
+        let info = build_audio_stream(STREAM_AUDIO, &mp3_body, &meta).unwrap();
+        assert_eq!(
+            info.params.channels,
+            Some(1),
+            "onMetaData stereo=false wins"
+        );
+        assert_eq!(info.params.sample_rate, Some(48_000));
     }
 }

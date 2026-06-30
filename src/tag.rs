@@ -1085,8 +1085,15 @@ impl AudioTagHeader {
         match self.codec_id {
             AUDIO_CODEC_MP3_8K => 8_000,
             AUDIO_CODEC_AAC => 44_100, // real rate comes from AudioSpecificConfig
+            // Nellymoser 8/16 kHz mono: per E.4.2.1 the SoundRate field
+            // "cannot represent 8 or 16 kHz sampling rates" and is ignored
+            // by the player — the codec id is the authoritative rate.
             AUDIO_CODEC_NELLYMOSER_8K_MONO => 8_000,
             AUDIO_CODEC_NELLYMOSER_16K_MONO => 16_000,
+            // Speex in FLV is "compressed mono sampled at 16 kHz" per
+            // E.4.2.1; the SoundRate field "shall be 0" but the true rate
+            // is always 16 kHz, so the header bits are ignored.
+            AUDIO_CODEC_SPEEX => 16_000,
             _ => match self.sample_rate_idx {
                 0 => 5_512,
                 1 => 11_025,
@@ -1097,10 +1104,17 @@ impl AudioTagHeader {
     }
 
     pub fn channels(self) -> u16 {
-        if self.is_stereo {
-            2
-        } else {
-            1
+        // E.4.2.1 pins the channel count for three formats regardless of
+        // the SoundType bit: Nellymoser 8/16 kHz mono (the player ignores
+        // SoundType for these) and Speex ("compressed mono ... SoundType
+        // shall be 0"). For every other format the SoundType bit is the
+        // truth.
+        match self.codec_id {
+            AUDIO_CODEC_NELLYMOSER_8K_MONO
+            | AUDIO_CODEC_NELLYMOSER_16K_MONO
+            | AUDIO_CODEC_SPEEX => 1,
+            _ if self.is_stereo => 2,
+            _ => 1,
         }
     }
 }
@@ -1629,6 +1643,30 @@ mod tests {
         assert_eq!(h.sample_rate_idx, 3);
         assert!(h.is_16bit);
         assert!(h.is_stereo);
+    }
+
+    #[test]
+    fn nellymoser_and_speex_rate_and_channels_are_spec_pinned() {
+        // E.4.2.1: Nellymoser 8/16 kHz mono and Speex ignore the SoundRate
+        // / SoundType header bits and are mono at a fixed rate.
+        // Nellymoser 16 kHz mono (codec 4), header bits claim 44 kHz stereo.
+        let h = AudioTagHeader::parse((4 << 4) | (3 << 2) | 0b11);
+        assert_eq!(h.codec_id, AUDIO_CODEC_NELLYMOSER_16K_MONO);
+        assert_eq!(h.sample_rate_hz(), 16_000);
+        assert_eq!(h.channels(), 1, "Nellymoser 16k is mono regardless of bit");
+        // Nellymoser 8 kHz mono (codec 5).
+        let h = AudioTagHeader::parse((5 << 4) | (3 << 2) | 0b11);
+        assert_eq!(h.sample_rate_hz(), 8_000);
+        assert_eq!(h.channels(), 1);
+        // Speex (codec 11): always 16 kHz mono. Header bits claim 44 kHz stereo.
+        let h = AudioTagHeader::parse((11 << 4) | (3 << 2) | 0b11);
+        assert_eq!(h.codec_id, AUDIO_CODEC_SPEEX);
+        assert_eq!(h.sample_rate_hz(), 16_000);
+        assert_eq!(h.channels(), 1);
+        // A non-pinned format (MP3, codec 2) still honours the bits.
+        let h = AudioTagHeader::parse((2 << 4) | (2 << 2) | 0b01);
+        assert_eq!(h.sample_rate_hz(), 22_050);
+        assert_eq!(h.channels(), 2);
     }
 
     #[test]

@@ -161,7 +161,15 @@ oxideav-flv = "0.0"
   - Codec id 0, 3 = Linear PCM (native, little-endian).
   - Codec id 1 = ADPCM.
   - Codec id 7 = G.711 A-law, 8 = G.711 mu-law.
-  - Codec id 11 = Speex.
+  - Codec id 4 = Nellymoser 16 kHz mono, 5 = Nellymoser 8 kHz mono,
+    6 = Nellymoser. Per E.4.2.1 the 8/16 kHz mono variants force their
+    sample rate from the codec id (the SoundRate field "cannot represent
+    8 or 16 kHz") and are mono regardless of the SoundType bit (which the
+    player ignores for these).
+  - Codec id 11 = Speex. Per E.4.2.1 Speex is "compressed mono sampled
+    at 16 kHz" — the demuxer pins it to 1 channel / 16 kHz regardless of
+    the SoundRate / SoundType bits (or a contradictory `onMetaData`
+    `stereo` / `audiosamplerate`).
   - **Audio silence message** (enhanced-rtmp-v2 §`AudioPacketType`): an
     audio tag whose payload is zero-length (an empty audio message
     carrying no `AudioTagHeader`) signals a period of silence with
@@ -794,10 +802,13 @@ can resolve them through the `oxideav-core` codec registry):
 | 1      | audio | `adpcm_swf`| Flash ADPCM                  |
 | 2      | audio | `mp3`      |                              |
 | 3      | audio | `pcm_s16le`| little-endian                |
+| 4      | audio | `nellymoser`| 16 kHz mono (rate pinned)   |
+| 5      | audio | `nellymoser`| 8 kHz mono (rate pinned)    |
+| 6      | audio | `nellymoser`| SoundRate-derived rate       |
 | 7      | audio | `pcm_alaw` |                              |
 | 8      | audio | `pcm_mulaw`|                              |
 | 10     | audio | `aac`      | MP4-style config + raw AUs   |
-| 11     | audio | `speex`    |                              |
+| 11     | audio | `speex`    | mono 16 kHz (pinned)         |
 | 14     | audio | `mp3`      | 8 kHz subvariant             |
 | 2      | video | `flv1`     | Sorenson H.263               |
 | 3      | video | `flashsv`  | Screen video v1              |
