@@ -278,6 +278,92 @@ impl<'a> TypedMetadata<'a> {
         Some(audio_codec_id_str_u32(self.audio_codec_id()?))
     }
 
+    // ---------------------------------------- Annex B.1 Stream Properties
+    //
+    // Adobe v10.1 Annex B.1 ("Stream Properties") documents the property
+    // set Flash Player surfaces on `NetStream.onMetaData` for an F4V
+    // file. Several of those properties are *also* stamped into the FLV
+    // `onMetaData` SCRIPTDATA object by real producers (the two share the
+    // ActionScript `NetStream.onMetaData` surface), so the demuxer
+    // flattens them into the bag like any other key. The accessors below
+    // re-type the Annex B.1 properties that have no Annex E.5 equivalent
+    // back into their declared AMF type.
+
+    /// `avclevel` — the AVC (H.264) level the video conforms to, when
+    /// the video is AVC-coded (Annex B.1).
+    ///
+    /// AMF type: Number (DOUBLE). Producers stamp the raw `level_idc`
+    /// value (e.g. `31.0` for level 3.1's `level_idc = 31`, `51.0` for
+    /// level 5.1). Returns the finite value verbatim; absent or
+    /// non-finite returns `None`.
+    pub fn avc_level(&self) -> Option<f64> {
+        self.lookup_finite_f64("avclevel")
+    }
+
+    /// `avcprofile` — the AVC (H.264) profile the video conforms to,
+    /// when the video is AVC-coded (Annex B.1).
+    ///
+    /// AMF type: Number (DOUBLE). Producers stamp the raw
+    /// `profile_idc` value (e.g. `66.0` Baseline, `77.0` Main,
+    /// `100.0` High). Returns the finite value verbatim; absent or
+    /// non-finite returns `None`.
+    pub fn avc_profile(&self) -> Option<f64> {
+        self.lookup_finite_f64("avcprofile")
+    }
+
+    /// `moovposition` — the absolute byte offset of the F4V `moov` box
+    /// within the file (Annex B.1).
+    ///
+    /// AMF type: Number (DOUBLE). Only meaningful for an F4V container
+    /// (it locates the sample tables); an FLV producer relaying F4V
+    /// metadata may carry it through. Returns the value as `u64` after
+    /// the same finite + non-negative gating as [`Self::filesize`].
+    pub fn moov_position(&self) -> Option<u64> {
+        let n = self.lookup_finite_f64("moovposition")?;
+        if !(0.0..=u64::MAX as f64).contains(&n) {
+            return None;
+        }
+        Some(n as u64)
+    }
+
+    /// `videocodecid` rendered as the four-character codec STRING form
+    /// Annex B.1 documents (`"avc1"`, `"vp08"`, …), as distinct from
+    /// the Annex E.5 numeric form [`Self::video_codec_id_str`] resolves.
+    ///
+    /// Annex B.1 states `videocodecid` is *"a STRING with four
+    /// characters that define the video codec used"* — the F4V sample
+    /// entry FourCc — whereas Annex E.5 declares the same property a
+    /// *Number* (the legacy CodecID nibble). A producer that stamped
+    /// the property as an AMF0 String surfaces in the bag verbatim, so
+    /// this accessor returns the raw four-character string when the
+    /// stored value is non-numeric (the String form). When the stored
+    /// value parses as a number it is the Annex E.5 numeric form and
+    /// this accessor returns `None` — reach for
+    /// [`Self::video_codec_id_str`] in that case.
+    pub fn video_codec_fourcc(&self) -> Option<&'a str> {
+        let s = self.lookup_str("videocodecid")?;
+        if s.parse::<f64>().is_ok() {
+            return None;
+        }
+        Some(s)
+    }
+
+    /// `audiocodecid` rendered as the four-character codec STRING form
+    /// Annex B.1 documents (`"mp4a"`, `".mp3"`, …), as distinct from
+    /// the Annex E.5 numeric form [`Self::audio_codec_id_str`] resolves.
+    ///
+    /// See [`Self::video_codec_fourcc`] for the String-vs-Number
+    /// disambiguation: returns the raw four-character string only when
+    /// the stored value is non-numeric (the Annex B.1 String form);
+    /// `None` when it parses as a number (the Annex E.5 numeric form).
+    pub fn audio_codec_fourcc(&self) -> Option<&'a str> {
+        let s = self.lookup_str("audiocodecid")?;
+        if s.parse::<f64>().is_ok() {
+            return None;
+        }
+        Some(s)
+    }
+
     // ----------------------------------------------------------- Boolean
 
     /// `stereo` — true when the audio stream is stereo (Annex E.5).
@@ -1166,6 +1252,62 @@ mod tests {
         // The string accessor now resolves the FourCc.
         assert_eq!(m.video_codec_id_str().as_deref(), Some("av1"));
         assert_eq!(m.audio_codec_id_str().as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn annex_b1_avc_level_and_profile() {
+        // Annex B.1 stamps `avclevel` / `avcprofile` as Number (DOUBLE);
+        // producers emit the raw level_idc / profile_idc.
+        let b = bag(&[("avclevel", "31"), ("avcprofile", "100")]);
+        let m = TypedMetadata::new(&b);
+        assert_eq!(m.avc_level(), Some(31.0));
+        assert_eq!(m.avc_profile(), Some(100.0));
+    }
+
+    #[test]
+    fn annex_b1_avc_level_and_profile_absent_or_malformed() {
+        let b = bag(&[("avclevel", "not-a-number")]);
+        let m = TypedMetadata::new(&b);
+        assert_eq!(m.avc_level(), None);
+        assert_eq!(m.avc_profile(), None); // absent
+    }
+
+    #[test]
+    fn annex_b1_moov_position() {
+        let b = bag(&[("moovposition", "40")]);
+        let m = TypedMetadata::new(&b);
+        assert_eq!(m.moov_position(), Some(40));
+        // Negative offset is out of range.
+        let b2 = bag(&[("moovposition", "-1")]);
+        let m2 = TypedMetadata::new(&b2);
+        assert_eq!(m2.moov_position(), None);
+    }
+
+    #[test]
+    fn annex_b1_codec_fourcc_string_form() {
+        // Annex B.1 documents `videocodecid` / `audiocodecid` as a
+        // four-character STRING (the F4V sample-entry FourCc), distinct
+        // from the Annex E.5 Number form. A producer that stamped the
+        // String form surfaces verbatim in the bag.
+        let b = bag(&[("videocodecid", "avc1"), ("audiocodecid", "mp4a")]);
+        let m = TypedMetadata::new(&b);
+        assert_eq!(m.video_codec_fourcc(), Some("avc1"));
+        assert_eq!(m.audio_codec_fourcc(), Some("mp4a"));
+        // The numeric accessors reject the non-numeric String form.
+        assert_eq!(m.video_codec_id(), None);
+        assert_eq!(m.audio_codec_id(), None);
+    }
+
+    #[test]
+    fn annex_b1_codec_fourcc_rejects_numeric_form() {
+        // When the property is the Annex E.5 Number form, the fourcc
+        // String accessor returns None (callers use video_codec_id_str).
+        let b = bag(&[("videocodecid", "7"), ("audiocodecid", "10")]);
+        let m = TypedMetadata::new(&b);
+        assert_eq!(m.video_codec_fourcc(), None);
+        assert_eq!(m.audio_codec_fourcc(), None);
+        assert_eq!(m.video_codec_id_str().as_deref(), Some("h264"));
+        assert_eq!(m.audio_codec_id_str().as_deref(), Some("aac"));
     }
 
     #[test]
