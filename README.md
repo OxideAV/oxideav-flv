@@ -1,5 +1,7 @@
 # oxideav-flv
 
+[![CI](https://github.com/OxideAV/oxideav-flv/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-flv/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-flv.svg)](https://crates.io/crates/oxideav-flv) [![docs.rs](https://docs.rs/oxideav-flv/badge.svg)](https://docs.rs/oxideav-flv) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust **Flash Video (FLV)** container demuxer for oxideav. Zero C
 dependencies, no FFI, no `*-sys` crates.
 
