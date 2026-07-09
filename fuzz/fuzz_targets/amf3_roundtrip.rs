@@ -42,8 +42,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Phase 3 — the canonical encoding must decode back to the SAME value
     // and consume every byte we wrote.
-    let (value2, consumed2) = parse_amf3_value(&enc, 0)
-        .expect("re-encoded AMF3 must decode");
+    let (value2, consumed2) = parse_amf3_value(&enc, 0).expect("re-encoded AMF3 must decode");
     assert_eq!(consumed2, enc.len(), "decoder left trailing encoder bytes");
     assert_eq!(value, value2, "value drifted across encode→decode");
 

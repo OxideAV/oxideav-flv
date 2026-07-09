@@ -43,6 +43,14 @@ cargo-fuzz = true
 #                          the value is unchanged and the canonical
 #                          encoding is a fixed point. Differential test
 #                          of the encoder against the decoder.
+#  * `legacy_audio_roundtrip` — pick one legacy SoundFormat, mux a run
+#                          of fuzz-controlled `SoundData` payloads via
+#                          the legacy audio writers (PCM / ADPCM /
+#                          G.711 / Nellymoser / Speex / MP3-8k),
+#                          re-parse, and assert the codec id resolves
+#                          and every non-empty payload survives verbatim
+#                          in order. Differential mux -> demux test of
+#                          the legacy audio tag writers.
 #
 # The fuzz crate links `oxideav-flv` via path-dep with default features
 # and depends on `oxideav-core` only transitively. No external codec
@@ -90,5 +98,11 @@ doc = false
 [[bin]]
 name = "amf3_roundtrip"
 path = "fuzz_targets/amf3_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "legacy_audio_roundtrip"
+path = "fuzz_targets/legacy_audio_roundtrip.rs"
 test = false
 doc = false
