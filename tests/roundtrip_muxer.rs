@@ -23,16 +23,16 @@ use oxideav_flv::{
 use oxideav_flv::{
     join_tracks, write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_aac_raw_tag,
     write_aac_sequence_header, write_ac3_coded_frames, write_additional_header, write_adpcm_tag,
-    write_alaw_tag, write_av1_coded_frames, write_av1_sequence_start, write_avc_nalu_tag,
-    write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_multichannel_config,
-    write_ex_audio_sequence_end, write_ex_audio_tag, write_ex_video_color_info,
-    write_ex_video_color_info_reset, write_ex_video_metadata, write_ex_video_sequence_end,
-    write_ex_video_tag, write_filtered_tag, write_flac_coded_frames, write_flac_sequence_start,
-    write_h263_tag, write_hevc_coded_frames, write_hevc_coded_frames_x, write_hevc_sequence_start,
-    write_mp3_8k_tag, write_mp3_ex_coded_frames, write_mulaw_tag, write_nellymoser_16k_mono_tag,
-    write_nellymoser_8k_mono_tag, write_nellymoser_tag, write_opus_coded_frames,
-    write_opus_sequence_start, write_pcm_tag, write_screen_video2_tag, write_screen_video_tag,
-    write_speex_tag, write_vp6_tag, write_vp6a_tag, write_vp9_coded_frames,
+    write_alaw_tag, write_audio_silence, write_av1_coded_frames, write_av1_sequence_start,
+    write_avc_nalu_tag, write_avc_sequence_header, write_eac3_coded_frames,
+    write_ex_audio_multichannel_config, write_ex_audio_sequence_end, write_ex_audio_tag,
+    write_ex_video_color_info, write_ex_video_color_info_reset, write_ex_video_metadata,
+    write_ex_video_sequence_end, write_ex_video_tag, write_filtered_tag, write_flac_coded_frames,
+    write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames, write_hevc_coded_frames_x,
+    write_hevc_sequence_start, write_mp3_8k_tag, write_mp3_ex_coded_frames, write_mulaw_tag,
+    write_nellymoser_16k_mono_tag, write_nellymoser_8k_mono_tag, write_nellymoser_tag,
+    write_opus_coded_frames, write_opus_sequence_start, write_pcm_tag, write_screen_video2_tag,
+    write_screen_video_tag, write_speex_tag, write_vp6_tag, write_vp6a_tag, write_vp9_coded_frames,
     write_vp9_sequence_start, write_vvc_coded_frames, write_vvc_sequence_start, AudioChannel,
     AudioChannelOrder, AvMultitrackType, ColorConfig, ColorInfo, EncryptedTagPreamble,
     ExAudioPacketType, ExAudioTagHeader, ExFrameType, ExPacketType, ExVideoTagHeader, HdrCll,
@@ -2478,4 +2478,35 @@ fn screen_video_v1_and_v2_tags_round_trip() {
     let p = dmx.next_packet().unwrap();
     assert!(p.flags.keyframe);
     assert_eq!(p.data, frame);
+}
+
+#[test]
+fn audio_silence_message_round_trips_after_established_stream() {
+    // A real audio tag establishes the stream, then a silence tag, then
+    // a resume tag. The demuxer surfaces the silence as a zero-length
+    // header+discard packet and resumes cleanly on the next real tag.
+    let f0 = vec![0x01u8, 0x02, 0x03];
+    let f1 = vec![0x04u8, 0x05];
+    let buf = build_audio_only(|b| {
+        write_pcm_tag(b, 0, true, 3, true, true, &f0).unwrap();
+        write_audio_silence(b, 40).unwrap();
+        write_pcm_tag(b, 60, true, 3, true, true, &f1).unwrap();
+    });
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "pcm_s16le");
+
+    let p0 = dmx.next_packet().unwrap();
+    assert!(!p0.flags.discard);
+    assert_eq!(p0.data, f0);
+
+    let silence = dmx.next_packet().unwrap();
+    assert_eq!(silence.pts, Some(40));
+    assert!(silence.data.is_empty(), "silence carries no media bytes");
+    assert!(silence.flags.header);
+    assert!(silence.flags.discard);
+
+    let p1 = dmx.next_packet().unwrap();
+    assert!(!p1.flags.discard);
+    assert_eq!(p1.pts, Some(60));
+    assert_eq!(p1.data, f1);
 }

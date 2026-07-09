@@ -425,6 +425,22 @@ pub fn write_mp3_8k_tag<W: Write + ?Sized>(
     write_audio_tag(w, timestamp_ms, header, mp3_frame)
 }
 
+/// Write an audio-silence message: an audio tag with a zero-length body
+/// (no `AudioTagHeader` byte), per the enhanced-rtmp-v2 §`AudioPacketType`
+/// note. An empty audio message signals a period of silence with
+/// spec-defined playback semantics — drain buffered audio, flush the
+/// audio decoder, and stop using the audio clock as the A/V-sync master
+/// until media resumes ("no less than the same meaning as"
+/// `SequenceEnd`). The demuxer surfaces such a tag (once an audio stream
+/// is established) as a zero-length `header + discard` packet at
+/// `timestamp_ms`; this is the write-side inverse. The tag carries no
+/// codec, so it must appear *after* at least one real audio tag has
+/// established the stream (a silence tag emitted first mints no stream
+/// and is skipped on the read side).
+pub fn write_audio_silence<W: Write + ?Sized>(w: &mut W, timestamp_ms: u32) -> Result<u32> {
+    write_tag(w, TagType::Audio, timestamp_ms, 0, &[])
+}
+
 /// Write a video tag: a one-byte [`VideoTagHeader`] followed by
 /// `payload`, wrapped in a full FLV tag via [`write_tag`] (spec
 /// §E.4.3 / §E.4.3.1).
