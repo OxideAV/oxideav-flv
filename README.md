@@ -479,7 +479,7 @@ exceeds the remaining bytes of the underlying `Read + Seek` stream
 *before* committing the `Vec`.
 
 A `fuzz/` sub-crate (cargo-fuzz / libfuzzer) backs the hand-crafted
-suite with five targets:
+suite with six targets:
 
 * `demuxer_open_next` — arbitrary bytes through `open_demuxer` and
   drain `next_packet` until error or EOF, with a per-iteration step
@@ -500,14 +500,26 @@ suite with five targets:
   the value is unchanged and the canonical encoding is a fixed point
   (`encode == encode ∘ decode ∘ encode`). Catches any asymmetry
   between the two halves.
+* `legacy_audio_roundtrip` — differential mux ↔ demux test of the
+  legacy audio tag writers: pick one SoundFormat, mux a run of
+  fuzz-controlled `SoundData` payloads via the matching writer
+  (PCM / ADPCM / G.711 / Nellymoser / Speex / MP3-8k), re-parse, and
+  assert the file re-opens, the codec id resolves to the writer's
+  declared format, and every non-empty payload survives verbatim and
+  in order (empty payloads route to the silence signal and are excluded
+  from the survival check).
 
 The fuzz crate carries its own `[workspace]` table so the umbrella
 build is unaffected; `Cargo.lock` is gitignored.
 
 ### Muxer
 
-A first muxer slice is implemented: enough to write a playable
-audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
+The muxer writes a playable FLV that round-trips bit-exactly back
+through `FlvDemuxer`. The legacy write surface is complete: every
+SoundFormat the demuxer reads (PCM 0/3, ADPCM 1, Nellymoser 4/5/6,
+G.711 7/8, MP3 2/14, AAC 10, Speex 11) and every legacy CodecID (H.263,
+Screen video v1/v2, VP6, VP6A, AVC) has a dedicated writer, each pinned
+to the same E.4.2.1 / E.4.3.1 resolution the read side applies.
 
 | Primitive | Function | Spec |
 | --- | --- | --- |
@@ -515,12 +527,20 @@ audio-only FLV that round-trips bit-exactly back through `FlvDemuxer`.
 | Leading `PreviousTagSize0` | `tag::write_first_previous_tag_size(w)` | §E.3 |
 | Generic tag | `tag::write_tag(w, type, ts_ms, stream_id, body)` | §E.4.1 |
 | MP3 audio tag | `tag::write_mp3_tag(w, ts_ms, rate_idx, is_16bit, is_stereo, frame)` | §E.4.2.1 |
+| MP3 8 kHz audio tag | `tag::write_mp3_8k_tag(w, ts_ms, is_16bit, is_stereo, frame)` | §E.4.2.1 (SoundFormat 14) |
 | Raw AAC audio tag | `tag::write_aac_raw_tag(w, ts_ms, raw_au)` | §E.4.2.1/2 |
 | Legacy AAC sequence header | `tag::write_aac_sequence_header(w, ts_ms, audio_specific_config)` | §E.4.2.1/2 |
+| Linear PCM audio tag | `tag::write_pcm_tag(w, ts_ms, little_endian, rate_idx, is_16bit, is_stereo, samples)` | §E.4.2.1 (SoundFormat 0 / 3) |
+| Flash ADPCM audio tag | `tag::write_adpcm_tag(w, ts_ms, rate_idx, is_16bit, is_stereo, data)` | §E.4.2.1 (SoundFormat 1) |
+| G.711 A-law / mu-law audio tag | `tag::write_alaw_tag` / `tag::write_mulaw_tag(w, ts_ms, rate_idx, is_stereo, data)` | §E.4.2.1 (SoundFormat 7 / 8) |
+| Nellymoser audio tag | `tag::write_nellymoser_tag(w, ts_ms, rate_idx, is_stereo, data)` + `write_nellymoser_8k_mono_tag` / `write_nellymoser_16k_mono_tag` (rate-pinned) | §E.4.2.1 (SoundFormat 6 / 5 / 4) |
+| Speex audio tag | `tag::write_speex_tag(w, ts_ms, data)` (pinned mono 16 kHz) | §E.4.2.1 (SoundFormat 11) |
+| Audio-silence message | `tag::write_audio_silence(w, ts_ms)` (zero-length audio tag) | enhanced-rtmp v2 §`AudioPacketType` |
 | Generic video tag | `tag::write_video_tag(w, ts_ms, VideoTagHeader, payload)` | §E.4.3.1 |
 | Sorenson H.263 (`flv1`) tag | `tag::write_h263_tag(w, ts_ms, is_keyframe, frame)` | §E.4.3.1 |
 | VP6 (`vp6f`) tag | `tag::write_vp6_tag(w, ts_ms, is_keyframe, frame)` | §E.4.3.1 |
 | VP6-with-alpha (`vp6a`) tag | `tag::write_vp6a_tag(w, ts_ms, is_keyframe, alpha_offset, frame)` | §E.4.3.1 |
+| Screen video v1 / v2 tag | `tag::write_screen_video_tag` / `tag::write_screen_video2_tag(w, ts_ms, is_keyframe, frame)` | §E.4.3.1 (CodecID 3 / 6) |
 | AVC sequence header | `tag::write_avc_sequence_header(w, ts_ms, config_record)` | §E.4.3.1 |
 | AVC NALU access unit | `tag::write_avc_nalu_tag(w, ts_ms, is_keyframe, composition_time_ms, au)` | §E.4.3.1 |
 | AVC end-of-sequence | `tag::write_avc_end_of_sequence(w, ts_ms)` | §E.4.3.1 |
