@@ -225,6 +225,206 @@ pub fn write_aac_sequence_header<W: Write + ?Sized>(
     write_audio_tag(w, timestamp_ms, header, &payload)
 }
 
+/// Write a Linear PCM audio tag (spec §E.4.2.1). `little_endian` picks
+/// the codec id: `false` = `SoundFormat 0` (platform-endian uncompressed
+/// PCM), `true` = `SoundFormat 3` (little-endian uncompressed PCM). Both
+/// resolve to the `pcm_s16le` codec string on the read side.
+///
+/// `sample_rate_idx` is the 2-bit `SoundRate` code (`0`=5.5k, `1`=11k,
+/// `2`=22k, `3`=44k), `is_16bit` the `SoundSize` bit, `is_stereo` the
+/// `SoundType` bit — all three are meaningful for uncompressed PCM (the
+/// spec's note that `SoundSize` "only pertains to uncompressed formats"
+/// makes this the one family where the bit is authoritative). `samples`
+/// is the raw sample block written verbatim as `SoundData`.
+pub fn write_pcm_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    little_endian: bool,
+    sample_rate_idx: u8,
+    is_16bit: bool,
+    is_stereo: bool,
+    samples: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: if little_endian {
+            AUDIO_CODEC_LPCM_LE
+        } else {
+            AUDIO_CODEC_LPCM_NATIVE
+        },
+        sample_rate_idx: sample_rate_idx & 0x03,
+        is_16bit,
+        is_stereo,
+    };
+    write_audio_tag(w, timestamp_ms, header, samples)
+}
+
+/// Write a Flash ADPCM audio tag (`SoundFormat = 1`, spec §E.4.2.1).
+/// Resolves to the `adpcm_swf` codec string on the read side. `data` is
+/// one ADPCM block written verbatim as `SoundData`; `sample_rate_idx`,
+/// `is_16bit`, and `is_stereo` populate the `SoundRate` / `SoundSize` /
+/// `SoundType` header bits.
+pub fn write_adpcm_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    sample_rate_idx: u8,
+    is_16bit: bool,
+    is_stereo: bool,
+    data: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: AUDIO_CODEC_ADPCM,
+        sample_rate_idx: sample_rate_idx & 0x03,
+        is_16bit,
+        is_stereo,
+    };
+    write_audio_tag(w, timestamp_ms, header, data)
+}
+
+/// Write a G.711 A-law audio tag (`SoundFormat = 7`, spec §E.4.2.1).
+/// Resolves to the `pcm_alaw` codec string on the read side. `data` is
+/// the companded 8-bit-per-sample body written verbatim as `SoundData`.
+/// The `SoundSize` bit is fixed at 16 (the decoded PCM width — the raw
+/// companded bytes are one octet each, but the spec's `SoundSize`
+/// "pertains to uncompressed formats" and describes the decoder output);
+/// `sample_rate_idx` and `is_stereo` populate the remaining header bits.
+pub fn write_alaw_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    sample_rate_idx: u8,
+    is_stereo: bool,
+    data: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: AUDIO_CODEC_ALAW,
+        sample_rate_idx: sample_rate_idx & 0x03,
+        is_16bit: true,
+        is_stereo,
+    };
+    write_audio_tag(w, timestamp_ms, header, data)
+}
+
+/// Write a G.711 mu-law audio tag (`SoundFormat = 8`, spec §E.4.2.1).
+/// Resolves to the `pcm_mulaw` codec string on the read side. The
+/// companion of [`write_alaw_tag`]; see it for the `SoundSize` note.
+pub fn write_mulaw_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    sample_rate_idx: u8,
+    is_stereo: bool,
+    data: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: AUDIO_CODEC_MULAW,
+        sample_rate_idx: sample_rate_idx & 0x03,
+        is_16bit: true,
+        is_stereo,
+    };
+    write_audio_tag(w, timestamp_ms, header, data)
+}
+
+/// Write a generic Nellymoser audio tag (`SoundFormat = 6`, spec
+/// §E.4.2.1) whose sample rate is carried by the `SoundRate` field.
+/// Resolves to the `nellymoser` codec string on the read side.
+/// `sample_rate_idx` is the 2-bit `SoundRate` code, `is_stereo` the
+/// `SoundType` bit; `data` is the Nellymoser frame written verbatim.
+/// For the two fixed-rate mono variants the field "cannot represent"
+/// (8 kHz / 16 kHz) use [`write_nellymoser_8k_mono_tag`] /
+/// [`write_nellymoser_16k_mono_tag`].
+pub fn write_nellymoser_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    sample_rate_idx: u8,
+    is_stereo: bool,
+    data: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: AUDIO_CODEC_NELLYMOSER,
+        sample_rate_idx: sample_rate_idx & 0x03,
+        is_16bit: true,
+        is_stereo,
+    };
+    write_audio_tag(w, timestamp_ms, header, data)
+}
+
+/// Write a Nellymoser 8 kHz mono audio tag (`SoundFormat = 5`, spec
+/// §E.4.2.1). Per the spec the `SoundRate` field "cannot represent 8 ...
+/// kHz" and is ignored by the player — the codec id pins the rate — so
+/// the header `SoundRate` bits are written as `0` and the read side
+/// resolves 8 kHz / mono regardless. `data` is the Nellymoser frame.
+pub fn write_nellymoser_8k_mono_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    data: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: AUDIO_CODEC_NELLYMOSER_8K_MONO,
+        sample_rate_idx: 0,
+        is_16bit: true,
+        is_stereo: false,
+    };
+    write_audio_tag(w, timestamp_ms, header, data)
+}
+
+/// Write a Nellymoser 16 kHz mono audio tag (`SoundFormat = 4`, spec
+/// §E.4.2.1). Rate-pinned sibling of [`write_nellymoser_8k_mono_tag`];
+/// the read side resolves 16 kHz / mono regardless of the header bits.
+pub fn write_nellymoser_16k_mono_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    data: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: AUDIO_CODEC_NELLYMOSER_16K_MONO,
+        sample_rate_idx: 0,
+        is_16bit: true,
+        is_stereo: false,
+    };
+    write_audio_tag(w, timestamp_ms, header, data)
+}
+
+/// Write a Speex audio tag (`SoundFormat = 11`, spec §E.4.2.1). Speex in
+/// FLV is defined as "compressed mono sampled at 16 kHz"; the `SoundRate`
+/// field "shall be 0", the stream is always mono, and the `SoundSize`
+/// bit is 16 (decoded width). The read side pins 16 kHz / 1 channel
+/// regardless, so the header byte is fixed at `SoundFormat = 11`,
+/// `SoundRate = 0`, `SoundSize = 1`, `SoundType = 0` (= `0xB2`). `data`
+/// is the Speex frame written verbatim as `SoundData`.
+pub fn write_speex_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    data: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: AUDIO_CODEC_SPEEX,
+        sample_rate_idx: 0,
+        is_16bit: true,
+        is_stereo: false,
+    };
+    write_audio_tag(w, timestamp_ms, header, data)
+}
+
+/// Write an 8 kHz MP3 audio tag (`SoundFormat = 14`, spec §E.4.2.1) —
+/// the low-rate MP3 subvariant. Resolves to the `mp3` codec string with
+/// the rate pinned to 8 kHz on the read side (the `SoundRate` field
+/// cannot encode 8 kHz), so the header `SoundRate` bits are written as
+/// `0`. `is_16bit` / `is_stereo` populate the remaining bits; `mp3_frame`
+/// is one raw MPEG Audio Layer III frame written verbatim.
+pub fn write_mp3_8k_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_16bit: bool,
+    is_stereo: bool,
+    mp3_frame: &[u8],
+) -> Result<u32> {
+    let header = AudioTagHeader {
+        codec_id: AUDIO_CODEC_MP3_8K,
+        sample_rate_idx: 0,
+        is_16bit,
+        is_stereo,
+    };
+    write_audio_tag(w, timestamp_ms, header, mp3_frame)
+}
+
 /// Write a video tag: a one-byte [`VideoTagHeader`] followed by
 /// `payload`, wrapped in a full FLV tag via [`write_tag`] (spec
 /// §E.4.3 / §E.4.3.1).
@@ -327,6 +527,47 @@ pub fn write_vp6a_tag<W: Write + ?Sized>(
     payload.push(alpha_offset);
     payload.extend_from_slice(frame);
     write_video_tag(w, timestamp_ms, header, &payload)
+}
+
+/// Write a Screen video (v1) tag (`CodecID = 3`, spec §E.4.3.1).
+/// Resolves to the `flashsv` codec string on the read side. `frame` is
+/// one Screen-video `VIDEODATA` block written verbatim; `is_keyframe`
+/// picks [`FrameType::Key`] vs [`FrameType::Inter`].
+pub fn write_screen_video_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_keyframe: bool,
+    frame: &[u8],
+) -> Result<u32> {
+    let header = VideoTagHeader {
+        frame_type: if is_keyframe {
+            FrameType::Key
+        } else {
+            FrameType::Inter
+        },
+        codec_id: VIDEO_CODEC_SCREEN_V1,
+    };
+    write_video_tag(w, timestamp_ms, header, frame)
+}
+
+/// Write a Screen video v2 tag (`CodecID = 6`, spec §E.4.3.1). Resolves
+/// to the `flashsv2` codec string on the read side. Sibling of
+/// [`write_screen_video_tag`].
+pub fn write_screen_video2_tag<W: Write + ?Sized>(
+    w: &mut W,
+    timestamp_ms: u32,
+    is_keyframe: bool,
+    frame: &[u8],
+) -> Result<u32> {
+    let header = VideoTagHeader {
+        frame_type: if is_keyframe {
+            FrameType::Key
+        } else {
+            FrameType::Inter
+        },
+        codec_id: VIDEO_CODEC_SCREEN_V2,
+    };
+    write_video_tag(w, timestamp_ms, header, frame)
 }
 
 /// Write an AVC sequence-header video tag (`AVCPacketType = 0`, spec

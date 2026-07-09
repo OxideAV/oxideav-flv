@@ -22,19 +22,22 @@ use oxideav_flv::{
 };
 use oxideav_flv::{
     join_tracks, write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_aac_raw_tag,
-    write_aac_sequence_header, write_ac3_coded_frames, write_additional_header,
-    write_av1_coded_frames, write_av1_sequence_start, write_avc_nalu_tag,
+    write_aac_sequence_header, write_ac3_coded_frames, write_additional_header, write_adpcm_tag,
+    write_alaw_tag, write_av1_coded_frames, write_av1_sequence_start, write_avc_nalu_tag,
     write_avc_sequence_header, write_eac3_coded_frames, write_ex_audio_multichannel_config,
     write_ex_audio_sequence_end, write_ex_audio_tag, write_ex_video_color_info,
     write_ex_video_color_info_reset, write_ex_video_metadata, write_ex_video_sequence_end,
     write_ex_video_tag, write_filtered_tag, write_flac_coded_frames, write_flac_sequence_start,
     write_h263_tag, write_hevc_coded_frames, write_hevc_coded_frames_x, write_hevc_sequence_start,
-    write_mp3_ex_coded_frames, write_opus_coded_frames, write_opus_sequence_start, write_vp6_tag,
-    write_vp6a_tag, write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
-    write_vvc_sequence_start, AudioChannel, AudioChannelOrder, AvMultitrackType, ColorConfig,
-    ColorInfo, EncryptedTagPreamble, ExAudioPacketType, ExAudioTagHeader, ExFrameType,
-    ExPacketType, ExVideoTagHeader, HdrCll, HdrMdcv, JoinTrack, ModExEntry, ModExPayload,
-    MultichannelConfig, TagType, FOURCC_AUDIO_AAC, FOURCC_AV01, FOURCC_OPUS, FOURCC_VP09,
+    write_mp3_8k_tag, write_mp3_ex_coded_frames, write_mulaw_tag, write_nellymoser_16k_mono_tag,
+    write_nellymoser_8k_mono_tag, write_nellymoser_tag, write_opus_coded_frames,
+    write_opus_sequence_start, write_pcm_tag, write_screen_video2_tag, write_screen_video_tag,
+    write_speex_tag, write_vp6_tag, write_vp6a_tag, write_vp9_coded_frames,
+    write_vp9_sequence_start, write_vvc_coded_frames, write_vvc_sequence_start, AudioChannel,
+    AudioChannelOrder, AvMultitrackType, ColorConfig, ColorInfo, EncryptedTagPreamble,
+    ExAudioPacketType, ExAudioTagHeader, ExFrameType, ExPacketType, ExVideoTagHeader, HdrCll,
+    HdrMdcv, JoinTrack, ModExEntry, ModExPayload, MultichannelConfig, TagType, FOURCC_AUDIO_AAC,
+    FOURCC_AV01, FOURCC_OPUS, FOURCC_VP09,
 };
 
 /// Three distinct synthetic MP3 frame payloads. The demuxer treats an
@@ -2263,4 +2266,216 @@ fn on_image_data_multiple_images_and_no_trackid() {
     assert_eq!(images[0].data, img_a);
     assert_eq!(images[1].track_id, None, "trackid omitted");
     assert_eq!(images[1].data, img_b);
+}
+
+// ---- Legacy audio codec muxer round-trips --------------------------------
+//
+// The demuxer reads every legacy SoundFormat (PCM / ADPCM / Nellymoser /
+// G.711 / Speex / MP3-8k), but the muxer previously only wrote MP3 + AAC.
+// These pin the new convenience writers: each writes an audio-only FLV,
+// demuxes it, and asserts the codec string, sample rate / channels /
+// sample-format the header resolves to, and per-packet body all survive.
+
+fn build_audio_only<F: FnMut(&mut Vec<u8>)>(mut emit: F) -> Vec<u8> {
+    let mut buf = Vec::new();
+    header::write(&mut buf, true, false).unwrap();
+    tag::write_first_previous_tag_size(&mut buf).unwrap();
+    emit(&mut buf);
+    buf
+}
+
+#[test]
+fn pcm_le_tag_round_trips_bytes_and_params() {
+    use oxideav_core::SampleFormat;
+    let samples = vec![0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06];
+    // little-endian PCM (SoundFormat 3), 44 kHz, 16-bit, stereo.
+    let buf = build_audio_only(|b| {
+        write_pcm_tag(b, 0, true, 3, true, true, &samples).unwrap();
+    });
+    let mut dmx = open_video_only(buf);
+    let s = &dmx.streams()[0];
+    assert_eq!(s.params.codec_id.as_str(), "pcm_s16le");
+    assert_eq!(s.params.sample_rate, Some(44_100));
+    assert_eq!(s.params.channels, Some(2));
+    assert_eq!(s.params.sample_format, Some(SampleFormat::S16));
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, samples);
+}
+
+#[test]
+fn pcm_native_8bit_mono_round_trips() {
+    use oxideav_core::SampleFormat;
+    let samples = vec![0x80u8, 0x81, 0x7F, 0x00];
+    // platform-endian PCM (SoundFormat 0), 11 kHz, 8-bit, mono.
+    let buf = build_audio_only(|b| {
+        write_pcm_tag(b, 0, false, 1, false, false, &samples).unwrap();
+    });
+    let mut dmx = open_video_only(buf);
+    let s = &dmx.streams()[0];
+    assert_eq!(s.params.codec_id.as_str(), "pcm_s16le");
+    assert_eq!(s.params.sample_rate, Some(11_025));
+    assert_eq!(s.params.channels, Some(1));
+    assert_eq!(s.params.sample_format, Some(SampleFormat::U8));
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, samples);
+}
+
+#[test]
+fn adpcm_tag_round_trips() {
+    let data = vec![0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE];
+    let buf = build_audio_only(|b| {
+        write_adpcm_tag(b, 0, 2, true, true, &data).unwrap();
+    });
+    let mut dmx = open_video_only(buf);
+    let s = &dmx.streams()[0];
+    assert_eq!(s.params.codec_id.as_str(), "adpcm_swf");
+    assert_eq!(s.params.sample_rate, Some(22_050));
+    assert_eq!(s.params.channels, Some(2));
+    let p = dmx.next_packet().unwrap();
+    assert_eq!(p.data, data);
+}
+
+#[test]
+fn alaw_and_mulaw_tags_round_trip() {
+    let a = vec![0x10u8, 0x20, 0x30];
+    let m = vec![0x40u8, 0x50, 0x60, 0x70];
+    let buf = build_audio_only(|b| {
+        write_alaw_tag(b, 0, 0, false, &a).unwrap();
+    });
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "pcm_alaw");
+    assert_eq!(dmx.streams()[0].params.channels, Some(1));
+    assert_eq!(dmx.next_packet().unwrap().data, a);
+
+    let buf = build_audio_only(|b| {
+        write_mulaw_tag(b, 0, 0, true, &m).unwrap();
+    });
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "pcm_mulaw");
+    assert_eq!(dmx.streams()[0].params.channels, Some(2));
+    assert_eq!(dmx.next_packet().unwrap().data, m);
+}
+
+#[test]
+fn nellymoser_generic_round_trips_rate_from_soundrate() {
+    let data = vec![0x01u8, 0x02, 0x03];
+    let buf = build_audio_only(|b| {
+        // Generic Nellymoser (SoundFormat 6), 11 kHz, stereo.
+        write_nellymoser_tag(b, 0, 1, true, &data).unwrap();
+    });
+    let mut dmx = open_video_only(buf);
+    let s = &dmx.streams()[0];
+    assert_eq!(s.params.codec_id.as_str(), "nellymoser");
+    assert_eq!(s.params.sample_rate, Some(11_025));
+    assert_eq!(s.params.channels, Some(2));
+    assert_eq!(dmx.next_packet().unwrap().data, data);
+}
+
+#[test]
+fn nellymoser_fixed_rate_mono_variants_pin_rate_and_channels() {
+    let data = vec![0xDEu8, 0xAD];
+    // 8 kHz mono (SoundFormat 5).
+    let buf = build_audio_only(|b| {
+        write_nellymoser_8k_mono_tag(b, 0, &data).unwrap();
+    });
+    let mut dmx = open_video_only(buf);
+    let s = &dmx.streams()[0];
+    assert_eq!(s.params.codec_id.as_str(), "nellymoser");
+    assert_eq!(s.params.sample_rate, Some(8_000));
+    assert_eq!(s.params.channels, Some(1));
+    assert_eq!(dmx.next_packet().unwrap().data, data);
+
+    // 16 kHz mono (SoundFormat 4).
+    let buf = build_audio_only(|b| {
+        write_nellymoser_16k_mono_tag(b, 0, &data).unwrap();
+    });
+    let mut dmx = open_video_only(buf);
+    let s = &dmx.streams()[0];
+    assert_eq!(s.params.sample_rate, Some(16_000));
+    assert_eq!(s.params.channels, Some(1));
+    assert_eq!(dmx.next_packet().unwrap().data, data);
+}
+
+#[test]
+fn speex_tag_pins_mono_16khz() {
+    let data = vec![0x11u8, 0x22, 0x33, 0x44];
+    let buf = build_audio_only(|b| {
+        write_speex_tag(b, 0, &data).unwrap();
+    });
+    let mut dmx = open_video_only(buf);
+    let s = &dmx.streams()[0];
+    assert_eq!(s.params.codec_id.as_str(), "speex");
+    assert_eq!(s.params.sample_rate, Some(16_000));
+    assert_eq!(s.params.channels, Some(1));
+    assert_eq!(dmx.next_packet().unwrap().data, data);
+}
+
+#[test]
+fn mp3_8k_tag_pins_rate_and_round_trips() {
+    let frame = vec![0xFFu8, 0xF3, 0x40, 0x00, 0x11];
+    let buf = build_audio_only(|b| {
+        write_mp3_8k_tag(b, 0, true, false, &frame).unwrap();
+    });
+    let mut dmx = open_video_only(buf);
+    let s = &dmx.streams()[0];
+    assert_eq!(s.params.codec_id.as_str(), "mp3");
+    assert_eq!(s.params.sample_rate, Some(8_000));
+    assert_eq!(s.params.channels, Some(1));
+    assert_eq!(dmx.next_packet().unwrap().data, frame);
+}
+
+#[test]
+fn multiple_pcm_tags_preserve_order_and_timestamps() {
+    let frames = [vec![0x01u8, 0x02], vec![0x03u8, 0x04, 0x05], vec![0x06u8]];
+    let buf = build_audio_only(|b| {
+        for (i, f) in frames.iter().enumerate() {
+            write_pcm_tag(b, (i as u32) * 23, true, 2, true, false, f).unwrap();
+        }
+    });
+    let mut dmx = open_video_only(buf);
+    let mut got = Vec::new();
+    while let Ok(p) = dmx.next_packet() {
+        got.push((p.pts.unwrap_or(-1), p.data.clone()));
+    }
+    assert_eq!(got.len(), frames.len());
+    for (i, f) in frames.iter().enumerate() {
+        assert_eq!(got[i].0, (i as i64) * 23);
+        assert_eq!(&got[i].1, f);
+    }
+}
+
+// ---- Screen-video codec muxer round-trips --------------------------------
+
+#[test]
+fn screen_video_v1_and_v2_tags_round_trip() {
+    let frame = vec![0x00u8, 0x10, 0x00, 0x10, 0xAB, 0xCD];
+    let buf = {
+        let mut b = Vec::new();
+        header::write(&mut b, false, true).unwrap();
+        tag::write_first_previous_tag_size(&mut b).unwrap();
+        write_screen_video_tag(&mut b, 0, true, &frame).unwrap();
+        write_screen_video_tag(&mut b, 40, false, &frame).unwrap();
+        b
+    };
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "flashsv");
+    let p0 = dmx.next_packet().unwrap();
+    assert!(p0.flags.keyframe);
+    assert_eq!(p0.data, frame);
+    let p1 = dmx.next_packet().unwrap();
+    assert!(!p1.flags.keyframe);
+    assert_eq!(p1.data, frame);
+
+    let buf = {
+        let mut b = Vec::new();
+        header::write(&mut b, false, true).unwrap();
+        tag::write_first_previous_tag_size(&mut b).unwrap();
+        write_screen_video2_tag(&mut b, 0, true, &frame).unwrap();
+        b
+    };
+    let mut dmx = open_video_only(buf);
+    assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "flashsv2");
+    let p = dmx.next_packet().unwrap();
+    assert!(p.flags.keyframe);
+    assert_eq!(p.data, frame);
 }
