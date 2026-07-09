@@ -613,7 +613,7 @@ mod tests {
     #[test]
     fn truncated_per_track_fourcc_errors() {
         // ManyTracksManyCodecs but only 2 of 4 FourCc bytes.
-        let body = [b'a', b'v'];
+        let body = *b"av";
         assert!(matches!(
             split_tracks(AvMultitrackType::ManyTracksManyCodecs, 0, &body),
             Err(Error::InvalidData(_))
