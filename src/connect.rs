@@ -46,6 +46,8 @@ pub const COMMAND_NAME: &str = "connect";
 /// `[audio|video]FourCcInfoMap` or `fourCcList`, applies to any codec.
 /// Per spec: a `"*"` key "overrides the flags set on properties for
 /// specific codecs".
+// internal — module-internal builder constant; not part of the stable API
+#[doc(hidden)]
 pub const FOURCC_WILDCARD: &str = "*";
 
 /// Per-codec capability flags carried in the values of

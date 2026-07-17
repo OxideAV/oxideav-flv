@@ -17,6 +17,8 @@ use oxideav_core::{Error, Result};
 
 /// Tag header length in bytes (not including the payload or the
 /// 4-byte `PreviousTagSize` prefix).
+// internal — module-internal framing constant; not part of the stable API
+#[doc(hidden)]
 pub const TAG_HEADER_LEN: u32 = 11;
 
 /// Maximum value of a `UI24` field — the `DataSize`, `Timestamp` (low

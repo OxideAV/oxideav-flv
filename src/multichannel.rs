@@ -260,10 +260,14 @@ impl AudioChannel {
 
 /// Number of `AudioChannelMask` bits the spec defines (bits `0..24`;
 /// bit *i* corresponds to [`AudioChannel`] value *i*).
+// internal — module-internal mask constant; not part of the stable API
+#[doc(hidden)]
 pub const CHANNEL_MASK_BITS: u32 = 24;
 
 /// Every spec-defined `AudioChannelMask` bit set
 /// (`FrontLeft ..= BottomFrontRight`).
+// internal — module-internal mask constant; not part of the stable API
+#[doc(hidden)]
 pub const CHANNEL_MASK_ALL: u32 = (1 << CHANNEL_MASK_BITS) - 1;
 
 /// Speaker labels for every spec-defined bit set in a `Native`-order
