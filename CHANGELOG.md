@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/OxideAV/oxideav-flv/compare/v0.0.5...v0.0.6) - 2026-07-17
+
+### Other
+
+- mark 4 internal plumbing constants #[doc(hidden)]
+- fix clippy::byte_char_slices in multitrack test (toolchain 1.97 drift)
+- README — document the completed legacy audio/video muxer write surface + legacy_audio_roundtrip fuzz target
+- write_audio_silence — muxer inverse of the enhanced-rtmp-v2 audio-silence signal
+- legacy_audio_roundtrip fuzz target — mux/demux differential over the legacy audio writers
+- legacy audio + screen-video muxer writers (PCM/ADPCM/G.711/Nellymoser/Speex/MP3-8k/flashsv)
+- add CI / crates.io / docs.rs / MIT-license badges
+- pin Speex / Nellymoser mono + fixed sample rate per E.4.2.1
+- Annex B.2 onImageData embedded-image harvesting + muxer
+- Annex B.1 Flash Player Metadata typed accessors
+- AMF0 Long String writer + auto-promotion for oversized onXMPData
+- |AdditionalHeader Encryption Header muxer (Annex F.2.1)
+- filtered (encrypted) tag muxer — write-side inverse of Annex F.3
+- end-to-end multitrack join_tracks → demux side-channel round-trip
+- ModEx timestamp-offset / entry-chain demuxer side-channel
+- README + script module-doc for onMetaData/onCuePoint muxer parity
+- onCuePoint muxer typed parameters
+- onMetaData muxer AMF0 value-type completeness (Null/Undefined/Xml/EcmaArray/StrictArray)
+- onMetaData muxer parity for nested objects + per-track info maps
+- amf3_roundtrip differential fuzz target + fixed-point corpus test
+- AMF0 AVM+ switch writer (write_avm_plus) — AMF0↔AMF3 boundary
+- AMF3 encoder (write_amf3_value) — close the AMF3 read↔write loop
+- AMF0 Date / SCRIPTDATADATE muxer support (write_date + MetadataBag::date)
+- connect per-codec capability queries (FourCcInfoMap wildcard-override)
+- legacy AAC sequence-header muxer writer (write_aac_sequence_header)
+- Enhanced-RTMP-v2 NetConnection connect command capability declaration
+- Enhanced-RTMP-v2 onStatus command + Reconnect Request (on_status module)
+- join_tracks body serialiser — write-side inverse of split_tracks
+
 ### Other
 
 - Marked four module-internal plumbing constants `#[doc(hidden)]` (`tag::TAG_HEADER_LEN`, `multichannel::CHANNEL_MASK_BITS`, `multichannel::CHANNEL_MASK_ALL`, `connect::FOURCC_WILDCARD`) so `cargo-semver-checks` stops tracking them as stable public API — attribute-only, no signature or visibility change. The documented demux/mux entry points, typed accessors, AMF0/AMF3 values, Enhanced-RTMP surfaces, codec-id constants, and every README-documented item stay fully visible.
