@@ -358,6 +358,10 @@ types — Number / Boolean / String — so callers don't have to parse
 strings out of the bag themselves:
 
 ```rust
+# let mut ctx = oxideav_core::RuntimeContext::new();
+# oxideav_flv::register(&mut ctx);
+# let input: Box<dyn oxideav_core::ReadSeek> = Box::new(std::fs::File::open("in.flv")?);
+# let dmx = ctx.containers.open_demuxer("flv", input, &ctx.codecs)?;
 use oxideav_flv::TypedMetadata;
 let typed = TypedMetadata::new(dmx.metadata());
 let dur = typed.duration();                 // Option<f64>     — seconds
@@ -369,6 +373,7 @@ let cse = typed.can_seek_to_end();          // Option<bool>
 let cd  = typed.creationdate();             // Option<&str>    — free-form
 let cdd = typed.creationdate_as_date();     // Option<(f64, i16)> — ms + tz min
 let vid = typed.video_codec_id_str();       // Option<String>  — "h264", "vp6f", …
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 Per-property accessors: `duration` / `filesize` / `width` / `height` /
