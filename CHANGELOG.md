@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- edition 2024, MSRV 1.95.
+
 ### Other
 
 - Marked four module-internal plumbing constants `#[doc(hidden)]` (`tag::TAG_HEADER_LEN`, `multichannel::CHANNEL_MASK_BITS`, `multichannel::CHANNEL_MASK_ALL`, `connect::FOURCC_WILDCARD`) so `cargo-semver-checks` stops tracking them as stable public API — attribute-only, no signature or visibility change. The documented demux/mux entry points, typed accessors, AMF0/AMF3 values, Enhanced-RTMP surfaces, codec-id constants, and every README-documented item stay fully visible.

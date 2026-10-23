@@ -54,7 +54,7 @@ use std::io::Write;
 
 use oxideav_core::{Error, Result};
 
-use crate::amf3::{parse_amf3_value, Amf3Value};
+use crate::amf3::{Amf3Value, parse_amf3_value};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AmfValue {

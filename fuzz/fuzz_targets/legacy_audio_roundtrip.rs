@@ -31,7 +31,7 @@ use libfuzzer_sys::fuzz_target;
 use oxideav_core::{NullCodecResolver, ReadSeek};
 use oxideav_flv::{
     header, open_demuxer, tag, write_adpcm_tag, write_alaw_tag, write_mp3_8k_tag, write_mulaw_tag,
-    write_nellymoser_16k_mono_tag, write_nellymoser_8k_mono_tag, write_nellymoser_tag,
+    write_nellymoser_8k_mono_tag, write_nellymoser_16k_mono_tag, write_nellymoser_tag,
     write_pcm_tag, write_speex_tag,
 };
 
@@ -56,7 +56,7 @@ fuzz_target!(|data: &[u8]| {
         2 => "adpcm_swf",
         3 => "pcm_alaw",
         4 => "pcm_mulaw",
-        5 | 6 | 7 => "nellymoser",
+        5..=7 => "nellymoser",
         _ => "mp3",
     };
     // selector 8 would be Speex, but we fold that below explicitly; keep

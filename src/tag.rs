@@ -2219,8 +2219,8 @@ mod tests {
         let asc = [0x12, 0x10];
         write_aac_sequence_header(&mut out, 0, &asc).unwrap();
         assert_eq!(out[0], 0x08); // TagType = Audio
-                                  // header byte 0xAF, AACPacketType 0x00 (sequence header),
-                                  // then the AudioSpecificConfig.
+        // header byte 0xAF, AACPacketType 0x00 (sequence header),
+        // then the AudioSpecificConfig.
         assert_eq!(out[11], 0xAF);
         assert_eq!(out[12], 0x00);
         assert_eq!(&out[13..15], &asc);
@@ -2289,7 +2289,7 @@ mod tests {
         // 11-byte tag header + 1 video header byte + 5 frame bytes + 4 trailer = 21
         assert_eq!(out.len(), 21);
         assert_eq!(out[0], 0x09); // TagType = Video
-                                  // VideoTagHeader: FrameType=Key(1) | CodecID=FLV1(2) = 0x12.
+        // VideoTagHeader: FrameType=Key(1) | CodecID=FLV1(2) = 0x12.
         let vh = VideoTagHeader::parse(out[11]);
         assert_eq!(vh.codec_id, VIDEO_CODEC_FLV1);
         assert!(vh.is_keyframe());
@@ -2343,11 +2343,11 @@ mod tests {
     fn write_avc_nalu_round_trips_negative_composition_time() {
         let mut out = Vec::new();
         let au = [0x00, 0x00, 0x00, 0x05, 0x65, 0x88, 0x84, 0x00, 0x20]; // length-prefixed IDR fragment
-                                                                         // CTS = -42 ms (B-frame reordering).
+        // CTS = -42 ms (B-frame reordering).
         write_avc_nalu_tag(&mut out, 100, true, -42, &au).unwrap();
         assert_eq!(out[11], 0x17); // Key|H264
         assert_eq!(out[12], 0x01); // AVCPacketType = 1 (NALU)
-                                   // SI24 of -42 = two's-complement low 24 bits = 0xFFFFD6.
+        // SI24 of -42 = two's-complement low 24 bits = 0xFFFFD6.
         let raw = ((out[13] as u32) << 16) | ((out[14] as u32) << 8) | (out[15] as u32);
         let sext = if raw & 0x0080_0000 != 0 {
             raw | 0xFF00_0000
@@ -2382,8 +2382,8 @@ mod tests {
         write_avc_end_of_sequence(&mut out, 1000).unwrap();
         assert_eq!(out[12], 0x02); // AVCPacketType = 2 (EOS)
         assert_eq!(&out[13..16], &[0, 0, 0]); // CompositionTime = 0
-                                              // Body is exactly 5 bytes (1 video header + 1 packet-type + 3 SI24).
-                                              // Total = 11 + 5 + 4 = 20.
+        // Body is exactly 5 bytes (1 video header + 1 packet-type + 3 SI24).
+        // Total = 11 + 5 + 4 = 20.
         assert_eq!(out.len(), 20);
     }
 
@@ -2394,7 +2394,7 @@ mod tests {
         // FrameType=VideoInfo(5)|CodecID=0 = 0x50.
         assert_eq!(out[11], 0x50);
         assert_eq!(out[12], 0x00); // StartClientSeek command byte
-                                   // 11 + 2 + 4 = 17.
+        // 11 + 2 + 4 = 17.
         assert_eq!(out.len(), 17);
 
         let mut out = Vec::new();

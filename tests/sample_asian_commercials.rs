@@ -102,10 +102,10 @@ fn walk_real_flv_sample() {
                         }
                     }
                 }
-                if let Some(p) = pkt.pts {
-                    if p > last_pts {
-                        last_pts = p;
-                    }
+                if let Some(p) = pkt.pts
+                    && p > last_pts
+                {
+                    last_pts = p;
                 }
             }
             Err(Error::Eof) => break,

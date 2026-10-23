@@ -38,7 +38,7 @@ use std::io::Write;
 
 use oxideav_core::{Error, Result};
 
-use crate::amf0::{self, parse_amf0_value, AmfValue};
+use crate::amf0::{self, AmfValue, parse_amf0_value};
 
 /// AMF0 command name for the NetConnection status command.
 pub const COMMAND_NAME: &str = "onStatus";

@@ -50,7 +50,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::mod_ex::{emit as mod_ex_emit, walk as mod_ex_walk, ModExEntry};
+use crate::mod_ex::{ModExEntry, emit as mod_ex_emit, walk as mod_ex_walk};
 
 /// `SoundFormat` value that signals the ExAudio FourCC path.
 /// Pre-2023 FLV reserved `SoundFormat = 9`; enhanced-rtmp-v2 reuses it.
@@ -681,7 +681,7 @@ mod tests {
         let mut body = vec![0x97];
         body.push(0xFF); // forces escape
         body.extend_from_slice(&[0x01, 0x00]); // UI16 BE = 256 → +1 = 257
-        body.extend(std::iter::repeat(0xAB).take(257));
+        body.extend(std::iter::repeat_n(0xAB, 257));
         // trailer: any modExType (here 0xF reserved) + CodedFrames
         body.push(0xF1);
         body.extend_from_slice(b"Opus");

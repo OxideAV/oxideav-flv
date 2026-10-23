@@ -1082,7 +1082,7 @@ mod tests {
         // Array with assoc { "ab": String("ab"), "": end } and dense=0.
         let mut b = vec![0x09]; // array-marker
         b.extend_from_slice(&u29_lit_len(0)); // dense count = 0, literal
-                                              // assoc key "ab" — UTF-8-vr literal
+        // assoc key "ab" — UTF-8-vr literal
         b.extend_from_slice(&u29_lit_len(2));
         b.extend_from_slice(b"ab");
         // value 0x06 (string) "ab" — at this point "ab" is in the

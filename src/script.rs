@@ -1167,7 +1167,7 @@ pub fn write_additional_header<W: Write + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::amf0::{parse_amf0_value, AmfValue};
+    use crate::amf0::{AmfValue, parse_amf0_value};
 
     #[test]
     fn bag_preserves_insertion_order() {

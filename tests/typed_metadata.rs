@@ -13,9 +13,9 @@ use std::io::Cursor;
 
 use oxideav_core::{NullCodecResolver, ReadSeek};
 use oxideav_flv::{
-    header, open_demuxer,
+    TypedMetadata, header, open_demuxer,
     script::{self, MetadataBag},
-    tag, TypedMetadata,
+    tag,
 };
 
 /// Build a minimal audio-only FLV (header + onMetaData + one MP3 tag)

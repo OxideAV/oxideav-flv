@@ -16,12 +16,11 @@ use std::io::Cursor;
 
 use oxideav_core::{Demuxer, NullCodecResolver, ReadSeek};
 use oxideav_flv::{
-    header, open_demuxer, open_demuxer_concrete, script,
-    script::{CuePointParams, CuePointType, EncryptionHeader, MetadataBag},
-    tag, FlvDemuxer, FlvHeader,
-};
-use oxideav_flv::{
-    join_tracks, write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_aac_raw_tag,
+    AudioChannel, AudioChannelOrder, AvMultitrackType, ColorConfig, ColorInfo,
+    EncryptedTagPreamble, ExAudioPacketType, ExAudioTagHeader, ExFrameType, ExPacketType,
+    ExVideoTagHeader, FOURCC_AUDIO_AAC, FOURCC_AV01, FOURCC_OPUS, FOURCC_VP09, HdrCll, HdrMdcv,
+    JoinTrack, ModExEntry, ModExPayload, MultichannelConfig, TagType, join_tracks,
+    write_aac_ex_coded_frames, write_aac_ex_sequence_start, write_aac_raw_tag,
     write_aac_sequence_header, write_ac3_coded_frames, write_additional_header, write_adpcm_tag,
     write_alaw_tag, write_audio_silence, write_av1_coded_frames, write_av1_sequence_start,
     write_avc_nalu_tag, write_avc_sequence_header, write_eac3_coded_frames,
@@ -30,14 +29,16 @@ use oxideav_flv::{
     write_ex_video_sequence_end, write_ex_video_tag, write_filtered_tag, write_flac_coded_frames,
     write_flac_sequence_start, write_h263_tag, write_hevc_coded_frames, write_hevc_coded_frames_x,
     write_hevc_sequence_start, write_mp3_8k_tag, write_mp3_ex_coded_frames, write_mulaw_tag,
-    write_nellymoser_16k_mono_tag, write_nellymoser_8k_mono_tag, write_nellymoser_tag,
-    write_opus_coded_frames, write_opus_sequence_start, write_pcm_tag, write_screen_video2_tag,
-    write_screen_video_tag, write_speex_tag, write_vp6_tag, write_vp6a_tag, write_vp9_coded_frames,
-    write_vp9_sequence_start, write_vvc_coded_frames, write_vvc_sequence_start, AudioChannel,
-    AudioChannelOrder, AvMultitrackType, ColorConfig, ColorInfo, EncryptedTagPreamble,
-    ExAudioPacketType, ExAudioTagHeader, ExFrameType, ExPacketType, ExVideoTagHeader, HdrCll,
-    HdrMdcv, JoinTrack, ModExEntry, ModExPayload, MultichannelConfig, TagType, FOURCC_AUDIO_AAC,
-    FOURCC_AV01, FOURCC_OPUS, FOURCC_VP09,
+    write_nellymoser_8k_mono_tag, write_nellymoser_16k_mono_tag, write_nellymoser_tag,
+    write_opus_coded_frames, write_opus_sequence_start, write_pcm_tag, write_screen_video_tag,
+    write_screen_video2_tag, write_speex_tag, write_vp6_tag, write_vp6a_tag,
+    write_vp9_coded_frames, write_vp9_sequence_start, write_vvc_coded_frames,
+    write_vvc_sequence_start,
+};
+use oxideav_flv::{
+    FlvDemuxer, FlvHeader, header, open_demuxer, open_demuxer_concrete, script,
+    script::{CuePointParams, CuePointType, EncryptionHeader, MetadataBag},
+    tag,
 };
 
 /// Three distinct synthetic MP3 frame payloads. The demuxer treats an
@@ -705,7 +706,7 @@ fn flac_ex_audio_sequence_start_round_trips() {
     // Xiph fLaC marker + a minimal STREAMINFO header (38 bytes total).
     let mut streaminfo = vec![b'f', b'L', b'a', b'C'];
     streaminfo.extend_from_slice(&[0x80, 0x00, 0x00, 0x22]); // METADATA_BLOCK header (last, STREAMINFO, 34)
-    streaminfo.extend(std::iter::repeat(0xAB).take(34));
+    streaminfo.extend(std::iter::repeat_n(0xAB, 34));
     write_flac_sequence_start(&mut buf, 0, &streaminfo).unwrap();
     let frame = vec![0xFF, 0xF8, 0x69, 0x18];
     write_flac_coded_frames(&mut buf, 26, &frame).unwrap();
@@ -2140,9 +2141,10 @@ fn on_cue_point_writer_round_trips_per_cue_fields() {
     assert_eq!(lookup("cuepoint.1.type"), Some("event"));
     // No `parameters.<key>` entries on cue 1 — it was constructed
     // without any user parameters.
-    assert!(md
-        .iter()
-        .all(|(k, _)| !k.starts_with("cuepoint.1.parameters.")));
+    assert!(
+        md.iter()
+            .all(|(k, _)| !k.starts_with("cuepoint.1.parameters."))
+    );
 }
 
 #[test]

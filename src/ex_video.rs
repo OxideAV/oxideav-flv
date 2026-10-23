@@ -56,7 +56,7 @@
 
 use oxideav_core::{Error, Result};
 
-use crate::mod_ex::{emit as mod_ex_emit, walk as mod_ex_walk, ModExEntry};
+use crate::mod_ex::{ModExEntry, emit as mod_ex_emit, walk as mod_ex_walk};
 use crate::multitrack::AvMultitrackType;
 
 /// Mask of the IsExHeader bit in the VideoTagHeader's first byte.
@@ -1049,7 +1049,7 @@ mod tests {
         let mut body = vec![0x97];
         body.push(0xFF);
         body.extend_from_slice(&[0x01, 0x00]); // 257
-        body.extend(std::iter::repeat(0xAB).take(257));
+        body.extend(std::iter::repeat_n(0xAB, 257));
         body.push(0xF0); // trailer: reserved 0xF | SequenceStart
         body.extend_from_slice(b"av01");
         let h = ExVideoTagHeader::parse(&body).unwrap().unwrap();

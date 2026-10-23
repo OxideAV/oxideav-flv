@@ -30,21 +30,21 @@ use oxideav_core::{
 };
 use oxideav_core::{Demuxer, ReadSeek};
 
-use crate::amf0::{parse_amf0_value, AmfValue};
+use crate::amf0::{AmfValue, parse_amf0_value};
 use crate::amf3::{Amf3Array, Amf3Object, Amf3Value};
-use crate::ex_audio::{fourcc_audio_codec_id_str, ExAudioPacketType, ExAudioTagHeader};
+use crate::ex_audio::{ExAudioPacketType, ExAudioTagHeader, fourcc_audio_codec_id_str};
 use crate::ex_video::{
-    fourcc_codec_id_str, ExFrameType, ExPacketType, ExVideoTagHeader, FOURCC_AVC1, FOURCC_HVC1,
-    FOURCC_VVC1,
+    ExFrameType, ExPacketType, ExVideoTagHeader, FOURCC_AVC1, FOURCC_HVC1, FOURCC_VVC1,
+    fourcc_codec_id_str,
 };
 use crate::header::FlvHeader;
 use crate::mod_ex::ModExEntry;
-use crate::multichannel::{mask_channel_labels, MultichannelConfig};
-use crate::multitrack::{split_tracks, MultitrackPacketTrack};
+use crate::multichannel::{MultichannelConfig, mask_channel_labels};
+use crate::multitrack::{MultitrackPacketTrack, split_tracks};
 use crate::tag::{
-    audio_codec_id_str, video_codec_id_str, AudioTagHeader, EncryptedTagPreamble, TagHeader,
-    TagType, VideoTagHeader, AUDIO_CODEC_AAC, AUDIO_CODEC_NELLYMOSER_16K_MONO,
-    AUDIO_CODEC_NELLYMOSER_8K_MONO, AUDIO_CODEC_SPEEX, VIDEO_CODEC_H264, VIDEO_CODEC_VP6A,
+    AUDIO_CODEC_AAC, AUDIO_CODEC_NELLYMOSER_8K_MONO, AUDIO_CODEC_NELLYMOSER_16K_MONO,
+    AUDIO_CODEC_SPEEX, AudioTagHeader, EncryptedTagPreamble, TagHeader, TagType, VIDEO_CODEC_H264,
+    VIDEO_CODEC_VP6A, VideoTagHeader, audio_codec_id_str, video_codec_id_str,
 };
 
 /// Parsed `keyframes` toc from the `onMetaData` script tag — the
@@ -579,20 +579,20 @@ impl Demuxer for FlvDemuxer {
                     // that are not self-describing, and a new config
                     // supersedes the prior one. The packet itself is
                     // still emitted as header+discard for parity.
-                    if let Ok(Some(ex)) = ExAudioTagHeader::parse(&body) {
-                        if ex.packet_type == ExAudioPacketType::MultichannelConfig {
-                            let start = ex.bytes_consumed.min(body.len());
-                            let tail = &body[start..];
-                            let payload = match ex.multitrack {
-                                Some(mt) => default_track_payload(mt, ex.fourcc, tail),
-                                None => tail.to_vec(),
-                            };
-                            harvest_multichannel_config(
-                                &payload,
-                                &mut self.metadata,
-                                &mut self.streams[idx as usize],
-                            );
-                        }
+                    if let Ok(Some(ex)) = ExAudioTagHeader::parse(&body)
+                        && ex.packet_type == ExAudioPacketType::MultichannelConfig
+                    {
+                        let start = ex.bytes_consumed.min(body.len());
+                        let tail = &body[start..];
+                        let payload = match ex.multitrack {
+                            Some(mt) => default_track_payload(mt, ex.fourcc, tail),
+                            None => tail.to_vec(),
+                        };
+                        harvest_multichannel_config(
+                            &payload,
+                            &mut self.metadata,
+                            &mut self.streams[idx as usize],
+                        );
                     }
                     if let Some((pkt, pending)) =
                         build_audio_packet(&self.streams[idx as usize], &header, &body)
@@ -624,11 +624,11 @@ impl Demuxer for FlvDemuxer {
                     // sent before the video section it affects, and a new
                     // colorInfo replaces the prior one. The packet itself is
                     // still emitted as header+discard for parity.
-                    if let Ok(Some(ex)) = ExVideoTagHeader::parse(&body) {
-                        if matches!(ex.packet_type, ExPacketType::Metadata) {
-                            let start = ex.bytes_consumed.min(body.len());
-                            harvest_video_metadata_frame(&body[start..], &mut self.metadata);
-                        }
+                    if let Ok(Some(ex)) = ExVideoTagHeader::parse(&body)
+                        && matches!(ex.packet_type, ExPacketType::Metadata)
+                    {
+                        let start = ex.bytes_consumed.min(body.len());
+                        harvest_video_metadata_frame(&body[start..], &mut self.metadata);
                     }
                     if let Some((pkt, pending)) =
                         build_video_packet(&self.streams[idx as usize], &header, &body)
@@ -849,18 +849,19 @@ fn build_audio_stream(
         // present (the ExHeader body itself carries no SoundRate /
         // SoundSize / SoundType fields — those bits were repurposed as
         // AudioPacketType).
-        if let Some(sr) = metadata_lookup_u32(metadata, "audiosamplerate") {
-            if sr > 0 {
-                params.sample_rate = Some(sr);
-            }
+        if let Some(sr) = metadata_lookup_u32(metadata, "audiosamplerate")
+            && sr > 0
+        {
+            params.sample_rate = Some(sr);
         }
         if let Some(b) = metadata_lookup_bool(metadata, "stereo") {
             params.channels = Some(if b { 2 } else { 1 });
         }
-        if let Some(kbps) = metadata_lookup_f64(metadata, "audiodatarate") {
-            if kbps.is_finite() && kbps >= 0.0 {
-                params.bit_rate = Some((kbps * 1000.0) as u64);
-            }
+        if let Some(kbps) = metadata_lookup_f64(metadata, "audiodatarate")
+            && kbps.is_finite()
+            && kbps >= 0.0
+        {
+            params.bit_rate = Some((kbps * 1000.0) as u64);
         }
         // `audiosamplesize` (E.5) is the only spec-defined source of
         // per-sample resolution on the ExAudio side — the ExHeader byte
@@ -912,10 +913,10 @@ fn build_audio_stream(
     // and AAC always reports 44 kHz regardless of the true rate carried
     // in AudioSpecificConfig — `audiosamplerate` is the producer's
     // declared truth.
-    if let Some(sr) = metadata_lookup_u32(metadata, "audiosamplerate") {
-        if sr > 0 {
-            params.sample_rate = Some(sr);
-        }
+    if let Some(sr) = metadata_lookup_u32(metadata, "audiosamplerate")
+        && sr > 0
+    {
+        params.sample_rate = Some(sr);
     }
     // The `onMetaData` `stereo` boolean is normally the more
     // authoritative channel-count source. But E.4.2.1 pins Nellymoser
@@ -926,10 +927,8 @@ fn build_audio_stream(
         ah.codec_id,
         AUDIO_CODEC_NELLYMOSER_8K_MONO | AUDIO_CODEC_NELLYMOSER_16K_MONO | AUDIO_CODEC_SPEEX
     );
-    if !spec_mono {
-        if let Some(b) = metadata_lookup_bool(metadata, "stereo") {
-            params.channels = Some(if b { 2 } else { 1 });
-        }
+    if !spec_mono && let Some(b) = metadata_lookup_bool(metadata, "stereo") {
+        params.channels = Some(if b { 2 } else { 1 });
     }
     // Likewise the `audiosamplerate` override must not move Speex /
     // Nellymoser 8/16 kHz off their spec-fixed rates (the SoundRate field
@@ -943,10 +942,11 @@ fn build_audio_stream(
         params.sample_rate = Some(ah.sample_rate_hz());
     }
     // `audiodatarate` is in kilobits-per-second per E.5.
-    if let Some(kbps) = metadata_lookup_f64(metadata, "audiodatarate") {
-        if kbps.is_finite() && kbps >= 0.0 {
-            params.bit_rate = Some((kbps * 1000.0) as u64);
-        }
+    if let Some(kbps) = metadata_lookup_f64(metadata, "audiodatarate")
+        && kbps.is_finite()
+        && kbps >= 0.0
+    {
+        params.bit_rate = Some((kbps * 1000.0) as u64);
     }
     // `audiosamplesize` (E.5) overrides the SoundSize-derived resolution
     // the same way `audiosamplerate` overrides the SoundRate field: the
@@ -997,15 +997,16 @@ fn build_video_stream(
         }
         if let Some(fps) = metadata_lookup_f64(metadata, "videoframerate")
             .or_else(|| metadata_lookup_f64(metadata, "framerate"))
+            && fps.is_finite()
+            && fps > 0.0
         {
-            if fps.is_finite() && fps > 0.0 {
-                params.frame_rate = Some(f64_to_rational(fps));
-            }
+            params.frame_rate = Some(f64_to_rational(fps));
         }
-        if let Some(kbps) = metadata_lookup_f64(metadata, "videodatarate") {
-            if kbps.is_finite() && kbps >= 0.0 {
-                params.bit_rate = Some((kbps * 1000.0) as u64);
-            }
+        if let Some(kbps) = metadata_lookup_f64(metadata, "videodatarate")
+            && kbps.is_finite()
+            && kbps >= 0.0
+        {
+            params.bit_rate = Some((kbps * 1000.0) as u64);
         }
         // SequenceStart's body is the codec's decoder-configuration
         // record — route to extradata so consumers find it without
@@ -1045,16 +1046,17 @@ fn build_video_stream(
     // emitting 29.97 / 23.976 round-trip cleanly.
     if let Some(fps) = metadata_lookup_f64(metadata, "videoframerate")
         .or_else(|| metadata_lookup_f64(metadata, "framerate"))
+        && fps.is_finite()
+        && fps > 0.0
     {
-        if fps.is_finite() && fps > 0.0 {
-            params.frame_rate = Some(f64_to_rational(fps));
-        }
+        params.frame_rate = Some(f64_to_rational(fps));
     }
     // `videodatarate` is in kilobits-per-second per E.5.
-    if let Some(kbps) = metadata_lookup_f64(metadata, "videodatarate") {
-        if kbps.is_finite() && kbps >= 0.0 {
-            params.bit_rate = Some((kbps * 1000.0) as u64);
-        }
+    if let Some(kbps) = metadata_lookup_f64(metadata, "videodatarate")
+        && kbps.is_finite()
+        && kbps >= 0.0
+    {
+        params.bit_rate = Some((kbps * 1000.0) as u64);
     }
     // H.264: body[1] = AVCPacketType, body[2..5] = CompositionTime offset.
     // Type 0 = AVCDecoderConfigurationRecord. Route it to extradata.
@@ -1685,10 +1687,10 @@ fn xmp_liveXML(value: &AmfValue) -> Option<String> {
         _ => return None,
     };
     for (k, v) in entries {
-        if k == "liveXML" {
-            if let AmfValue::String(s) | AmfValue::Xml(s) = v {
-                return Some(s.clone());
-            }
+        if k == "liveXML"
+            && let AmfValue::String(s) | AmfValue::Xml(s) = v
+        {
+            return Some(s.clone());
         }
     }
     None
@@ -2052,12 +2054,13 @@ fn parse_keyframes_object(v: &AmfValue) -> Option<KeyframeIndex> {
 
 fn metadata_lookup_u32(metadata: &[(String, String)], key: &str) -> Option<u32> {
     for (k, v) in metadata {
-        if k == key {
-            if let Ok(n) = v.parse::<f64>() {
-                if n.is_finite() && n >= 0.0 && n <= u32::MAX as f64 {
-                    return Some(n as u32);
-                }
-            }
+        if k == key
+            && let Ok(n) = v.parse::<f64>()
+            && n.is_finite()
+            && n >= 0.0
+            && n <= u32::MAX as f64
+        {
+            return Some(n as u32);
         }
     }
     None
@@ -2065,12 +2068,11 @@ fn metadata_lookup_u32(metadata: &[(String, String)], key: &str) -> Option<u32> 
 
 fn metadata_lookup_f64(metadata: &[(String, String)], key: &str) -> Option<f64> {
     for (k, v) in metadata {
-        if k == key {
-            if let Ok(n) = v.parse::<f64>() {
-                if n.is_finite() {
-                    return Some(n);
-                }
-            }
+        if k == key
+            && let Ok(n) = v.parse::<f64>()
+            && n.is_finite()
+        {
+            return Some(n);
         }
     }
     None
@@ -2138,16 +2140,16 @@ fn read_u32_be<R: Read + ?Sized>(r: &mut R) -> Result<u32> {
 /// probe falls back to "trust the size and let `read_exact` error".
 fn read_body<R: Read + Seek + ?Sized>(r: &mut R, size: u32) -> Result<Vec<u8>> {
     let needed = size as u64;
-    if let Ok(cur) = r.stream_position() {
-        if let Ok(end) = r.seek(SeekFrom::End(0)) {
-            // Restore the cursor before erroring or reading.
-            r.seek(SeekFrom::Start(cur))?;
-            let remaining = end.saturating_sub(cur);
-            if needed > remaining {
-                return Err(Error::invalid(format!(
-                    "FLV tag: DataSize {needed} exceeds remaining stream bytes {remaining}"
-                )));
-            }
+    if let Ok(cur) = r.stream_position()
+        && let Ok(end) = r.seek(SeekFrom::End(0))
+    {
+        // Restore the cursor before erroring or reading.
+        r.seek(SeekFrom::Start(cur))?;
+        let remaining = end.saturating_sub(cur);
+        if needed > remaining {
+            return Err(Error::invalid(format!(
+                "FLV tag: DataSize {needed} exceeds remaining stream bytes {remaining}"
+            )));
         }
     }
     let mut out = vec![0u8; size as usize];
@@ -2537,15 +2539,18 @@ mod tests {
         // `is_encrypted` method.
         let md = dmx.metadata();
         assert!(md.iter().any(|(k, v)| k == "encryption" && v == "true"));
-        assert!(md
-            .iter()
-            .any(|(k, v)| k == "encryption.algorithm" && v == "AES-CBC"));
-        assert!(md
-            .iter()
-            .any(|(k, v)| k == "encryption.key_subtype" && v == "FlashAccessv2"));
-        assert!(md
-            .iter()
-            .any(|(k, v)| k == "encryption.version" && v == "2"));
+        assert!(
+            md.iter()
+                .any(|(k, v)| k == "encryption.algorithm" && v == "AES-CBC")
+        );
+        assert!(
+            md.iter()
+                .any(|(k, v)| k == "encryption.key_subtype" && v == "FlashAccessv2")
+        );
+        assert!(
+            md.iter()
+                .any(|(k, v)| k == "encryption.version" && v == "2")
+        );
     }
 
     #[test]
@@ -2604,10 +2609,11 @@ mod tests {
         let flv = make_flv(&[&script_tag, &video_tag]);
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
         let dmx = open(input, &NullCodecResolver).unwrap();
-        assert!(dmx
-            .metadata()
-            .iter()
-            .any(|(k, v)| k == "xmp" && v == live_xml));
+        assert!(
+            dmx.metadata()
+                .iter()
+                .any(|(k, v)| k == "xmp" && v == live_xml)
+        );
     }
 
     #[test]
@@ -2641,10 +2647,11 @@ mod tests {
         // bit_rate lifted out of the typed-object body.
         assert_eq!(dmx.streams()[0].params.bit_rate, Some(768_000));
         // Class alias surfaced for the caller.
-        assert!(dmx
-            .metadata()
-            .iter()
-            .any(|(k, v)| k == "scriptdata.class" && v == class));
+        assert!(
+            dmx.metadata()
+                .iter()
+                .any(|(k, v)| k == "scriptdata.class" && v == class)
+        );
     }
 
     #[test]
@@ -2670,10 +2677,11 @@ mod tests {
         let flv = make_flv(&[&script_tag, &video_tag]);
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
         let dmx = open(input, &NullCodecResolver).unwrap();
-        assert!(dmx
-            .metadata()
-            .iter()
-            .any(|(k, v)| k == "xmp" && v == live_xml));
+        assert!(
+            dmx.metadata()
+                .iter()
+                .any(|(k, v)| k == "xmp" && v == live_xml)
+        );
     }
 
     #[test]
@@ -3116,10 +3124,11 @@ mod tests {
         let _seq = dmx.next_packet().unwrap();
         let m = dmx.next_packet().unwrap();
         assert!(m.flags.header && m.flags.discard);
-        assert!(dmx
-            .metadata()
-            .iter()
-            .all(|(k, _)| !k.starts_with("colorinfo")));
+        assert!(
+            dmx.metadata()
+                .iter()
+                .all(|(k, _)| !k.starts_with("colorinfo"))
+        );
     }
 
     /// Build an `onMetaData` script-tag body whose single ECMA-array
@@ -3442,10 +3451,11 @@ mod tests {
         assert_eq!(m.data, vec![0x01, 0x02, 0x03]);
         // Malformed side-channel info: no metadata keys, channel count
         // untouched.
-        assert!(dmx
-            .metadata()
-            .iter()
-            .all(|(k, _)| !k.starts_with("multichannelconfig")));
+        assert!(
+            dmx.metadata()
+                .iter()
+                .all(|(k, _)| !k.starts_with("multichannelconfig"))
+        );
         assert_ne!(dmx.streams()[0].params.channels, Some(2));
     }
 
@@ -3580,7 +3590,7 @@ mod tests {
         // mt-byte 0x11 = ManyTracks (1) | inner CodedFrames (1).
         let mut vbody = vec![0x96, 0x11];
         vbody.extend_from_slice(b"av01"); // shared FourCc
-                                          // Track 0: id=0, size=3, payload [0xDE,0xAD,0xBE].
+        // Track 0: id=0, size=3, payload [0xDE,0xAD,0xBE].
         vbody.push(0x00);
         vbody.extend_from_slice(&[0x00, 0x00, 0x03]);
         vbody.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
@@ -3755,7 +3765,7 @@ mod tests {
         let mut vbody = vec![0x96, 0x01];
         vbody.extend_from_slice(b"hvc1");
         vbody.push(0x00); // trackId 0
-                          // SI24 CTO (0) + coded bytes — payload runs to end.
+        // SI24 CTO (0) + coded bytes — payload runs to end.
         vbody.extend_from_slice(&[0x00, 0x00, 0x00, 0x77, 0x88]);
 
         let mp3_body = vec![(((2 << 4) | (2 << 2) | 0x02 | 0x01) as u8), 0xAA];
@@ -3806,15 +3816,17 @@ mod tests {
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
         let dmx = open(input, &NullCodecResolver).unwrap();
         // The legacy `scriptdata.name` sentinel still records the name.
-        assert!(dmx
-            .metadata()
-            .iter()
-            .any(|(k, v)| k == "scriptdata.name" && v == "onCaptionInfo"));
+        assert!(
+            dmx.metadata()
+                .iter()
+                .any(|(k, v)| k == "scriptdata.name" && v == "onCaptionInfo")
+        );
         // The argument value lands under the scoped prefix.
-        assert!(dmx
-            .metadata()
-            .iter()
-            .any(|(k, v)| k == "scriptdata.onCaptionInfo" && v == "hello"));
+        assert!(
+            dmx.metadata()
+                .iter()
+                .any(|(k, v)| k == "scriptdata.onCaptionInfo" && v == "hello")
+        );
     }
 
     #[test]
@@ -3845,18 +3857,21 @@ mod tests {
         let flv = make_flv(&[&script_tag, &video_tag]);
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
         let dmx = open(input, &NullCodecResolver).unwrap();
-        assert!(dmx
-            .metadata()
-            .iter()
-            .any(|(k, v)| k == "scriptdata.name" && v == "onTextData"));
-        assert!(dmx
-            .metadata()
-            .iter()
-            .any(|(k, v)| k == "scriptdata.onTextData.track" && v == "7"));
-        assert!(dmx
-            .metadata()
-            .iter()
-            .any(|(k, v)| k == "scriptdata.onTextData.language" && v == "eng"));
+        assert!(
+            dmx.metadata()
+                .iter()
+                .any(|(k, v)| k == "scriptdata.name" && v == "onTextData")
+        );
+        assert!(
+            dmx.metadata()
+                .iter()
+                .any(|(k, v)| k == "scriptdata.onTextData.track" && v == "7")
+        );
+        assert!(
+            dmx.metadata()
+                .iter()
+                .any(|(k, v)| k == "scriptdata.onTextData.language" && v == "eng")
+        );
     }
 
     #[test]
@@ -3876,14 +3891,16 @@ mod tests {
         let flv = make_flv(&[&script_tag, &video_tag]);
         let input: Box<dyn ReadSeek> = Box::new(Cursor::new(flv));
         let dmx = open(input, &NullCodecResolver).unwrap();
-        assert!(dmx
-            .metadata()
-            .iter()
-            .any(|(k, v)| k == "scriptdata.name" && v == "onSomeEvent"));
-        assert!(dmx
-            .metadata()
-            .iter()
-            .any(|(k, v)| k == "scriptdata.onSomeEvent" && v == "null"));
+        assert!(
+            dmx.metadata()
+                .iter()
+                .any(|(k, v)| k == "scriptdata.name" && v == "onSomeEvent")
+        );
+        assert!(
+            dmx.metadata()
+                .iter()
+                .any(|(k, v)| k == "scriptdata.onSomeEvent" && v == "null")
+        );
     }
 
     #[test]
