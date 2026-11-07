@@ -1234,6 +1234,7 @@ fn u24_to_be(v: u32) -> [u8; 3] {
 
 /// Parsed 11-byte tag header.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct TagHeader {
     pub tag_type_raw: u8,
     pub kind: Option<TagType>,
@@ -1310,6 +1311,7 @@ pub const AUDIO_CODEC_DEVICE_SPECIFIC: u8 = 15;
 
 /// Decoded audio tag header — the first byte of every audio payload.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct AudioTagHeader {
     pub codec_id: u8,
     /// 0=5.5 kHz, 1=11 kHz, 2=22 kHz, 3=44 kHz (spec rate index).
@@ -1517,6 +1519,7 @@ impl VideoInfoCommand {
 
 /// Decoded video tag header — the first byte of every video payload.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct VideoTagHeader {
     pub frame_type: FrameType,
     pub codec_id: u8,
@@ -1570,6 +1573,7 @@ impl VideoTagHeader {
 /// `SelectiveEncryptionFilterParams` body whose first member is the
 /// 16-byte AES-CBC initialisation vector.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncryptedTagPreamble {
     pub filter_name: String,
     /// `true` for non-selective `"Encryption"`, `false` for `"SE"`.

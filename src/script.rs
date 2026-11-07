@@ -59,6 +59,7 @@ const F64_LOSSLESS_INTEGER_MAX: u64 = 1u64 << 53;
 /// (`0x03`) carrying two parallel SCRIPTDATASTRICTARRAY (`0x0A`)
 /// properties (`filepositions` + `times`).
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum MetaValue {
     /// AMF0 Number — every numeric `onMetaData` field (duration, width,
     /// height, framerate, *datarate, audiosamplerate, filesize, …) is a
@@ -423,6 +424,7 @@ enum MediaKind {
 /// back. Setting a field that belongs to the other media kind is a
 /// no-op on emit (a video-only `channels`, say, is simply not written).
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct TrackInfo {
     /// Video: pixel width (`width`).
     pub width: Option<u32>,
@@ -827,6 +829,7 @@ impl CuePointType {
 /// demuxer's flatten walk round-trips them under
 /// `metadata["cuepoint.<n>.parameters.<key>"]` regardless of type.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct CuePointParams {
     /// Producer-assigned identifier (`name` property).
     pub name: String,
@@ -1059,6 +1062,7 @@ pub fn write_on_image_data<W: Write + ?Sized>(
 ///             KeyInfo: { SubType } } } }
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct EncryptionHeader {
     /// `Encryption.Version` — `1` (FMRMS v1.x) or `2` (Flash Access 2.0).
     pub version: f64,

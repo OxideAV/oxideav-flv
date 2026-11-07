@@ -67,6 +67,7 @@ pub const LEVEL_STATUS: &str = "status";
 /// they are serialised after the four spec-named ones in insertion
 /// order.
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct OnStatusInfo {
     /// `code` — a string identifying the event that occurred
     /// (e.g. `NetConnection.Connect.Success`,

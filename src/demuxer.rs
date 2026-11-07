@@ -311,6 +311,7 @@ pub struct FlvDemuxer {
 /// the `onimagedata.<n>.trackid` / `.length` scalars so a caller
 /// scanning only the string bag still learns an image is present.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EmbeddedImage {
     /// The `trackid` (Annex B.2 DOUBLE) the image sample belongs to.
     /// `None` when the producer omitted the property.

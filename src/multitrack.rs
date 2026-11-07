@@ -55,6 +55,7 @@ use oxideav_core::{Error, Result};
 /// pipelines — the same enum is read off the multitrack outer header in
 /// both [`crate::ex_audio`] and [`crate::ex_video`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AvMultitrackType {
     /// `0` — one track (the default; a degenerate single-track batch
     /// with no per-track `sizeOfTrack` field).
@@ -111,6 +112,7 @@ impl AvMultitrackType {
 /// [`ExAudioTagBody`]: crate::ex_audio
 /// [`ExVideoTagBody`]: crate::ex_video
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MultitrackTrack {
     /// `trackId` (UI8). `0` is the conventional default track; positive
     /// ids identify additional variants. These are identifiers only and
@@ -160,6 +162,7 @@ impl MultitrackTrack {
 /// [`FlvDemuxer`]: crate::FlvDemuxer
 /// [`FlvDemuxer::last_multitrack_tracks`]: crate::FlvDemuxer::last_multitrack_tracks
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MultitrackPacketTrack {
     /// `trackId` (UI8). `0` is the conventional default track; positive
     /// ids identify additional variants. Identifiers only — they imply
@@ -308,6 +311,7 @@ pub fn split_tracks(
 /// exposes on read: the `trackId`, the codec `fourcc`, and the per-track
 /// payload bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct JoinTrack {
     /// `trackId` (UI8). `0` is the conventional default track; positive
     /// ids identify additional variants. Identifiers only — no ordering

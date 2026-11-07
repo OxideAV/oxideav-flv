@@ -57,6 +57,7 @@ use oxideav_core::{Error, Result};
 /// every other value is captured as `Reserved(u8)` so future
 /// subtype additions surface without parser changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AudioPacketModExType {
     /// `0` — `TimestampOffsetNano`. The ModEx data carries a UI24
     /// nanosecond timestamp refinement (0..999_999 ns).
@@ -87,6 +88,7 @@ impl AudioPacketModExType {
 /// [`AudioPacketModExType`]; kept distinct so the audio and video
 /// paths remain self-contained.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VideoPacketModExType {
     /// `0` — `TimestampOffsetNano`. The ModEx data carries a UI24
     /// nanosecond timestamp refinement (0..999_999 ns).
@@ -118,6 +120,7 @@ impl VideoPacketModExType {
 /// via [`ModExEntry::raw`]) so consumers can react to future spec
 /// extensions without re-parsing the size escape and trailer layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ModExPayload {
     /// `TimestampOffsetNano` — UI24 BE nanosecond refinement
     /// (0..999_999 ns) decoded from a >= 3-byte payload. Spec note:
@@ -139,6 +142,7 @@ pub enum ModExPayload {
 /// for reserved subtypes it's whatever opaque blob the producer
 /// chose to embed.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ModExEntry {
     /// Subtype code as decoded from the high nibble of the ModEx
     /// trailer byte. `u8` so the audio and video paths can share the
@@ -152,6 +156,17 @@ pub struct ModExEntry {
     /// Verbatim ModEx data bytes (size-prefix removed). Length matches
     /// the decoded `modExDataSize`.
     pub raw: Vec<u8>,
+}
+
+impl ModExEntry {
+    /// Build a [`ModExEntry`] from every field.
+    pub fn new(subtype_raw: u8, payload: ModExPayload, raw: Vec<u8>) -> Self {
+        Self {
+            subtype_raw,
+            payload,
+            raw,
+        }
+    }
 }
 
 impl ModExEntry {

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ExAudioTagHeader::new(packet_type)`,
+  `ExVideoTagHeader::new(frame_type, packet_type)`,
+  `MultichannelConfig::new(order, channel_count)`, `ModExEntry::new`,
+  `Default` on `Amf3Array` / `Amf3Object`, and `with_*` setters on those
+  plus `ColorInfo`, `ColorConfig`, `HdrCll`, `HdrMdcv`.
+
+### Changed
+
+- API hygiene: the E-RTMP / script enums `ExAudioPacketType`,
+  `ExFrameType`, `ExPacketType`, `VideoCommand`, `AudioPacketModExType`,
+  `VideoPacketModExType`, `ModExPayload`, `AudioChannelOrder`,
+  `AudioChannel`, `AvMultitrackType`, `MetaValue`, `ScalarValue` and the
+  records `ExAudioTagHeader`, `ExVideoTagHeader`, `ModExEntry`,
+  `MultichannelConfig`, `MultitrackTrack`, `MultitrackPacketTrack`,
+  `JoinTrack`, `TrackInfo`, `CuePointParams`, `EncryptionHeader`,
+  `ColorInfo`, `ColorConfig`, `HdrCll`, `HdrMdcv`,
+  `ConnectCommandObject`, `OnStatusInfo`, `EmbeddedImage`, `FlvHeader`,
+  `TagHeader`, `AudioTagHeader`, `VideoTagHeader`,
+  `EncryptedTagPreamble`, `Amf3Array`, `Amf3Object` are now
+  `#[non_exhaustive]`. The fixed AMF0 / AMF3 marker sets (`AmfValue`,
+  `Amf3Value`) and the legacy FLV `TagType` / `FrameType` /
+  `VideoInfoCommand` / `CuePointType` stay exhaustive.
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-flv/compare/v0.0.5...v0.0.6) - 2026-10-23
 
 ### Other

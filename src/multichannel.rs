@@ -41,6 +41,7 @@ use oxideav_core::{Error, Result};
 /// `AudioChannelOrder` (UI8) — how the channels in the bitstream relate
 /// to speaker positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AudioChannelOrder {
     /// `0` — only the channel count is specified, without any further
     /// information about the channel order.
@@ -97,6 +98,7 @@ impl AudioChannelOrder {
 /// be safely skipped; `0xFF` marks a channel that contains data but
 /// whose speaker configuration is unknown. `24..=0xFD` are reserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AudioChannel {
     /// `0`
     FrontLeft,
@@ -299,6 +301,7 @@ pub fn mask_channel_labels(flags: u32) -> Vec<String> {
 /// and population counts that disagree with `channel_count` — the
 /// caller sees exactly what the producer signalled.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MultichannelConfig {
     /// How the bitstream channels relate to speaker positions.
     pub order: AudioChannelOrder,
@@ -313,6 +316,49 @@ pub struct MultichannelConfig {
     /// values below [`CHANNEL_MASK_BITS`]) to test whether a specific
     /// speaker is present.
     pub channel_flags: Option<u32>,
+}
+
+impl MultichannelConfig {
+    /// A config of `channel_count` channels in `order`, with no custom
+    /// mapping and no channel flags; set those with
+    /// [`with_mapping`](Self::with_mapping) /
+    /// [`with_channel_flags`](Self::with_channel_flags).
+    pub fn new(order: AudioChannelOrder, channel_count: u8) -> Self {
+        Self {
+            order,
+            channel_count,
+            mapping: None,
+            channel_flags: None,
+        }
+    }
+
+    /// Builder: set [`order`](Self::order).
+    #[must_use]
+    pub fn with_order(mut self, v: AudioChannelOrder) -> Self {
+        self.order = v;
+        self
+    }
+
+    /// Builder: set [`channel_count`](Self::channel_count).
+    #[must_use]
+    pub fn with_channel_count(mut self, v: u8) -> Self {
+        self.channel_count = v;
+        self
+    }
+
+    /// Builder: set [`mapping`](Self::mapping).
+    #[must_use]
+    pub fn with_mapping(mut self, v: Option<Vec<AudioChannel>>) -> Self {
+        self.mapping = v;
+        self
+    }
+
+    /// Builder: set [`channel_flags`](Self::channel_flags).
+    #[must_use]
+    pub fn with_channel_flags(mut self, v: Option<u32>) -> Self {
+        self.channel_flags = v;
+        self
+    }
 }
 
 impl MultichannelConfig {

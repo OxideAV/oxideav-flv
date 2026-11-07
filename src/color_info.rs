@@ -41,6 +41,7 @@ use crate::amf0;
 /// same semantics as [`write_ex_video_color_info_reset`] below
 /// (Undefined value).
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ColorInfo {
     /// `colorConfig` — bit depth + ISO 23091-4 / ITU-T H.273 colour
     /// indices (primaries, transfer, matrix).
@@ -53,12 +54,36 @@ pub struct ColorInfo {
     pub hdr_mdcv: Option<HdrMdcv>,
 }
 
+impl ColorInfo {
+    /// Builder: set [`color_config`](Self::color_config).
+    #[must_use]
+    pub fn with_color_config(mut self, v: Option<ColorConfig>) -> Self {
+        self.color_config = v;
+        self
+    }
+
+    /// Builder: set [`hdr_cll`](Self::hdr_cll).
+    #[must_use]
+    pub fn with_hdr_cll(mut self, v: Option<HdrCll>) -> Self {
+        self.hdr_cll = v;
+        self
+    }
+
+    /// Builder: set [`hdr_mdcv`](Self::hdr_mdcv).
+    #[must_use]
+    pub fn with_hdr_mdcv(mut self, v: Option<HdrMdcv>) -> Self {
+        self.hdr_mdcv = v;
+        self
+    }
+}
+
 /// `colorConfig` group. Every field is optional; an `Option::None`
 /// means "producer did not signal it" and the property is omitted from
 /// the AMF object so the player can fall through to its codec-bitstream
 /// signalling. A `Some(v)` whose value falls outside the spec range is
 /// rejected by [`ColorInfo::encode_amf`] with [`Error::invalid`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ColorConfig {
     /// `bitDepth`. Spec: "SHOULD be 8, 10 or 12." We don't enforce that
     /// SHOULD — only `u8` so callers can't emit a NaN — but anything
@@ -74,10 +99,41 @@ pub struct ColorConfig {
     pub matrix_coefficients: Option<u8>,
 }
 
+impl ColorConfig {
+    /// Builder: set [`bit_depth`](Self::bit_depth).
+    #[must_use]
+    pub fn with_bit_depth(mut self, v: Option<u8>) -> Self {
+        self.bit_depth = v;
+        self
+    }
+
+    /// Builder: set [`color_primaries`](Self::color_primaries).
+    #[must_use]
+    pub fn with_color_primaries(mut self, v: Option<u8>) -> Self {
+        self.color_primaries = v;
+        self
+    }
+
+    /// Builder: set [`transfer_characteristics`](Self::transfer_characteristics).
+    #[must_use]
+    pub fn with_transfer_characteristics(mut self, v: Option<u8>) -> Self {
+        self.transfer_characteristics = v;
+        self
+    }
+
+    /// Builder: set [`matrix_coefficients`](Self::matrix_coefficients).
+    #[must_use]
+    pub fn with_matrix_coefficients(mut self, v: Option<u8>) -> Self {
+        self.matrix_coefficients = v;
+        self
+    }
+}
+
 /// `hdrCll` group — content light level (MaxFALL / MaxCLL). Spec range
 /// for both is `[0.0001, 10_000]` cd/m^2. Out-of-range values are
 /// rejected as [`Error::invalid`]; `None` omits the property.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct HdrCll {
     /// `maxFall` — maximum frame-average light level of the entire
     /// playback sequence, in cd/m^2.
@@ -85,6 +141,22 @@ pub struct HdrCll {
     /// `maxCLL` — maximum light level of any single pixel of the
     /// entire playback sequence, in cd/m^2.
     pub max_cll: Option<f64>,
+}
+
+impl HdrCll {
+    /// Builder: set [`max_fall`](Self::max_fall).
+    #[must_use]
+    pub fn with_max_fall(mut self, v: Option<f64>) -> Self {
+        self.max_fall = v;
+        self
+    }
+
+    /// Builder: set [`max_cll`](Self::max_cll).
+    #[must_use]
+    pub fn with_max_cll(mut self, v: Option<f64>) -> Self {
+        self.max_cll = v;
+        self
+    }
 }
 
 /// `hdrMdcv` group — mastering-display colour-volume metadata
@@ -96,6 +168,7 @@ pub struct HdrCll {
 /// `None` omits the property; out-of-range values raise
 /// [`Error::invalid`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct HdrMdcv {
     pub red_x: Option<f64>,
     pub red_y: Option<f64>,
@@ -109,6 +182,78 @@ pub struct HdrMdcv {
     pub max_luminance: Option<f64>,
     /// `minLuminance` — minimum mastering-display luminance, cd/m^2.
     pub min_luminance: Option<f64>,
+}
+
+impl HdrMdcv {
+    /// Builder: set [`red_x`](Self::red_x).
+    #[must_use]
+    pub fn with_red_x(mut self, v: Option<f64>) -> Self {
+        self.red_x = v;
+        self
+    }
+
+    /// Builder: set [`red_y`](Self::red_y).
+    #[must_use]
+    pub fn with_red_y(mut self, v: Option<f64>) -> Self {
+        self.red_y = v;
+        self
+    }
+
+    /// Builder: set [`green_x`](Self::green_x).
+    #[must_use]
+    pub fn with_green_x(mut self, v: Option<f64>) -> Self {
+        self.green_x = v;
+        self
+    }
+
+    /// Builder: set [`green_y`](Self::green_y).
+    #[must_use]
+    pub fn with_green_y(mut self, v: Option<f64>) -> Self {
+        self.green_y = v;
+        self
+    }
+
+    /// Builder: set [`blue_x`](Self::blue_x).
+    #[must_use]
+    pub fn with_blue_x(mut self, v: Option<f64>) -> Self {
+        self.blue_x = v;
+        self
+    }
+
+    /// Builder: set [`blue_y`](Self::blue_y).
+    #[must_use]
+    pub fn with_blue_y(mut self, v: Option<f64>) -> Self {
+        self.blue_y = v;
+        self
+    }
+
+    /// Builder: set [`white_point_x`](Self::white_point_x).
+    #[must_use]
+    pub fn with_white_point_x(mut self, v: Option<f64>) -> Self {
+        self.white_point_x = v;
+        self
+    }
+
+    /// Builder: set [`white_point_y`](Self::white_point_y).
+    #[must_use]
+    pub fn with_white_point_y(mut self, v: Option<f64>) -> Self {
+        self.white_point_y = v;
+        self
+    }
+
+    /// Builder: set [`max_luminance`](Self::max_luminance).
+    #[must_use]
+    pub fn with_max_luminance(mut self, v: Option<f64>) -> Self {
+        self.max_luminance = v;
+        self
+    }
+
+    /// Builder: set [`min_luminance`](Self::min_luminance).
+    #[must_use]
+    pub fn with_min_luminance(mut self, v: Option<f64>) -> Self {
+        self.min_luminance = v;
+        self
+    }
 }
 
 // X chromaticity in `[0.0001, 0.7400]`, Y chromaticity in

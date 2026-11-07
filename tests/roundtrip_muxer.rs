@@ -854,12 +854,7 @@ fn ex_audio_multichannel_config_native_round_trips_through_demuxer() {
     tag::write_first_previous_tag_size(&mut buf).unwrap();
 
     write_opus_sequence_start(&mut buf, 0, &[0x4F, 0x70]).unwrap();
-    let mcc = MultichannelConfig {
-        order: AudioChannelOrder::Native,
-        channel_count: 6,
-        mapping: None,
-        channel_flags: Some(0x3F),
-    };
+    let mcc = MultichannelConfig::new(AudioChannelOrder::Native, 6).with_channel_flags(Some(0x3F));
     write_ex_audio_multichannel_config(&mut buf, 5, FOURCC_OPUS, &mcc).unwrap();
     write_opus_coded_frames(&mut buf, 20, &[0xFC, 0x12]).unwrap();
 
@@ -899,19 +894,13 @@ fn ex_audio_multichannel_config_custom_supersedes_native() {
     tag::write_first_previous_tag_size(&mut buf).unwrap();
 
     write_opus_sequence_start(&mut buf, 0, &[0x4F, 0x70]).unwrap();
-    let native = MultichannelConfig {
-        order: AudioChannelOrder::Native,
-        channel_count: 6,
-        mapping: None,
-        channel_flags: Some(0x3F),
-    };
+    let native =
+        MultichannelConfig::new(AudioChannelOrder::Native, 6).with_channel_flags(Some(0x3F));
     write_ex_audio_multichannel_config(&mut buf, 5, FOURCC_OPUS, &native).unwrap();
-    let custom = MultichannelConfig {
-        order: AudioChannelOrder::Custom,
-        channel_count: 2,
-        mapping: Some(vec![AudioChannel::FrontRight, AudioChannel::FrontLeft]),
-        channel_flags: None,
-    };
+    let custom = MultichannelConfig::new(AudioChannelOrder::Custom, 2).with_mapping(Some(vec![
+        AudioChannel::FrontRight,
+        AudioChannel::FrontLeft,
+    ]));
     write_ex_audio_multichannel_config(&mut buf, 10, FOURCC_OPUS, &custom).unwrap();
 
     let mut dmx = open_video_only(buf);
@@ -1129,22 +1118,14 @@ fn ex_video_modex_timestamp_offset_nano_round_trips_through_demuxer() {
     write_av1_sequence_start(&mut buf, 0, &config).unwrap();
 
     let frame = vec![0xCA, 0xFE, 0xBA, 0xBE];
-    let header_struct = ExVideoTagHeader {
-        frame_type: ExFrameType::KeyFrame,
-        packet_type: ExPacketType::CodedFrames,
-        fourcc: Some(FOURCC_AV01),
-        multitrack: None,
-        bytes_consumed: 0,
-        composition_time_offset_ms: None,
-        timestamp_offset_nano: 250_000,
-        mod_ex_entries: vec![ModExEntry {
-            subtype_raw: 0,
-            payload: ModExPayload::TimestampOffsetNano { offset_ns: 250_000 },
-            // 250_000 = 0x03D090 in 24-bit BE.
-            raw: vec![0x03, 0xD0, 0x90],
-        }],
-        video_command: None,
-    };
+    let header_struct = ExVideoTagHeader::new(ExFrameType::KeyFrame, ExPacketType::CodedFrames)
+        .with_fourcc(Some(FOURCC_AV01))
+        .with_timestamp_offset_nano(250_000)
+        .with_mod_ex_entries(vec![ModExEntry::new(
+            0,
+            ModExPayload::TimestampOffsetNano { offset_ns: 250_000 },
+            vec![0x03, 0xD0, 0x90],
+        )]);
     write_ex_video_tag(&mut buf, 40, &header_struct, &frame).unwrap();
 
     let mut dmx = open_video_only(buf);
@@ -1172,25 +1153,21 @@ fn ex_audio_modex_timestamp_offset_nano_chained_round_trips_through_demuxer() {
     write_aac_ex_sequence_start(&mut buf, 0, &asc).unwrap();
 
     let au = vec![0xDE, 0xAD, 0xBE, 0xEF];
-    let header_struct = ExAudioTagHeader {
-        packet_type: ExAudioPacketType::CodedFrames,
-        fourcc: Some(FOURCC_AUDIO_AAC),
-        multitrack: None,
-        timestamp_offset_nano: 300,
-        mod_ex_entries: vec![
-            ModExEntry {
-                subtype_raw: 0,
-                payload: ModExPayload::TimestampOffsetNano { offset_ns: 100 },
-                raw: vec![0x00, 0x00, 0x64],
-            },
-            ModExEntry {
-                subtype_raw: 0,
-                payload: ModExPayload::TimestampOffsetNano { offset_ns: 200 },
-                raw: vec![0x00, 0x00, 0xC8],
-            },
-        ],
-        bytes_consumed: 0,
-    };
+    let header_struct = ExAudioTagHeader::new(ExAudioPacketType::CodedFrames)
+        .with_fourcc(Some(FOURCC_AUDIO_AAC))
+        .with_timestamp_offset_nano(300)
+        .with_mod_ex_entries(vec![
+            ModExEntry::new(
+                0,
+                ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+                vec![0x00, 0x00, 0x64],
+            ),
+            ModExEntry::new(
+                0,
+                ModExPayload::TimestampOffsetNano { offset_ns: 200 },
+                vec![0x00, 0x00, 0xC8],
+            ),
+        ]);
     write_ex_audio_tag(&mut buf, 23, &header_struct, &au).unwrap();
 
     let mut dmx = open_video_only(buf);
@@ -1218,21 +1195,13 @@ fn ex_video_modex_reserved_subtype_passthrough_round_trips_through_demuxer() {
     write_av1_sequence_start(&mut buf, 0, &config).unwrap();
 
     let frame = vec![0x11, 0x22, 0x33];
-    let header_struct = ExVideoTagHeader {
-        frame_type: ExFrameType::InterFrame,
-        packet_type: ExPacketType::CodedFrames,
-        fourcc: Some(FOURCC_AV01),
-        multitrack: None,
-        bytes_consumed: 0,
-        composition_time_offset_ms: None,
-        timestamp_offset_nano: 0,
-        mod_ex_entries: vec![ModExEntry {
-            subtype_raw: 5, // reserved
-            payload: ModExPayload::Reserved { subtype_raw: 5 },
-            raw: vec![0xAA, 0xBB, 0xCC, 0xDD],
-        }],
-        video_command: None,
-    };
+    let header_struct = ExVideoTagHeader::new(ExFrameType::InterFrame, ExPacketType::CodedFrames)
+        .with_fourcc(Some(FOURCC_AV01))
+        .with_mod_ex_entries(vec![ModExEntry::new(
+            5,
+            ModExPayload::Reserved { subtype_raw: 5 },
+            vec![0xAA, 0xBB, 0xCC, 0xDD],
+        )]);
     write_ex_video_tag(&mut buf, 60, &header_struct, &frame).unwrap();
 
     let mut dmx = open_video_only(buf);
@@ -1261,21 +1230,14 @@ fn demuxer_surfaces_video_timestamp_offset_nano_side_channel() {
     write_av1_sequence_start(&mut buf, 0, &config).unwrap();
 
     let frame = vec![0xCA, 0xFE, 0xBA, 0xBE];
-    let header_struct = ExVideoTagHeader {
-        frame_type: ExFrameType::KeyFrame,
-        packet_type: ExPacketType::CodedFrames,
-        fourcc: Some(FOURCC_AV01),
-        multitrack: None,
-        bytes_consumed: 0,
-        composition_time_offset_ms: None,
-        timestamp_offset_nano: 250_000,
-        mod_ex_entries: vec![ModExEntry {
-            subtype_raw: 0,
-            payload: ModExPayload::TimestampOffsetNano { offset_ns: 250_000 },
-            raw: vec![0x03, 0xD0, 0x90],
-        }],
-        video_command: None,
-    };
+    let header_struct = ExVideoTagHeader::new(ExFrameType::KeyFrame, ExPacketType::CodedFrames)
+        .with_fourcc(Some(FOURCC_AV01))
+        .with_timestamp_offset_nano(250_000)
+        .with_mod_ex_entries(vec![ModExEntry::new(
+            0,
+            ModExPayload::TimestampOffsetNano { offset_ns: 250_000 },
+            vec![0x03, 0xD0, 0x90],
+        )]);
     write_ex_video_tag(&mut buf, 40, &header_struct, &frame).unwrap();
 
     let mut dmx = open_concrete(buf);
@@ -1310,25 +1272,21 @@ fn demuxer_surfaces_chained_audio_nano_offset_and_clears_on_plain_tag() {
 
     // First a ModEx-bearing tag chaining 100 + 200 = 300 ns.
     let au0 = vec![0xDE, 0xAD, 0xBE, 0xEF];
-    let modex_hdr = ExAudioTagHeader {
-        packet_type: ExAudioPacketType::CodedFrames,
-        fourcc: Some(FOURCC_AUDIO_AAC),
-        multitrack: None,
-        timestamp_offset_nano: 300,
-        mod_ex_entries: vec![
-            ModExEntry {
-                subtype_raw: 0,
-                payload: ModExPayload::TimestampOffsetNano { offset_ns: 100 },
-                raw: vec![0x00, 0x00, 0x64],
-            },
-            ModExEntry {
-                subtype_raw: 0,
-                payload: ModExPayload::TimestampOffsetNano { offset_ns: 200 },
-                raw: vec![0x00, 0x00, 0xC8],
-            },
-        ],
-        bytes_consumed: 0,
-    };
+    let modex_hdr = ExAudioTagHeader::new(ExAudioPacketType::CodedFrames)
+        .with_fourcc(Some(FOURCC_AUDIO_AAC))
+        .with_timestamp_offset_nano(300)
+        .with_mod_ex_entries(vec![
+            ModExEntry::new(
+                0,
+                ModExPayload::TimestampOffsetNano { offset_ns: 100 },
+                vec![0x00, 0x00, 0x64],
+            ),
+            ModExEntry::new(
+                0,
+                ModExPayload::TimestampOffsetNano { offset_ns: 200 },
+                vec![0x00, 0x00, 0xC8],
+            ),
+        ]);
     write_ex_audio_tag(&mut buf, 23, &modex_hdr, &au0).unwrap();
 
     // Then a plain (no-ModEx) Ex audio tag — the side-channel MUST clear
@@ -1367,21 +1325,13 @@ fn demuxer_preserves_reserved_modex_subtype_in_side_channel() {
     write_av1_sequence_start(&mut buf, 0, &config).unwrap();
 
     let frame = vec![0x11, 0x22, 0x33];
-    let header_struct = ExVideoTagHeader {
-        frame_type: ExFrameType::InterFrame,
-        packet_type: ExPacketType::CodedFrames,
-        fourcc: Some(FOURCC_AV01),
-        multitrack: None,
-        bytes_consumed: 0,
-        composition_time_offset_ms: None,
-        timestamp_offset_nano: 0,
-        mod_ex_entries: vec![ModExEntry {
-            subtype_raw: 5,
-            payload: ModExPayload::Reserved { subtype_raw: 5 },
-            raw: vec![0xAA, 0xBB, 0xCC, 0xDD],
-        }],
-        video_command: None,
-    };
+    let header_struct = ExVideoTagHeader::new(ExFrameType::InterFrame, ExPacketType::CodedFrames)
+        .with_fourcc(Some(FOURCC_AV01))
+        .with_mod_ex_entries(vec![ModExEntry::new(
+            5,
+            ModExPayload::Reserved { subtype_raw: 5 },
+            vec![0xAA, 0xBB, 0xCC, 0xDD],
+        )]);
     write_ex_video_tag(&mut buf, 60, &header_struct, &frame).unwrap();
 
     let mut dmx = open_concrete(buf);
@@ -1422,14 +1372,9 @@ fn ex_audio_multitrack_one_track_round_trips_through_demuxer() {
     let mut mt_body = vec![0u8]; // trackId 0
     mt_body.extend_from_slice(&opus_packet);
 
-    let header_struct = ExAudioTagHeader {
-        packet_type: ExAudioPacketType::CodedFrames,
-        fourcc: Some(FOURCC_OPUS),
-        multitrack: Some(AvMultitrackType::OneTrack),
-        timestamp_offset_nano: 0,
-        mod_ex_entries: Vec::new(),
-        bytes_consumed: 0,
-    };
+    let header_struct = ExAudioTagHeader::new(ExAudioPacketType::CodedFrames)
+        .with_fourcc(Some(FOURCC_OPUS))
+        .with_multitrack(Some(AvMultitrackType::OneTrack));
     write_ex_audio_tag(&mut buf, 23, &header_struct, &mt_body).unwrap();
 
     let mut dmx = open_video_only(buf);
@@ -1479,14 +1424,9 @@ fn ex_audio_multitrack_many_tracks_round_trips_default_track() {
     mt_body.extend_from_slice(&[(s >> 16) as u8, (s >> 8) as u8, s as u8]);
     mt_body.extend_from_slice(&alt_au);
 
-    let header_struct = ExAudioTagHeader {
-        packet_type: ExAudioPacketType::CodedFrames,
-        fourcc: Some(FOURCC_AUDIO_AAC),
-        multitrack: Some(AvMultitrackType::ManyTracks),
-        timestamp_offset_nano: 0,
-        mod_ex_entries: Vec::new(),
-        bytes_consumed: 0,
-    };
+    let header_struct = ExAudioTagHeader::new(ExAudioPacketType::CodedFrames)
+        .with_fourcc(Some(FOURCC_AUDIO_AAC))
+        .with_multitrack(Some(AvMultitrackType::ManyTracks));
     write_ex_audio_tag(&mut buf, 46, &header_struct, &mt_body).unwrap();
 
     let mut dmx = open_video_only(buf);
@@ -1536,17 +1476,9 @@ fn video_many_tracks_join_round_trips_all_tracks_via_side_channel() {
         .collect();
     let mt_body = join_tracks(AvMultitrackType::ManyTracks, &tracks).unwrap();
 
-    let header_struct = ExVideoTagHeader {
-        frame_type: ExFrameType::KeyFrame,
-        packet_type: ExPacketType::CodedFrames,
-        fourcc: Some(FOURCC_AV01),
-        multitrack: Some(AvMultitrackType::ManyTracks),
-        bytes_consumed: 0,
-        composition_time_offset_ms: None,
-        timestamp_offset_nano: 0,
-        mod_ex_entries: Vec::new(),
-        video_command: None,
-    };
+    let header_struct = ExVideoTagHeader::new(ExFrameType::KeyFrame, ExPacketType::CodedFrames)
+        .with_fourcc(Some(FOURCC_AV01))
+        .with_multitrack(Some(AvMultitrackType::ManyTracks));
     write_ex_video_tag(&mut buf, 70, &header_struct, &mt_body).unwrap();
 
     let mut dmx = open_concrete(buf);
@@ -1588,19 +1520,8 @@ fn video_many_tracks_many_codecs_join_round_trips_per_track_fourcc() {
     ];
     let mt_body = join_tracks(AvMultitrackType::ManyTracksManyCodecs, &tracks).unwrap();
 
-    let header_struct = ExVideoTagHeader {
-        frame_type: ExFrameType::KeyFrame,
-        packet_type: ExPacketType::CodedFrames,
-        // ManyTracksManyCodecs: no shared header FourCc (each track
-        // carries its own). The Ex header FourCc field is `None`.
-        fourcc: None,
-        multitrack: Some(AvMultitrackType::ManyTracksManyCodecs),
-        bytes_consumed: 0,
-        composition_time_offset_ms: None,
-        timestamp_offset_nano: 0,
-        mod_ex_entries: Vec::new(),
-        video_command: None,
-    };
+    let header_struct = ExVideoTagHeader::new(ExFrameType::KeyFrame, ExPacketType::CodedFrames)
+        .with_multitrack(Some(AvMultitrackType::ManyTracksManyCodecs));
     write_ex_video_tag(&mut buf, 70, &header_struct, &mt_body).unwrap();
 
     let mut dmx = open_concrete(buf);
@@ -1640,14 +1561,8 @@ fn audio_many_tracks_many_codecs_join_round_trips_per_track_fourcc() {
     ];
     let mt_body = join_tracks(AvMultitrackType::ManyTracksManyCodecs, &tracks).unwrap();
 
-    let header_struct = ExAudioTagHeader {
-        packet_type: ExAudioPacketType::CodedFrames,
-        fourcc: None,
-        multitrack: Some(AvMultitrackType::ManyTracksManyCodecs),
-        timestamp_offset_nano: 0,
-        mod_ex_entries: Vec::new(),
-        bytes_consumed: 0,
-    };
+    let header_struct = ExAudioTagHeader::new(ExAudioPacketType::CodedFrames)
+        .with_multitrack(Some(AvMultitrackType::ManyTracksManyCodecs));
     write_ex_audio_tag(&mut buf, 30, &header_struct, &mt_body).unwrap();
 
     let mut dmx = open_concrete(buf);
@@ -1801,30 +1716,32 @@ fn ex_video_color_info_writer_round_trip_full_payload() {
     tag::write_first_previous_tag_size(&mut buf).unwrap();
     make_hvc1_seq_start(&mut buf);
 
-    let ci = ColorInfo {
-        color_config: Some(ColorConfig {
-            bit_depth: Some(10),
-            color_primaries: Some(9),           // BT.2020
-            transfer_characteristics: Some(16), // SMPTE ST 2084 (PQ)
-            matrix_coefficients: Some(9),       // BT.2020 NCL
-        }),
-        hdr_cll: Some(HdrCll {
-            max_fall: Some(400.0),
-            max_cll: Some(1000.0),
-        }),
-        hdr_mdcv: Some(HdrMdcv {
-            red_x: Some(0.708),
-            red_y: Some(0.292),
-            green_x: Some(0.170),
-            green_y: Some(0.797),
-            blue_x: Some(0.131),
-            blue_y: Some(0.046),
-            white_point_x: Some(0.3127),
-            white_point_y: Some(0.3290),
-            max_luminance: Some(1000.0),
-            min_luminance: Some(0.01),
-        }),
-    };
+    let ci = ColorInfo::default()
+        .with_color_config(Some(
+            ColorConfig::default()
+                .with_bit_depth(Some(10))
+                .with_color_primaries(Some(9))
+                .with_transfer_characteristics(Some(16))
+                .with_matrix_coefficients(Some(9)),
+        ))
+        .with_hdr_cll(Some(
+            HdrCll::default()
+                .with_max_fall(Some(400.0))
+                .with_max_cll(Some(1000.0)),
+        ))
+        .with_hdr_mdcv(Some(
+            HdrMdcv::default()
+                .with_red_x(Some(0.708))
+                .with_red_y(Some(0.292))
+                .with_green_x(Some(0.170))
+                .with_green_y(Some(0.797))
+                .with_blue_x(Some(0.131))
+                .with_blue_y(Some(0.046))
+                .with_white_point_x(Some(0.3127))
+                .with_white_point_y(Some(0.3290))
+                .with_max_luminance(Some(1000.0))
+                .with_min_luminance(Some(0.01)),
+        ));
     write_ex_video_color_info(&mut buf, 40, oxideav_flv::FOURCC_HVC1, &ci).unwrap();
 
     let mut dmx = open_video_only(buf);
@@ -1893,30 +1810,32 @@ fn ex_video_color_info_full_read_write_loop_via_to_color_info() {
     tag::write_first_previous_tag_size(&mut buf).unwrap();
     make_hvc1_seq_start(&mut buf);
 
-    let ci = ColorInfo {
-        color_config: Some(ColorConfig {
-            bit_depth: Some(10),
-            color_primaries: Some(9),
-            transfer_characteristics: Some(16),
-            matrix_coefficients: Some(9),
-        }),
-        hdr_cll: Some(HdrCll {
-            max_fall: Some(400.0),
-            max_cll: Some(1000.0),
-        }),
-        hdr_mdcv: Some(HdrMdcv {
-            red_x: Some(0.708),
-            red_y: Some(0.292),
-            green_x: Some(0.170),
-            green_y: Some(0.797),
-            blue_x: Some(0.131),
-            blue_y: Some(0.046),
-            white_point_x: Some(0.3127),
-            white_point_y: Some(0.3290),
-            max_luminance: Some(1000.0),
-            min_luminance: Some(0.01),
-        }),
-    };
+    let ci = ColorInfo::default()
+        .with_color_config(Some(
+            ColorConfig::default()
+                .with_bit_depth(Some(10))
+                .with_color_primaries(Some(9))
+                .with_transfer_characteristics(Some(16))
+                .with_matrix_coefficients(Some(9)),
+        ))
+        .with_hdr_cll(Some(
+            HdrCll::default()
+                .with_max_fall(Some(400.0))
+                .with_max_cll(Some(1000.0)),
+        ))
+        .with_hdr_mdcv(Some(
+            HdrMdcv::default()
+                .with_red_x(Some(0.708))
+                .with_red_y(Some(0.292))
+                .with_green_x(Some(0.170))
+                .with_green_y(Some(0.797))
+                .with_blue_x(Some(0.131))
+                .with_blue_y(Some(0.046))
+                .with_white_point_x(Some(0.3127))
+                .with_white_point_y(Some(0.3290))
+                .with_max_luminance(Some(1000.0))
+                .with_min_luminance(Some(0.01)),
+        ));
     write_ex_video_color_info(&mut buf, 40, oxideav_flv::FOURCC_HVC1, &ci).unwrap();
 
     let mut dmx = open_video_only(buf);
@@ -1940,13 +1859,8 @@ fn ex_video_color_info_reset_loop_rebuilds_default() {
     tag::write_first_previous_tag_size(&mut buf).unwrap();
     make_hvc1_seq_start(&mut buf);
 
-    let ci = ColorInfo {
-        color_config: Some(ColorConfig {
-            bit_depth: Some(10),
-            ..ColorConfig::default()
-        }),
-        ..ColorInfo::default()
-    };
+    let ci = ColorInfo::default()
+        .with_color_config(Some(ColorConfig::default().with_bit_depth(Some(10))));
     write_ex_video_color_info(&mut buf, 40, oxideav_flv::FOURCC_HVC1, &ci).unwrap();
     write_ex_video_color_info_reset(&mut buf, 80, oxideav_flv::FOURCC_HVC1).unwrap();
 
@@ -1972,13 +1886,8 @@ fn ex_video_color_info_writer_omits_absent_groups() {
     tag::write_first_previous_tag_size(&mut buf).unwrap();
     make_hvc1_seq_start(&mut buf);
 
-    let ci = ColorInfo {
-        color_config: Some(ColorConfig {
-            bit_depth: Some(12),
-            ..ColorConfig::default()
-        }),
-        ..ColorInfo::default()
-    };
+    let ci = ColorInfo::default()
+        .with_color_config(Some(ColorConfig::default().with_bit_depth(Some(12))));
     write_ex_video_color_info(&mut buf, 40, oxideav_flv::FOURCC_HVC1, &ci).unwrap();
 
     let mut dmx = open_video_only(buf);
@@ -2006,13 +1915,8 @@ fn ex_video_color_info_reset_clears_prior_signal() {
     tag::write_first_previous_tag_size(&mut buf).unwrap();
     make_hvc1_seq_start(&mut buf);
 
-    let ci = ColorInfo {
-        color_config: Some(ColorConfig {
-            bit_depth: Some(10),
-            ..ColorConfig::default()
-        }),
-        ..ColorInfo::default()
-    };
+    let ci = ColorInfo::default()
+        .with_color_config(Some(ColorConfig::default().with_bit_depth(Some(10))));
     write_ex_video_color_info(&mut buf, 40, oxideav_flv::FOURCC_HVC1, &ci).unwrap();
     write_ex_video_color_info_reset(&mut buf, 80, oxideav_flv::FOURCC_HVC1).unwrap();
 
@@ -2029,13 +1933,8 @@ fn ex_video_color_info_rejects_out_of_range_at_writer() {
     // Writer must surface the spec-range validation error to callers,
     // not silently emit a malformed AMF blob.
     let mut buf = Vec::new();
-    let ci = ColorInfo {
-        hdr_cll: Some(HdrCll {
-            max_cll: Some(50_000.0), // > 10_000 cd/m^2 ceiling
-            ..HdrCll::default()
-        }),
-        ..ColorInfo::default()
-    };
+    let ci =
+        ColorInfo::default().with_hdr_cll(Some(HdrCll::default().with_max_cll(Some(50_000.0))));
     let err = write_ex_video_color_info(&mut buf, 0, oxideav_flv::FOURCC_HVC1, &ci).unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("maxCLL"));

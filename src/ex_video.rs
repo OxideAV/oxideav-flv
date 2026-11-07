@@ -80,6 +80,7 @@ pub const FOURCC_VVC1: u32 = u32::from_be_bytes(*b"vvc1");
 /// keep the explicit Command variant so callers can recognise it
 /// without consulting PacketType.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExFrameType {
     KeyFrame,
     InterFrame,
@@ -124,6 +125,7 @@ impl ExFrameType {
 /// Values >= 6 are v2 reserved/extension territory; ModEx (7) is the
 /// only defined extension so far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExPacketType {
     /// `0` — codec configuration record (AV1CodecConfigurationRecord,
     /// HEVCDecoderConfigurationRecord, VPCodecConfigurationRecord, ...).
@@ -193,6 +195,7 @@ impl ExPacketType {
 /// for future use. Unknown values are preserved verbatim so a future
 /// command extension lands without parser changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VideoCommand {
     /// `0` — start of client-side seeking video frame sequence.
     StartSeek,
@@ -250,6 +253,7 @@ pub use crate::mod_ex::VideoPacketModExType;
 ///           for SequenceStart on FourCC=av01, …)
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExVideoTagHeader {
     pub frame_type: ExFrameType,
     pub packet_type: ExPacketType,
@@ -286,6 +290,89 @@ pub struct ExVideoTagHeader {
     /// [`bytes_consumed`] is advanced past it so callers see an empty
     /// `body[bytes_consumed..]`. `None` for every non-command tag.
     pub video_command: Option<VideoCommand>,
+}
+
+impl ExVideoTagHeader {
+    /// A header of `frame_type` / `packet_type` with no FourCC, no
+    /// multitrack wrapper, no composition-time offset, no ModEx entries,
+    /// no video command and a zero nanosecond offset; fill the rest with
+    /// the `with_*` setters.
+    pub fn new(frame_type: ExFrameType, packet_type: ExPacketType) -> Self {
+        Self {
+            frame_type,
+            packet_type,
+            fourcc: None,
+            multitrack: None,
+            bytes_consumed: 0,
+            composition_time_offset_ms: None,
+            timestamp_offset_nano: 0,
+            mod_ex_entries: Vec::new(),
+            video_command: None,
+        }
+    }
+
+    /// Builder: set [`frame_type`](Self::frame_type).
+    #[must_use]
+    pub fn with_frame_type(mut self, v: ExFrameType) -> Self {
+        self.frame_type = v;
+        self
+    }
+
+    /// Builder: set [`packet_type`](Self::packet_type).
+    #[must_use]
+    pub fn with_packet_type(mut self, v: ExPacketType) -> Self {
+        self.packet_type = v;
+        self
+    }
+
+    /// Builder: set [`fourcc`](Self::fourcc).
+    #[must_use]
+    pub fn with_fourcc(mut self, v: Option<u32>) -> Self {
+        self.fourcc = v;
+        self
+    }
+
+    /// Builder: set [`multitrack`](Self::multitrack).
+    #[must_use]
+    pub fn with_multitrack(mut self, v: Option<AvMultitrackType>) -> Self {
+        self.multitrack = v;
+        self
+    }
+
+    /// Builder: set [`bytes_consumed`](Self::bytes_consumed).
+    #[must_use]
+    pub fn with_bytes_consumed(mut self, v: usize) -> Self {
+        self.bytes_consumed = v;
+        self
+    }
+
+    /// Builder: set [`composition_time_offset_ms`](Self::composition_time_offset_ms).
+    #[must_use]
+    pub fn with_composition_time_offset_ms(mut self, v: Option<i32>) -> Self {
+        self.composition_time_offset_ms = v;
+        self
+    }
+
+    /// Builder: set [`timestamp_offset_nano`](Self::timestamp_offset_nano).
+    #[must_use]
+    pub fn with_timestamp_offset_nano(mut self, v: u32) -> Self {
+        self.timestamp_offset_nano = v;
+        self
+    }
+
+    /// Builder: set [`mod_ex_entries`](Self::mod_ex_entries).
+    #[must_use]
+    pub fn with_mod_ex_entries(mut self, v: Vec<ModExEntry>) -> Self {
+        self.mod_ex_entries = v;
+        self
+    }
+
+    /// Builder: set [`video_command`](Self::video_command).
+    #[must_use]
+    pub fn with_video_command(mut self, v: Option<VideoCommand>) -> Self {
+        self.video_command = v;
+        self
+    }
 }
 
 impl ExVideoTagHeader {

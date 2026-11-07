@@ -108,6 +108,7 @@ impl CapsExMask {
 ///
 /// [`extra`]: ConnectCommandObject::extra
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct ConnectCommandObject {
     /// `fourCcList` — the legacy enhanced-codec declaration: a strict
     /// array of FourCC strings (`"av01"`, `"hvc1"`, …) or the single
@@ -134,6 +135,7 @@ pub struct ConnectCommandObject {
 /// list — the subset (String / Number) the `connect` Command Object's
 /// non-E-RTMP properties use.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum ScalarValue {
     /// AMF0 String.
     Str(String),

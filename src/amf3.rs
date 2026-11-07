@@ -140,7 +140,8 @@ pub enum Amf3Value {
 }
 
 /// An AMF3 Array (§3.11).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Amf3Array {
     /// `(name, value)*` for non-ordinal indices ("ECMA-style").
     pub assoc: Vec<(String, Amf3Value)>,
@@ -148,8 +149,25 @@ pub struct Amf3Array {
     pub dense: Vec<Amf3Value>,
 }
 
+impl Amf3Array {
+    /// Builder: set [`assoc`](Self::assoc).
+    #[must_use]
+    pub fn with_assoc(mut self, v: Vec<(String, Amf3Value)>) -> Self {
+        self.assoc = v;
+        self
+    }
+
+    /// Builder: set [`dense`](Self::dense).
+    #[must_use]
+    pub fn with_dense(mut self, v: Vec<Amf3Value>) -> Self {
+        self.dense = v;
+        self
+    }
+}
+
 /// An AMF3 Object (§3.12) with its trait information.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct Amf3Object {
     /// Class alias. `""` for anonymous objects.
     pub class_name: String,
@@ -169,6 +187,50 @@ pub struct Amf3Object {
     pub sealed_values: Vec<Amf3Value>,
     /// Dynamic members (only populated for `dynamic` classes).
     pub dynamic_members: Vec<(String, Amf3Value)>,
+}
+
+impl Amf3Object {
+    /// Builder: set [`class_name`](Self::class_name).
+    #[must_use]
+    pub fn with_class_name(mut self, v: String) -> Self {
+        self.class_name = v;
+        self
+    }
+
+    /// Builder: set [`dynamic`](Self::dynamic).
+    #[must_use]
+    pub fn with_dynamic(mut self, v: bool) -> Self {
+        self.dynamic = v;
+        self
+    }
+
+    /// Builder: set [`externalizable`](Self::externalizable).
+    #[must_use]
+    pub fn with_externalizable(mut self, v: bool) -> Self {
+        self.externalizable = v;
+        self
+    }
+
+    /// Builder: set [`sealed_names`](Self::sealed_names).
+    #[must_use]
+    pub fn with_sealed_names(mut self, v: Vec<String>) -> Self {
+        self.sealed_names = v;
+        self
+    }
+
+    /// Builder: set [`sealed_values`](Self::sealed_values).
+    #[must_use]
+    pub fn with_sealed_values(mut self, v: Vec<Amf3Value>) -> Self {
+        self.sealed_values = v;
+        self
+    }
+
+    /// Builder: set [`dynamic_members`](Self::dynamic_members).
+    #[must_use]
+    pub fn with_dynamic_members(mut self, v: Vec<(String, Amf3Value)>) -> Self {
+        self.dynamic_members = v;
+        self
+    }
 }
 
 impl Amf3Value {

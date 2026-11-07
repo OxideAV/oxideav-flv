@@ -76,6 +76,7 @@ pub const FOURCC_AAC: u32 = u32::from_be_bytes(*b"mp4a");
 /// SoundFormat == ExHeader). Values >= 8 are reserved for future
 /// extensions; ModEx (7) is the only currently-defined extension hook.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExAudioPacketType {
     /// `0` — codec-config blob (Opus ID header / FLAC STREAMINFO /
     /// AAC AudioSpecificConfig). AC-3 / E-AC-3 / MP3 ignore this
@@ -173,6 +174,7 @@ pub use crate::multitrack::AvMultitrackType;
 ///           4  audioFourCc (FOURCC)
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExAudioTagHeader {
     /// `AudioPacketType` after ModEx unwrapping. When the leading
     /// byte's low nibble was `Multitrack` (5), this field holds the
@@ -206,6 +208,64 @@ pub struct ExAudioTagHeader {
     /// Number of bytes consumed at the front of the tag body. The
     /// caller slices `body[bytes_consumed..]` to recover the payload.
     pub bytes_consumed: usize,
+}
+
+impl ExAudioTagHeader {
+    /// A header of `packet_type` with no FourCC, no multitrack wrapper,
+    /// no ModEx entries and a zero nanosecond offset; fill the rest with
+    /// the `with_*` setters.
+    pub fn new(packet_type: ExAudioPacketType) -> Self {
+        Self {
+            packet_type,
+            fourcc: None,
+            multitrack: None,
+            timestamp_offset_nano: 0,
+            mod_ex_entries: Vec::new(),
+            bytes_consumed: 0,
+        }
+    }
+
+    /// Builder: set [`packet_type`](Self::packet_type).
+    #[must_use]
+    pub fn with_packet_type(mut self, v: ExAudioPacketType) -> Self {
+        self.packet_type = v;
+        self
+    }
+
+    /// Builder: set [`fourcc`](Self::fourcc).
+    #[must_use]
+    pub fn with_fourcc(mut self, v: Option<u32>) -> Self {
+        self.fourcc = v;
+        self
+    }
+
+    /// Builder: set [`multitrack`](Self::multitrack).
+    #[must_use]
+    pub fn with_multitrack(mut self, v: Option<AvMultitrackType>) -> Self {
+        self.multitrack = v;
+        self
+    }
+
+    /// Builder: set [`timestamp_offset_nano`](Self::timestamp_offset_nano).
+    #[must_use]
+    pub fn with_timestamp_offset_nano(mut self, v: u32) -> Self {
+        self.timestamp_offset_nano = v;
+        self
+    }
+
+    /// Builder: set [`mod_ex_entries`](Self::mod_ex_entries).
+    #[must_use]
+    pub fn with_mod_ex_entries(mut self, v: Vec<ModExEntry>) -> Self {
+        self.mod_ex_entries = v;
+        self
+    }
+
+    /// Builder: set [`bytes_consumed`](Self::bytes_consumed).
+    #[must_use]
+    pub fn with_bytes_consumed(mut self, v: usize) -> Self {
+        self.bytes_consumed = v;
+        self
+    }
 }
 
 impl ExAudioTagHeader {

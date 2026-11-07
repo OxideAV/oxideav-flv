@@ -38,6 +38,7 @@ pub fn write<W: Write + ?Sized>(w: &mut W, has_audio: bool, has_video: bool) -> 
 
 /// Decoded FLV file header.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct FlvHeader {
     pub version: u8,
     /// True when bit 0x04 is set in the flags byte.
