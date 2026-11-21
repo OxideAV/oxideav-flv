@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Demuxer: `FlvDemuxer::stats()` → `FlvDemuxStats` (wrong
+  `PreviousTagSize` fields, timestamp wraps and discontinuities, unknown
+  tag types skipped, late / changed configuration records, mid-stream
+  codec switches, "stopped inside a cut-off tag", rejected keyframe
+  table) and `FlvDemuxer::indexed_sync_points()`.
+- Demuxer: timestamps are carried from the 24 + 8-bit wire field onto a
+  64-bit timeline, across the 32-bit wrap (49.7 days) and across a
+  24-bit wrap by writers that never fill `TimestampExtended`.
+- Demuxer: a sync-point index built as a by-product of reading (capped
+  at 65 536 entries), so files without an `onMetaData` keyframe table
+  seek by bisection inside the part already seen and by a header-only
+  walk beyond it.
+- Demuxer: files that are still being written — `next_packet` stops with
+  `Eof` at the last complete tag and continues from there once the file
+  has grown; seeks see the newly arrived key frames.
+- Demuxer: configuration records that arrive late or change mid-stream
+  update the stream's `extradata` (and are emitted as `header` packets);
+  a mid-stream codec switch rebuilds the stream parameters; PCM / ADPCM /
+  Nellymoser layout changes follow the tag header.
+- Demuxer: a stream declared by the file header flag plus
+  `audiocodecid` / `videocodecid` whose first tag lies beyond the
+  discovery window gets its slot at open and fills in when the tag
+  arrives; script tags past the discovery window (late `onMetaData`,
+  cue points) join the metadata when first read.
+- Demuxer: `flv.conflict.*` metadata entries wherever `onMetaData` or
+  the header flags contradict the tags (the tags win).
+- Demuxer: `Demuxer::set_active_streams` — tags of inactive streams are
+  stepped over without copying their payload.
+
 - `ExAudioTagHeader::new(packet_type)`,
   `ExVideoTagHeader::new(frame_type, packet_type)`,
   `MultichannelConfig::new(order, channel_count)`, `ModExEntry::new`,
@@ -16,6 +45,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plus `ColorInfo`, `ColorConfig`, `HdrCll`, `HdrMdcv`.
 
 ### Changed
+
+- Demuxer I/O goes through one 64 KiB sliding window: a tag is parsed
+  in place and its payload copied once (was: four `read` + three `seek`
+  calls and two allocations per tag). The input's length is never
+  queried.
+- `open` is bounded at 256 tags / 4 MiB and keeps looking, within that
+  window, for a configuration record that follows the first frames.
+- `seek_to` lands on the last sync point **at or before** the target
+  (was: the first key frame at or after it when no keyframe table was
+  present). The `onMetaData` keyframe table is verified against the file
+  before it is trusted, and a table listing only some key frames still
+  gives the exact answer.
+- A file cut inside a tag now ends with `Eof` after the last complete
+  tag (was: an I/O / invalid-data error), with
+  `FlvDemuxStats::ended_mid_tag` set.
+- For linear PCM, ADPCM and generic-rate Nellymoser the tag header's
+  rate / size / channel bits now win over `onMetaData`
+  (`audiosamplerate` / `audiosamplesize` / `stereo`).
+- An `onMetaData` `duration` of 0 reads as "unknown" (`None`).
+- A first video tag that is a command frame no longer defines the video
+  stream; an unparsable first tag is skipped instead of failing `open`.
 
 - API hygiene: the E-RTMP / script enums `ExAudioPacketType`,
   `ExFrameType`, `ExPacketType`, `VideoCommand`, `AudioPacketModExType`,

@@ -35,6 +35,7 @@ pub mod mod_ex;
 pub mod multichannel;
 pub mod multitrack;
 pub mod on_status;
+mod reader;
 pub mod script;
 pub mod tag;
 pub mod typed_meta;
@@ -49,7 +50,8 @@ pub use connect::{
     parse_connect_command, write_command_object, write_connect_command, write_connect_command_body,
 };
 pub use demuxer::{
-    EmbeddedImage, FlvDemuxer, open as open_demuxer, open_concrete as open_demuxer_concrete,
+    EmbeddedImage, FlvDemuxStats, FlvDemuxer, open as open_demuxer,
+    open_concrete as open_demuxer_concrete,
 };
 pub use ex_audio::{
     AudioPacketModExType, AvMultitrackType, ExAudioPacketType, ExAudioTagHeader,

@@ -1,15 +1,16 @@
 //! FLV demuxer.
 //!
-//! Two-pass initialisation:
-//!
-//! 1. Parse the 9-byte file header. Skip the first `PreviousTagSize`
-//!    (always zero in spec-conformant files).
-//! 2. Walk tags until we have discovered at least one audio and one
-//!    video stream (or we hit the end of the file). For each new
-//!    media kind, synthesise a `StreamInfo` from the first tag's
-//!    header. Script tags are consumed into `metadata` along the way.
-//! 3. Return to the start-of-tags position. `next_packet` re-walks
-//!    the stream producing one `Packet` per audio/video tag.
+//! * **Open** parses the 9-byte file header and then a bounded prefix
+//!   of the tag stream (at most 256 tags / 4 MiB) — enough to see the
+//!   first audio tag, the first video tag, their configuration records
+//!   and the script tags in front of them. It never measures the input
+//!   and never scans for a duration or an index.
+//! * **`next_packet`** walks the tag stream through a sliding window
+//!   (the crate-private `reader` module); each media tag becomes one `Packet` whose
+//!   payload is copied out of the window exactly once.
+//! * **`seek_to`** lands on the last sync point at or before the
+//!   target, through the `onMetaData` keyframe table when there is a
+//!   valid one and through an index built during reading otherwise.
 //!
 //! For AAC / H.264 tags the "packet type" / "configuration record"
 //! prefix byte (and, for H.264, the 3-byte CompositionTime) is
@@ -17,12 +18,13 @@
 //!
 //! * Packet-type 0 (config) lands in `extradata` on the stream's
 //!   `CodecParameters` and is also surfaced as a `header`-flagged
-//!   packet to match behaviours callers expect (MP4 demuxer / MKV
-//!   demuxer pattern).
+//!   packet — including when it arrives late or changes mid-stream.
 //! * Packet-type 1 (data) → normal decoder input.
 //! * Packet-type 2 (end of sequence) → skipped.
-
-use std::io::{Read, Seek, SeekFrom};
+//!
+//! Timestamps are carried from the 24 + 8-bit wire field onto a 64-bit
+//! timeline (the private `Clock` type); stream-health observations are counted in
+//! [`FlvDemuxStats`].
 
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, Packet, Rational, Result, SampleFormat,
@@ -41,6 +43,7 @@ use crate::header::FlvHeader;
 use crate::mod_ex::ModExEntry;
 use crate::multichannel::{MultichannelConfig, mask_channel_labels};
 use crate::multitrack::{MultitrackPacketTrack, split_tracks};
+use crate::reader::TagReader;
 use crate::tag::{
     AUDIO_CODEC_AAC, AUDIO_CODEC_NELLYMOSER_8K_MONO, AUDIO_CODEC_NELLYMOSER_16K_MONO,
     AUDIO_CODEC_SPEEX, AudioTagHeader, EncryptedTagPreamble, TagHeader, TagType, VIDEO_CODEC_H264,
@@ -85,10 +88,21 @@ struct EncryptionHeadline {
 const STREAM_AUDIO: u32 = 0;
 const STREAM_VIDEO: u32 = 1;
 
+/// Discovery stops after this many tags…
+const MAX_DISCOVERY_TAGS: u32 = 256;
+/// …or after this many bytes once at least one stream is known
+/// (sixteen times as many while none is), whichever comes first. `open`
+/// never reads further than this, so opening a multi-gigabyte or
+/// still-growing file costs the same as opening a short one.
+const MAX_DISCOVERY_BYTES: u64 = 4 << 20;
+/// `PreviousTagSize` (UI32) + the 11-byte tag header: the fixed prefix
+/// of one record of the file body (spec §E.3).
+const RECORD_PREFIX: usize = 4 + 11;
+
 /// Open factory used by the container registry. Returns the demuxer as a
 /// trait object; use [`open_concrete`] when you need the concrete
 /// [`FlvDemuxer`] accessors ([`FlvDemuxer::is_encrypted`] /
-/// [`FlvDemuxer::last_multitrack_tracks`]).
+/// [`FlvDemuxer::last_multitrack_tracks`] / [`FlvDemuxer::stats`]).
 pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     Ok(Box::new(open_concrete(input, codecs)?))
 }
@@ -96,60 +110,64 @@ pub fn open(input: Box<dyn ReadSeek>, codecs: &dyn CodecResolver) -> Result<Box<
 /// Open factory returning the concrete [`FlvDemuxer`] so callers can
 /// reach the FLV-specific accessors that the [`Demuxer`] trait does not
 /// expose — [`FlvDemuxer::is_encrypted`] (Adobe FLV §Annex F encryption
-/// flag) and [`FlvDemuxer::last_multitrack_tracks`] (every track of the
-/// last Enhanced-RTMP multitrack tag). [`open`] wraps this in a
+/// flag), [`FlvDemuxer::last_multitrack_tracks`] (every track of the
+/// last Enhanced-RTMP multitrack tag) and [`FlvDemuxer::stats`]
+/// (stream-health counters). [`open`] wraps this in a
 /// `Box<dyn Demuxer>` for the registry path.
+///
+/// Opening is bounded: it reads the file header and then at most
+/// 256 tags / 4 MiB looking for the first audio tag, the first video tag
+/// and their configuration records. It never asks the input for its
+/// length and never scans for a duration or a seek table, so a live
+/// capture or a file that is still being written opens as fast as a
+/// finished one. [`Demuxer::duration_micros`] is `Some` only when
+/// `onMetaData` declares a duration.
 pub fn open_concrete(
     mut input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
 ) -> Result<FlvDemuxer> {
-    let _hdr = FlvHeader::read(&mut *input)?;
-    // The four bytes immediately after the header are the first
-    // `PreviousTagSize` — per spec always 0x00000000.
-    let _ = read_u32_be(&mut *input)?;
-    let first_tag_pos = input.stream_position()?;
+    let hdr = FlvHeader::read(&mut *input)?;
+    // The body starts with `PreviousTagSize0`; every record after that
+    // is "PreviousTagSize + tag", so the cursor always rests on a
+    // back-pointer.
+    let first_record_pos = input.stream_position()?;
+    let mut reader = TagReader::new(input, first_record_pos);
 
-    // --- Pass 1: discovery ---------------------------------------------------
-    let mut streams_by_type: [Option<StreamInfo>; 2] = [None, None];
+    // --- Discovery -----------------------------------------------------------
+    let mut found: [Option<StreamInfo>; 2] = [None, None];
+    let mut keys: [Option<u32>; 2] = [None, None];
+    let mut awaiting_config = [false, false];
     let mut metadata: Vec<(String, String)> = Vec::new();
     let mut duration_micros: Option<i64> = None;
     let mut keyframe_index: Option<KeyframeIndex> = None;
     let mut encryption: Option<EncryptionHeadline> = None;
     let mut xmp_metadata: Option<String> = None;
     let mut embedded_images: Vec<EmbeddedImage> = Vec::new();
-    // Scan up to a reasonable cap — we only need one audio + one video tag
-    // plus the script tag. Keep a hard limit so pathological files can't
-    // force us to pre-read the whole input here.
+    let mut clock = Clock::default();
     let mut tags_scanned: u32 = 0;
-    const MAX_DISCOVERY_TAGS: u32 = 256;
     while tags_scanned < MAX_DISCOVERY_TAGS {
-        if streams_by_type[0].is_some() && streams_by_type[1].is_some() {
+        let have_any = found[0].is_some() || found[1].is_some();
+        if found[0].is_some() && found[1].is_some() && !awaiting_config[0] && !awaiting_config[1] {
             break;
         }
-        let pos = input.stream_position()?;
-        let header = match TagHeader::read(&mut *input) {
-            Ok(h) => h,
-            Err(Error::Eof) => break,
-            Err(e) => return Err(e),
+        let budget = if have_any {
+            MAX_DISCOVERY_BYTES
+        } else {
+            16 * MAX_DISCOVERY_BYTES
         };
-        let kind = match header.kind {
-            Some(k) => k,
-            None => {
-                // Unknown tag type — skip the body + trailing size.
-                skip_bytes(&mut *input, header.data_size as u64 + 4)?;
-                tags_scanned += 1;
-                continue;
-            }
+        if reader.position() - first_record_pos > budget {
+            break;
+        }
+        let Some(header) = peek_record(&mut reader)? else {
+            break;
         };
-        // Read the full payload.
-        let body = read_body(&mut *input, header.data_size)?;
-        // Trailing PreviousTagSize (u32 BE).
-        let _ = read_u32_be(&mut *input)?;
-
-        match kind {
-            TagType::ScriptData => {
+        let total = RECORD_PREFIX + header.data_size as usize;
+        let ts = clock.stamp(header.kind, header.timestamp_ms);
+        let body = &reader.window()[RECORD_PREFIX..total];
+        match header.kind {
+            Some(TagType::ScriptData) => {
                 parse_script_body(
-                    &body,
+                    body,
                     &mut metadata,
                     &mut duration_micros,
                     &mut keyframe_index,
@@ -158,34 +176,85 @@ pub fn open_concrete(
                     &mut embedded_images,
                 );
             }
-            TagType::Audio => {
-                if streams_by_type[STREAM_AUDIO as usize].is_none() && !body.is_empty() {
-                    let info = build_audio_stream(STREAM_AUDIO, &body, &metadata)?;
-                    streams_by_type[STREAM_AUDIO as usize] = Some(info);
+            Some(TagType::Audio) if !body.is_empty() => {
+                let slot = STREAM_AUDIO as usize;
+                if found[slot].is_none() {
+                    if let Ok(mut info) = build_audio_stream(STREAM_AUDIO, body, &metadata) {
+                        info.start_time = Some(ts);
+                        awaiting_config[slot] =
+                            audio_wants_config(body) && info.params.extradata.is_empty();
+                        keys[slot] = audio_codec_key(body);
+                        found[slot] = Some(info);
+                    }
+                } else if awaiting_config[slot]
+                    && let Some(cfg) = audio_config_record(body)
+                    && let Some(info) = found[slot].as_mut()
+                {
+                    info.params.extradata = cfg;
+                    awaiting_config[slot] = false;
                 }
             }
-            TagType::Video => {
-                if streams_by_type[STREAM_VIDEO as usize].is_none() && !body.is_empty() {
-                    let info = build_video_stream(STREAM_VIDEO, &body, &metadata)?;
-                    streams_by_type[STREAM_VIDEO as usize] = Some(info);
+            Some(TagType::Video) if !body.is_empty() => {
+                let slot = STREAM_VIDEO as usize;
+                if found[slot].is_none() {
+                    if video_codec_key(body).is_some()
+                        && let Ok(mut info) = build_video_stream(STREAM_VIDEO, body, &metadata)
+                    {
+                        info.start_time = Some(ts);
+                        awaiting_config[slot] =
+                            video_wants_config(body) && info.params.extradata.is_empty();
+                        keys[slot] = video_codec_key(body);
+                        found[slot] = Some(info);
+                    }
+                } else if awaiting_config[slot]
+                    && let Some(cfg) = video_config_record(body)
+                    && let Some(info) = found[slot].as_mut()
+                {
+                    info.params.extradata = cfg;
+                    awaiting_config[slot] = false;
                 }
             }
+            _ => {}
         }
-        let _ = pos;
+        reader.consume(total);
         tags_scanned += 1;
     }
+    let script_parsed_to = reader.position();
 
-    // Preserve discovery order. Audio is stream 0 when present, video 1.
-    // If one of them is missing we renumber so there's no gap.
+    // A stream the file header and `onMetaData` both declare, but whose
+    // first tag lies beyond the discovery window (late video after a
+    // long audio-only lead-in, typically), still gets its slot now: the
+    // stream list is fixed for the demuxer's lifetime. Its parameters
+    // come from `onMetaData` and are replaced by the tag's own facts as
+    // soon as the first tag arrives.
+    if found[0].is_none()
+        && hdr.has_audio
+        && let Some(info) = placeholder_audio_stream(&metadata)
+    {
+        found[0] = Some(info);
+    }
+    if found[1].is_none()
+        && hdr.has_video
+        && let Some(info) = placeholder_video_stream(&metadata)
+    {
+        found[1] = Some(info);
+    }
+
+    // Where `onMetaData` and the tags disagree the tags win; say so.
+    report_conflicts(&hdr, &found, keys, &mut metadata);
+
+    // Audio is stream 0 when present, video follows; a missing kind
+    // leaves no gap.
     let mut streams: Vec<StreamInfo> = Vec::new();
     let mut audio_stream_index: Option<u32> = None;
     let mut video_stream_index: Option<u32> = None;
-    if let Some(mut s) = streams_by_type[0].take() {
+    let [audio, video] = found;
+    if let Some(mut s) = audio {
         s.index = streams.len() as u32;
         audio_stream_index = Some(s.index);
         streams.push(s);
     }
-    if let Some(mut s) = streams_by_type[1].take() {
+    if let Some(mut s) = video {
         s.index = streams.len() as u32;
         video_stream_index = Some(s.index);
         streams.push(s);
@@ -220,48 +289,580 @@ pub fn open_concrete(
         metadata.push(("xmp".into(), xmp.clone()));
     }
 
-    // --- Rewind for packet emission -----------------------------------------
-    input.seek(SeekFrom::Start(first_tag_pos))?;
+    // Back to the first record (inside the window for ordinary files, so
+    // no I/O).
+    reader.seek(first_record_pos)?;
 
+    let active = vec![true; streams.len()];
     Ok(FlvDemuxer {
-        input,
+        reader,
         streams,
         metadata,
         duration_micros,
         audio_stream_index,
         video_stream_index,
-        // Pending header-flagged "config" packet for AVC / AAC — queued so
-        // we surface exactly one config packet before the first data packet
-        // for each of those codecs.
-        pending_packet: None,
-        first_tag_pos,
+        codec_keys: keys,
+        active,
+        first_record_pos,
+        script_parsed_to,
+        clock: Clock::default(),
+        max_ts: 0,
+        expected_prev_size: Some(0),
+        index: LazyIndex::new(first_record_pos),
         keyframe_index,
         is_encrypted,
         last_multitrack: None,
         last_mod_ex: None,
         embedded_images,
+        stats: FlvDemuxStats::default(),
     })
+}
+
+/// Bring the record at the reader's cursor fully into the window and
+/// return its tag header, or `None` when the input ends before the
+/// record is complete (clean end of file, a file cut mid-tag, or a file
+/// that has not been written that far yet). The cursor is left on the
+/// record's `PreviousTagSize` either way; on `Some` the window holds
+/// `RECORD_PREFIX + DataSize` bytes.
+fn peek_record(reader: &mut TagReader) -> Result<Option<TagHeader>> {
+    if !reader.fill(RECORD_PREFIX)? {
+        return Ok(None);
+    }
+    let header = parse_tag_header(&reader.window()[4..RECORD_PREFIX]);
+    if !reader.fill(RECORD_PREFIX + header.data_size as usize)? {
+        return Ok(None);
+    }
+    Ok(Some(header))
+}
+
+/// Decode the 11 tag-header bytes (spec §E.4.1).
+fn parse_tag_header(b: &[u8]) -> TagHeader {
+    let u24 = |i: usize| ((b[i] as u32) << 16) | ((b[i + 1] as u32) << 8) | b[i + 2] as u32;
+    TagHeader {
+        tag_type_raw: b[0],
+        kind: TagType::from_u8(b[0]),
+        data_size: u24(1),
+        timestamp_ms: ((b[7] as u32) << 24) | u24(4),
+        stream_id: u24(8),
+        filter: (b[0] & 0x20) != 0,
+    }
+}
+
+fn is_media(kind: Option<TagType>) -> bool {
+    matches!(kind, Some(TagType::Audio | TagType::Video))
+}
+
+/// Whether a tag is a point playback can start from: a video key frame
+/// when the file has video, any audio tag otherwise. `first` is the
+/// first body byte (the Audio/VideoTagHeader byte).
+fn is_sync_tag(kind: Option<TagType>, first: Option<u8>, has_video: bool) -> bool {
+    match (kind, first) {
+        (Some(TagType::Video), Some(b)) if has_video => {
+            if (b & crate::ex_video::EX_HEADER_FLAG) != 0 {
+                ExFrameType::from_u8((b >> 4) & 0x07).is_keyframe()
+            } else {
+                VideoTagHeader::parse(b).is_keyframe()
+            }
+        }
+        (Some(TagType::Audio), Some(_)) => !has_video,
+        _ => false,
+    }
+}
+
+/// Identity of the codec an audio tag announces: the legacy
+/// `SoundFormat` nibble, or the FourCC of an Ex tag (tagged so the two
+/// spaces cannot collide). `None` for an empty body.
+fn audio_codec_key(body: &[u8]) -> Option<u32> {
+    let b = *body.first()?;
+    if (b >> 4) == crate::ex_audio::SOUND_FORMAT_EX_HEADER {
+        match ExAudioTagHeader::parse(body) {
+            Ok(Some(ex)) => Some(ex.fourcc.unwrap_or(u32::MAX)),
+            _ => None,
+        }
+    } else {
+        Some((b >> 4) as u32)
+    }
+}
+
+/// Video counterpart of [`audio_codec_key`]. `None` for an empty body
+/// and for command frames (FrameType 5), which name no codec.
+fn video_codec_key(body: &[u8]) -> Option<u32> {
+    let b = *body.first()?;
+    if (b & crate::ex_video::EX_HEADER_FLAG) != 0 {
+        match ExVideoTagHeader::parse(body) {
+            Ok(Some(ex)) if !matches!(ex.frame_type, ExFrameType::Command) => {
+                Some(ex.fourcc.unwrap_or(u32::MAX))
+            }
+            _ => None,
+        }
+    } else if VideoTagHeader::parse(b).is_video_info() {
+        None
+    } else {
+        Some((b & 0x0F) as u32)
+    }
+}
+
+/// Does this audio tag's codec ship a separate configuration record?
+fn audio_wants_config(body: &[u8]) -> bool {
+    match ExAudioTagHeader::parse(body) {
+        Ok(Some(ex)) => matches!(
+            ex.fourcc,
+            Some(crate::ex_audio::FOURCC_OPUS)
+                | Some(crate::ex_audio::FOURCC_FLAC)
+                | Some(crate::ex_audio::FOURCC_AAC)
+        ),
+        Ok(None) => AudioTagHeader::parse(body[0]).codec_id == AUDIO_CODEC_AAC,
+        Err(_) => false,
+    }
+}
+
+/// Does this video tag's codec ship a separate configuration record?
+fn video_wants_config(body: &[u8]) -> bool {
+    match ExVideoTagHeader::parse(body) {
+        Ok(Some(ex)) => ex.fourcc.is_some_and(|f| f != crate::ex_video::FOURCC_VP08),
+        Ok(None) => VideoTagHeader::parse(body[0]).codec_id == VIDEO_CODEC_H264,
+        Err(_) => false,
+    }
+}
+
+/// The configuration record an audio tag carries, when it is a
+/// sequence header (legacy AAC `AACPacketType == 0`, or an Ex
+/// `SequenceStart`).
+fn audio_config_record(body: &[u8]) -> Option<Vec<u8>> {
+    match ExAudioTagHeader::parse(body) {
+        Ok(Some(ex)) => {
+            if ex.packet_type != ExAudioPacketType::SequenceStart || body.len() <= ex.bytes_consumed
+            {
+                return None;
+            }
+            let tail = &body[ex.bytes_consumed..];
+            Some(match ex.multitrack {
+                Some(mt) => default_track_payload(mt, ex.fourcc, tail),
+                None => tail.to_vec(),
+            })
+        }
+        Ok(None) => {
+            let ah = AudioTagHeader::parse(*body.first()?);
+            (ah.codec_id == AUDIO_CODEC_AAC && body.len() > 2 && body[1] == 0)
+                .then(|| body[2..].to_vec())
+        }
+        Err(_) => None,
+    }
+}
+
+/// The configuration record a video tag carries, when it is a sequence
+/// header (legacy AVC `AVCPacketType == 0`, or an Ex `SequenceStart`).
+fn video_config_record(body: &[u8]) -> Option<Vec<u8>> {
+    match ExVideoTagHeader::parse(body) {
+        Ok(Some(ex)) => {
+            if !matches!(ex.packet_type, ExPacketType::SequenceStart)
+                || body.len() <= ex.bytes_consumed
+            {
+                return None;
+            }
+            let tail = &body[ex.bytes_consumed..];
+            Some(match ex.multitrack {
+                Some(mt) => default_track_payload(mt, ex.fourcc, tail),
+                None => tail.to_vec(),
+            })
+        }
+        Ok(None) => {
+            let vh = VideoTagHeader::parse(*body.first()?);
+            (vh.codec_id == VIDEO_CODEC_H264 && body.len() > 5 && body[1] == 0)
+                .then(|| body[5..].to_vec())
+        }
+        Err(_) => None,
+    }
+}
+
+/// Stream slot for audio that `onMetaData` declares (`audiocodecid`) but
+/// whose first tag has not been seen yet.
+fn placeholder_audio_stream(metadata: &[(String, String)]) -> Option<StreamInfo> {
+    let id = metadata_lookup_u32(metadata, "audiocodecid")?;
+    let mut params = CodecParameters::audio(CodecId::new(crate::tag::audio_codec_id_str_u32(id)));
+    apply_audio_metadata(&mut params, metadata);
+    Some(StreamInfo {
+        index: STREAM_AUDIO,
+        time_base: TimeBase::new(1, 1000),
+        duration: None,
+        start_time: None,
+        params,
+    })
+}
+
+/// Stream slot for video that `onMetaData` declares (`videocodecid`) but
+/// whose first tag has not been seen yet.
+fn placeholder_video_stream(metadata: &[(String, String)]) -> Option<StreamInfo> {
+    let id = metadata_lookup_u32(metadata, "videocodecid")?;
+    let mut params = CodecParameters::video(CodecId::new(crate::tag::video_codec_id_str_u32(id)));
+    apply_video_metadata(&mut params, metadata);
+    Some(StreamInfo {
+        index: STREAM_VIDEO,
+        time_base: TimeBase::new(1, 1000),
+        duration: None,
+        start_time: None,
+        params,
+    })
+}
+
+/// Record every place where `onMetaData` (or the file header) and the
+/// tags themselves disagree. The tags are what the stream list was
+/// built from; each disagreement lands in the metadata bag under
+/// `flv.conflict.<what>` as `"declared=<x> stream=<y>"` so a caller can
+/// see that the declaration was overruled.
+fn report_conflicts(
+    hdr: &FlvHeader,
+    found: &[Option<StreamInfo>; 2],
+    keys: [Option<u32>; 2],
+    metadata: &mut Vec<(String, String)>,
+) {
+    let mut notes: Vec<(String, String)> = Vec::new();
+    // Only streams built from a real tag (`keys` set) can contradict a
+    // declaration; a placeholder *is* the declaration.
+    if let (Some(s), Some(_)) = (&found[0], keys[0]) {
+        if let Some(id) = metadata_lookup_u32(metadata, "audiocodecid") {
+            let declared = crate::tag::audio_codec_id_str_u32(id);
+            if declared != s.params.codec_id.as_str() {
+                notes.push((
+                    "flv.conflict.audiocodecid".into(),
+                    format!("declared={declared} stream={}", s.params.codec_id.as_str()),
+                ));
+            }
+        }
+        if keys[0].is_some_and(audio_header_is_authoritative) {
+            if let (Some(d), Some(a)) = (
+                metadata_lookup_u32(metadata, "audiosamplerate"),
+                s.params.sample_rate,
+            ) && !sound_rate_matches(d, a)
+            {
+                notes.push((
+                    "flv.conflict.audiosamplerate".into(),
+                    format!("declared={d} stream={a}"),
+                ));
+            }
+            if let (Some(d), Some(a)) =
+                (metadata_lookup_bool(metadata, "stereo"), s.params.channels)
+                && d != (a == 2)
+            {
+                notes.push((
+                    "flv.conflict.stereo".into(),
+                    format!("declared={d} stream={}", a == 2),
+                ));
+            }
+            if let (Some(d), Some(a)) = (
+                metadata_audio_sample_format(metadata),
+                s.params.sample_format,
+            ) && d != a
+            {
+                notes.push((
+                    "flv.conflict.audiosamplesize".into(),
+                    format!("declared={d:?} stream={a:?}"),
+                ));
+            }
+        }
+    }
+    if let (Some(s), Some(_)) = (&found[1], keys[1])
+        && let Some(id) = metadata_lookup_u32(metadata, "videocodecid")
+    {
+        let declared = crate::tag::video_codec_id_str_u32(id);
+        if declared != s.params.codec_id.as_str() {
+            notes.push((
+                "flv.conflict.videocodecid".into(),
+                format!("declared={declared} stream={}", s.params.codec_id.as_str()),
+            ));
+        }
+    }
+    let kinds = |a: bool, v: bool| match (a, v) {
+        (true, true) => "audio+video",
+        (true, false) => "audio",
+        (false, true) => "video",
+        (false, false) => "none",
+    };
+    let seen = (keys[0].is_some(), keys[1].is_some());
+    if (hdr.has_audio, hdr.has_video) != seen {
+        notes.push((
+            "flv.conflict.header_flags".into(),
+            format!(
+                "declared={} stream={}",
+                kinds(hdr.has_audio, hdr.has_video),
+                kinds(seen.0, seen.1)
+            ),
+        ));
+    }
+    metadata.extend(notes);
+}
+
+/// `SoundRate` names its rates loosely ("5.5 kHz", "11 kHz", …); treat a
+/// declared rate within 1 % of the tag-header rate as agreement.
+fn sound_rate_matches(declared: u32, actual: u32) -> bool {
+    (declared as i64 - actual as i64).abs() * 100 <= actual as i64
+}
+
+/// For the formats whose samples are laid out by the `SoundRate` /
+/// `SoundSize` / `SoundType` bits themselves (linear PCM, ADPCM and
+/// generic-rate Nellymoser) the tag header is the fact and `onMetaData`
+/// cannot overrule it. (The G.711 formats are listed as reserved in
+/// §E.4.2.1 and commonly run at 8 kHz, which the bits cannot say, so
+/// for them the declaration is kept.) `key` is an
+/// [`audio_codec_key`].
+fn audio_header_is_authoritative(key: u32) -> bool {
+    key <= 0x0F
+        && matches!(
+            key as u8,
+            crate::tag::AUDIO_CODEC_LPCM_NATIVE
+                | crate::tag::AUDIO_CODEC_ADPCM
+                | crate::tag::AUDIO_CODEC_LPCM_LE
+                | crate::tag::AUDIO_CODEC_NELLYMOSER
+        )
+}
+
+/// Extends the wire timestamp onto a 64-bit timeline.
+///
+/// The tag header stores time as 24 + 8 bits (spec §E.4.1,
+/// `Timestamp` + `TimestampExtended`), so a long-running stream wraps
+/// after about 49.7 days — and a writer that never fills the extension
+/// byte wraps its 24 bits after about 4.66 hours. Each timestamp is
+/// placed at the position congruent to the wire value that is nearest
+/// the previous tag, which keeps time monotonic across either wrap
+/// while leaving genuine discontinuities (a jump that is not a wrap)
+/// visible as jumps.
+///
+/// The first tag after open is taken at face value as an unsigned
+/// 32-bit number.
+#[derive(Clone, Copy, Debug, Default)]
+enum Clock {
+    /// Nothing read yet.
+    #[default]
+    Unanchored,
+    /// The previous tag carried wire value `raw`, placed at `ext`.
+    /// `wrap24` is set once the stream has been seen to wrap its low 24
+    /// bits without carrying into the extension byte.
+    At { raw: u32, ext: i64, wrap24: bool },
+    /// No previous tag, but the next one is expected near `ext` (after
+    /// a seek).
+    Near { ext: i64 },
+}
+
+/// A 24-bit wrap is only recognised when one tag sits this close below
+/// 2^24 ms and the other this close above zero.
+const WRAP24_GUARD_MS: u32 = 60_000;
+const WRAP24: i64 = 1 << 24;
+
+impl Clock {
+    /// Place `raw` on the timeline; also says whether the stream is in
+    /// the "24-bit wrap without extension" regime afterwards.
+    fn place(&self, raw: u32) -> (i64, bool) {
+        match *self {
+            Clock::Unanchored => (raw as i64, false),
+            Clock::At {
+                raw: prev,
+                ext,
+                wrap24,
+            } => {
+                let mut step = raw.wrapping_sub(prev) as i32 as i64;
+                let mut wrap24 = wrap24;
+                if (raw >> 24) == (prev >> 24) {
+                    let (pl, rl) = (prev & 0x00FF_FFFF, raw & 0x00FF_FFFF);
+                    let high = (1 << 24) - WRAP24_GUARD_MS;
+                    if step < 0 && pl >= high && rl < WRAP24_GUARD_MS {
+                        // Forward across a 24-bit wrap.
+                        step += WRAP24;
+                        wrap24 = true;
+                    } else if step > 0 && wrap24 && pl < WRAP24_GUARD_MS && rl >= high {
+                        // A straggler from just before that wrap.
+                        step -= WRAP24;
+                    }
+                }
+                (ext + step, wrap24)
+            }
+            Clock::Near { ext } => {
+                let near32 = ext + (raw.wrapping_sub(ext as u32) as i32 as i64);
+                if (near32 - ext).abs() >= WRAP24 / 2 && raw < (1 << 24) {
+                    let low = (raw as i64 - (ext & (WRAP24 - 1)) + WRAP24 / 2).rem_euclid(WRAP24)
+                        - WRAP24 / 2;
+                    (ext + low, true)
+                } else {
+                    (near32, false)
+                }
+            }
+        }
+    }
+
+    /// Timeline position for a tag of type `kind`. Only audio and video
+    /// tags move the clock: script tags are conventionally stamped 0
+    /// wherever they sit, and must not pull the timeline back there.
+    fn stamp(&mut self, kind: Option<TagType>, raw: u32) -> i64 {
+        if is_media(kind) {
+            self.extend(raw)
+        } else {
+            self.place(raw).0
+        }
+    }
+
+    /// Place `raw` and make it the reference for the next tag.
+    fn extend(&mut self, raw: u32) -> i64 {
+        let (ext, wrap24) = self.place(raw);
+        *self = Clock::At { raw, ext, wrap24 };
+        ext
+    }
+}
+
+/// One seek landing point: a sync tag's record offset (the offset of the
+/// `PreviousTagSize` in front of the tag) and its timeline position.
+#[derive(Clone, Copy, Debug)]
+struct IndexEntry {
+    record_pos: u64,
+    ts: i64,
+}
+
+/// Upper bound on the lazily built index (24 bytes per entry).
+const MAX_INDEX_ENTRIES: usize = 1 << 16;
+
+/// Sync-point index built as a side effect of reading.
+///
+/// It covers `[first record, scanned_to)` and grows only when the
+/// demuxer (or a seek that has to look further ahead) walks tags
+/// starting exactly at `scanned_to`, so it never costs a pass of its
+/// own. Memory is bounded: once [`MAX_INDEX_ENTRIES`] is reached every
+/// other entry is dropped and the minimum spacing doubles — a seek then
+/// lands on the nearest kept entry and walks forward the short rest.
+#[derive(Debug)]
+struct LazyIndex {
+    entries: Vec<IndexEntry>,
+    /// Record offset of the first tag not yet examined.
+    scanned_to: u64,
+    /// Timeline state at `scanned_to`.
+    clock: Clock,
+    /// Minimum spacing between kept entries (0 = keep every sync tag).
+    stride_ms: i64,
+}
+
+impl LazyIndex {
+    fn new(first_record_pos: u64) -> Self {
+        Self {
+            entries: Vec::new(),
+            scanned_to: first_record_pos,
+            clock: Clock::default(),
+            stride_ms: 0,
+        }
+    }
+
+    /// Note the tag at `record_pos` (which must equal `scanned_to`).
+    fn note(&mut self, record_pos: u64, total: usize, clock: Clock, ts: i64, sync: bool) {
+        debug_assert_eq!(record_pos, self.scanned_to);
+        self.scanned_to = record_pos + total as u64;
+        self.clock = clock;
+        if !sync {
+            return;
+        }
+        // Keep the list strictly increasing in time so it can be
+        // bisected; a sync tag that steps backwards (a discontinuity)
+        // is not a target a time-based seek could name anyway.
+        if let Some(last) = self.entries.last()
+            && ts < last.ts + self.stride_ms.max(1)
+        {
+            return;
+        }
+        if self.entries.len() >= MAX_INDEX_ENTRIES {
+            let span = self.entries.last().map_or(0, |l| l.ts) - self.entries[0].ts;
+            let mut keep = false;
+            self.entries.retain(|_| {
+                keep = !keep;
+                keep
+            });
+            self.stride_ms = (self.stride_ms * 2)
+                .max(2 * span / MAX_INDEX_ENTRIES as i64)
+                .max(1);
+        }
+        self.entries.push(IndexEntry { record_pos, ts });
+    }
+
+    /// Last entry at or before `target`.
+    fn at_or_before(&self, target: i64) -> Option<IndexEntry> {
+        let n = self.entries.partition_point(|e| e.ts <= target);
+        n.checked_sub(1).map(|i| self.entries[i])
+    }
+
+    /// Whether the index already holds a sync point after `target`
+    /// (i.e. the answer for `target` cannot change by scanning further).
+    fn covers(&self, target: i64) -> bool {
+        self.entries.last().is_some_and(|e| e.ts > target)
+    }
+}
+
+/// Stream-health counters a [`FlvDemuxer`] keeps while reading — the
+/// things a well-formed file never triggers. Read them through
+/// [`FlvDemuxer::stats`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FlvDemuxStats {
+    /// Tags whose preceding `PreviousTagSize` was not the size of the
+    /// tag before it (spec §E.3). The field is never used to walk the
+    /// file, so a wrong value costs nothing but is counted here.
+    pub previous_tag_size_mismatches: u64,
+    /// Times the 24 + 8-bit wire timestamp wrapped and was carried onto
+    /// the 64-bit packet timeline.
+    pub timestamp_wraps: u64,
+    /// Timestamp jumps that were not wraps: a step backwards of more
+    /// than one second, or forwards of more than ten, from one tag to
+    /// the next. Packet timestamps follow the stream across the jump.
+    pub timestamp_discontinuities: u64,
+    /// Tags of a type other than audio (8), video (9) or script (18),
+    /// skipped by their `DataSize`.
+    pub unknown_tags_skipped: u64,
+    /// Audio or video tags dropped because the file gave no sign of that
+    /// stream when it was opened (neither a tag in the discovery window
+    /// nor a header flag plus `onMetaData` codec id).
+    pub undeclared_stream_tags_dropped: u64,
+    /// Configuration records (AAC / AVC sequence headers, Ex
+    /// `SequenceStart`) that arrived after open or replaced an earlier
+    /// one. Each also surfaces as a `header`-flagged packet and updates
+    /// the stream's `extradata`.
+    pub config_updates: u64,
+    /// Times a stream switched codec mid-file (the tag header named a
+    /// different codec than the stream had). The stream's parameters
+    /// are rebuilt from the new tag.
+    pub codec_changes: u64,
+    /// `true` once reading stopped at a tag that was cut short (the file
+    /// ends inside a tag header or body). Reading again retries from the
+    /// same tag, so a file that is still growing simply continues.
+    pub ended_mid_tag: bool,
+    /// `true` when the `onMetaData` keyframe table pointed at something
+    /// that was not a video key frame at the stated time and was
+    /// therefore discarded; seeks then use the lazily built index.
+    pub keyframe_table_rejected: bool,
 }
 
 /// Public [`Demuxer`] type, exported so the integration tests can
 /// name it. Intentionally opaque — construction is via [`open`].
 pub struct FlvDemuxer {
-    input: Box<dyn ReadSeek>,
+    reader: TagReader,
     streams: Vec<StreamInfo>,
     metadata: Vec<(String, String)>,
     duration_micros: Option<i64>,
     audio_stream_index: Option<u32>,
     video_stream_index: Option<u32>,
-    pending_packet: Option<Packet>,
-    /// Byte offset of the first FLV tag (immediately after the file
-    /// header + leading PreviousTagSize). Used as the "rewind to
-    /// start" landing point for `seek_to(0)` and as the lower bound
-    /// for scan-forward seeks.
-    first_tag_pos: u64,
-    /// Cached `keyframes` table parsed out of `onMetaData`. `None` when
-    /// no script tag was present, when the tag did not carry a
-    /// `keyframes` object, or when the arrays were mismatched /
-    /// truncated. Callers fall back to scan-forward.
+    /// Codec identity ([`audio_codec_key`] / [`video_codec_key`]) each
+    /// stream's parameters were built from; `None` while a stream is
+    /// still an `onMetaData` placeholder.
+    codec_keys: [Option<u32>; 2],
+    /// Per-stream "caller wants packets" flags
+    /// ([`Demuxer::set_active_streams`]).
+    active: Vec<bool>,
+    /// Offset of `PreviousTagSize0`, the first record of the body.
+    first_record_pos: u64,
+    /// Script tags below this offset are already in the metadata bag.
+    script_parsed_to: u64,
+    /// Timeline state at the read cursor.
+    clock: Clock,
+    /// Highest timeline position handed out so far.
+    max_ts: i64,
+    /// What the next `PreviousTagSize` should read (`None` right after
+    /// a seek, when the previous tag is unknown).
+    expected_prev_size: Option<u32>,
+    /// Sync points seen so far.
+    index: LazyIndex,
+    /// `keyframes` table from `onMetaData`, until proven wrong.
     keyframe_index: Option<KeyframeIndex>,
     /// `true` when discovery saw a `|AdditionalHeader` script tag (FLV
     /// encryption, spec Annex F.2). The demuxer still emits packets for
@@ -295,6 +896,7 @@ pub struct FlvDemuxer {
     /// `onImageData` tag seen, in discovery order. Empty for the common
     /// case of a file with no embedded images.
     embedded_images: Vec<EmbeddedImage>,
+    stats: FlvDemuxStats,
 }
 
 /// An embedded image harvested from an `onImageData` script tag
@@ -442,20 +1044,200 @@ impl FlvDemuxer {
     pub fn last_mod_ex_entries(&self) -> Option<&[ModExEntry]> {
         self.last_mod_ex.as_ref().map(|m| m.entries.as_slice())
     }
+
+    /// Stream-health counters gathered so far: wrong `PreviousTagSize`
+    /// fields, timestamp wraps and discontinuities, skipped unknown tag
+    /// types, late or changed configuration records, mid-stream codec
+    /// switches, and whether reading stopped inside a cut-off tag.
+    pub fn stats(&self) -> &FlvDemuxStats {
+        &self.stats
+    }
+
+    /// Number of sync points (video key frames, or audio tags of an
+    /// audio-only file) the demuxer has indexed so far while reading.
+    /// The index is a by-product of [`Demuxer::next_packet`] and of
+    /// seeks that had to look ahead; it is capped at 65 536 entries.
+    pub fn indexed_sync_points(&self) -> usize {
+        self.index.entries.len()
+    }
+
+    /// Step the timeline for a tag read at the cursor and keep the
+    /// wrap / discontinuity counters.
+    fn advance_clock(&mut self, raw: u32) -> i64 {
+        let before = self.clock;
+        let ts = self.clock.extend(raw);
+        if let Clock::At {
+            raw: prev_raw,
+            ext: prev,
+            ..
+        } = before
+        {
+            // (a step that is neither is ordinary playback)
+            let step = ts - prev;
+            if raw < prev_raw && step > 0 {
+                // Count each roll-over once, however the tags around
+                // it interleave.
+                if (ts >> 24) > (self.max_ts >> 24) {
+                    self.stats.timestamp_wraps += 1;
+                }
+            } else if !(-1_000..=10_000).contains(&step) {
+                self.stats.timestamp_discontinuities += 1;
+            }
+        }
+        self.max_ts = self.max_ts.max(ts);
+        ts
+    }
+
+    /// Walk tag headers forward from the reader's cursor (timeline state
+    /// `clock`), feeding the lazy index where the walk passes its
+    /// frontier, until a tag later than `target` or the end of input.
+    /// Returns the last sync point at or before `target` that the walk
+    /// saw. Bodies are skipped, not read.
+    fn walk_to(&mut self, mut clock: Clock, target: i64) -> Result<Option<IndexEntry>> {
+        let has_video = self.video_stream_index.is_some();
+        let mut best = None;
+        loop {
+            let record_pos = self.reader.position();
+            if !self.reader.fill(RECORD_PREFIX)? {
+                break;
+            }
+            let header = parse_tag_header(&self.reader.window()[4..RECORD_PREFIX]);
+            let total = RECORD_PREFIX + header.data_size as usize;
+            let first = if header.data_size > 0 {
+                if !self.reader.fill(RECORD_PREFIX + 1)? {
+                    break;
+                }
+                Some(self.reader.window()[RECORD_PREFIX])
+            } else {
+                None
+            };
+            if record_pos == self.index.scanned_to {
+                clock = self.index.clock;
+            }
+            let ts = clock.stamp(header.kind, header.timestamp_ms);
+            let sync = is_sync_tag(header.kind, first, has_video);
+            if sync && ts > target {
+                break;
+            }
+            // A tag only counts once the input holds all of it (a file
+            // that is still growing may end inside this one).
+            if !self.reader.reaches(record_pos + total as u64)? {
+                self.reader.seek(record_pos)?;
+                break;
+            }
+            if record_pos == self.index.scanned_to {
+                self.index.note(record_pos, total, clock, ts, sync);
+            }
+            if sync {
+                best = Some(IndexEntry { record_pos, ts });
+            }
+        }
+        Ok(best)
+    }
+
+    /// Put the read cursor on `entry`.
+    fn land(&mut self, entry: IndexEntry) -> Result<i64> {
+        self.reader.seek(entry.record_pos)?;
+        self.clock = Clock::Near { ext: entry.ts };
+        self.expected_prev_size = None;
+        Ok(entry.ts)
+    }
+
+    /// Verify that the keyframe table's claim "a key frame stamped
+    /// `table_ts` starts at byte `tag_pos`" holds in the file.
+    fn check_table_entry(&mut self, tag_pos: u64, table_ts: i64) -> Result<Option<IndexEntry>> {
+        // The table gives the offset of the tag; the record starts at
+        // the `PreviousTagSize` four bytes earlier.
+        let Some(record_pos) = tag_pos.checked_sub(4) else {
+            return Ok(None);
+        };
+        if record_pos < self.first_record_pos {
+            return Ok(None);
+        }
+        self.reader.seek(record_pos)?;
+        if !self.reader.fill(RECORD_PREFIX + 1)? {
+            return Ok(None);
+        }
+        let w = self.reader.window();
+        let header = parse_tag_header(&w[4..RECORD_PREFIX]);
+        if header.data_size == 0
+            || header.stream_id != 0
+            || !is_sync_tag(header.kind, Some(w[RECORD_PREFIX]), true)
+        {
+            return Ok(None);
+        }
+        let (ts, _) = Clock::Near { ext: table_ts }.place(header.timestamp_ms);
+        // The table's time must describe this tag (allowing for
+        // rounding and for a writer whose table times are offset from
+        // its tag times by a few seconds).
+        if (ts - table_ts).abs() > 5_000 {
+            return Ok(None);
+        }
+        Ok(Some(IndexEntry { record_pos, ts }))
+    }
+
+    /// Seek through the `onMetaData` keyframe table. `Ok(None)` when
+    /// there is no usable table (absent, or it pointed at something that
+    /// is not a key frame — in which case it is dropped for good).
+    fn seek_by_table(&mut self, target: i64) -> Result<Option<i64>> {
+        let (Some(idx), Some(_)) = (&self.keyframe_index, self.video_stream_index) else {
+            return Ok(None);
+        };
+        let target_seconds = target as f64 / 1000.0;
+        let n = idx.times_seconds.partition_point(|t| *t <= target_seconds);
+        let i = n.saturating_sub(1);
+        let tag_pos = idx.file_positions[i];
+        let table_ts = (idx.times_seconds[i] * 1000.0).round() as i64;
+        let entry = self.check_table_entry(tag_pos, table_ts)?;
+        let Some(entry) = entry else {
+            self.keyframe_index = None;
+            self.stats.keyframe_table_rejected = true;
+            return Ok(None);
+        };
+        // A table may list only some key frames: walk on to the last
+        // one at or before the target (at most one table interval).
+        let mut best = entry;
+        if entry.ts < target {
+            self.reader.seek(entry.record_pos)?;
+            if let Some(later) = self.walk_to(Clock::Near { ext: entry.ts }, target)? {
+                best = later;
+            }
+        }
+        self.land(best).map(Some)
+    }
+
+    /// Seek through the lazily built index, extending it up to the
+    /// target first when reading has not got that far yet.
+    fn seek_by_scan(&mut self, target: i64) -> Result<i64> {
+        if !self.index.covers(target) {
+            self.reader.seek(self.index.scanned_to)?;
+            self.walk_to(self.index.clock, target)?;
+        }
+        let Some(mut entry) = self.index.at_or_before(target).or_else(|| {
+            // Target lies before the first sync point: start there.
+            self.index.entries.first().copied()
+        }) else {
+            // No sync point anywhere (yet): rewind to the first tag.
+            self.reader.seek(self.first_record_pos)?;
+            self.clock = Clock::default();
+            self.expected_prev_size = Some(0);
+            return Ok(0);
+        };
+        if self.index.stride_ms > 0 && entry.ts < target {
+            // The index was thinned: the exact sync point may sit
+            // between two kept entries.
+            self.reader.seek(entry.record_pos)?;
+            if let Some(later) = self.walk_to(Clock::Near { ext: entry.ts }, target)? {
+                entry = later;
+            }
+        }
+        self.land(entry)
+    }
 }
 
-/// Extract the ModEx state (nano offset + entries) from an Ex tag body,
-/// or `None` when the body is a legacy tag, a single-track / multitrack
-/// Ex tag without a ModEx prefix, or malformed. `is_video` selects the
-/// Ex header parser.
-fn extract_mod_ex(body: &[u8], is_video: bool) -> Option<LastModEx> {
-    let (offset_nano, entries) = if is_video {
-        let ex = ExVideoTagHeader::parse(body).ok().flatten()?;
-        (ex.timestamp_offset_nano, ex.mod_ex_entries)
-    } else {
-        let ex = ExAudioTagHeader::parse(body).ok().flatten()?;
-        (ex.timestamp_offset_nano, ex.mod_ex_entries)
-    };
+/// Captured ModEx state of an Ex tag, or `None` when it carried no
+/// ModEx prefix.
+fn mod_ex_state(offset_nano: u32, entries: Vec<ModExEntry>) -> Option<LastModEx> {
     if entries.is_empty() {
         return None;
     }
@@ -465,26 +1247,35 @@ fn extract_mod_ex(body: &[u8], is_video: bool) -> Option<LastModEx> {
     })
 }
 
-/// Resolve every track of a multitrack Ex tag body to an owned
-/// [`MultitrackPacketTrack`], or `None` when the tag is not a multitrack
-/// Ex tag (legacy tag, single-track Ex tag, command, or a malformed
-/// multitrack body that does not split).
-///
-/// `is_video` selects the audio vs. video FourCc name table and the Ex
-/// header parser. The returned payloads are the per-track Ex bodies
-/// exactly as they sit on the wire (the leading `SI24`
-/// CompositionTimeOffset for AVC/HEVC/VVC `CodedFrames` is preserved).
-fn extract_multitrack_tracks(body: &[u8], is_video: bool) -> Option<Vec<MultitrackPacketTrack>> {
-    // `(multitrack_type, default_fourcc, payload_start)` differs only in
-    // which Ex parser reads the header; the split + naming below is shared.
-    let (mt_type, default_fourcc, payload_start) = if is_video {
-        let ex = ExVideoTagHeader::parse(body).ok().flatten()?;
-        (ex.multitrack?, ex.fourcc, ex.bytes_consumed.min(body.len()))
-    } else {
-        let ex = ExAudioTagHeader::parse(body).ok().flatten()?;
-        (ex.multitrack?, ex.fourcc, ex.bytes_consumed.min(body.len()))
-    };
-    let tail = &body[payload_start..];
+/// Resolve every track of a multitrack Ex video tag body to an owned
+/// [`MultitrackPacketTrack`], or `None` when the tag is single-track or
+/// its multitrack body does not split. The returned payloads are the
+/// per-track Ex bodies exactly as they sit on the wire (the leading
+/// `SI24` CompositionTimeOffset for AVC/HEVC/VVC `CodedFrames` is
+/// preserved).
+fn video_multitrack_tracks(
+    body: &[u8],
+    ex: &ExVideoTagHeader,
+) -> Option<Vec<MultitrackPacketTrack>> {
+    multitrack_tracks(body, ex.multitrack?, ex.fourcc, ex.bytes_consumed, true)
+}
+
+/// Audio counterpart of [`video_multitrack_tracks`].
+fn audio_multitrack_tracks(
+    body: &[u8],
+    ex: &ExAudioTagHeader,
+) -> Option<Vec<MultitrackPacketTrack>> {
+    multitrack_tracks(body, ex.multitrack?, ex.fourcc, ex.bytes_consumed, false)
+}
+
+fn multitrack_tracks(
+    body: &[u8],
+    mt_type: crate::multitrack::AvMultitrackType,
+    default_fourcc: Option<u32>,
+    bytes_consumed: usize,
+    is_video: bool,
+) -> Option<Vec<MultitrackPacketTrack>> {
+    let tail = &body[bytes_consumed.min(body.len())..];
     let tracks = split_tracks(mt_type, default_fourcc.unwrap_or(0), tail).ok()?;
     Some(
         tracks
@@ -517,6 +1308,8 @@ impl std::fmt::Debug for FlvDemuxer {
                 "keyframe_index_entries",
                 &self.keyframe_index.as_ref().map(|i| i.file_positions.len()),
             )
+            .field("indexed_sync_points", &self.index.entries.len())
+            .field("stats", &self.stats)
             .field("is_encrypted", &self.is_encrypted)
             .finish()
     }
@@ -531,126 +1324,195 @@ impl Demuxer for FlvDemuxer {
         &self.streams
     }
 
+    /// Read the next packet.
+    ///
+    /// Returns [`Error::Eof`] when the input ends — at the end of the
+    /// last complete tag even if the file was cut inside the next one
+    /// ([`FlvDemuxStats::ended_mid_tag`] tells the two apart). The read
+    /// position stays on the incomplete tag, so calling `next_packet`
+    /// again after the file has grown continues from there.
     fn next_packet(&mut self) -> Result<Packet> {
-        if let Some(p) = self.pending_packet.take() {
-            return Ok(p);
-        }
         loop {
-            let header = match TagHeader::read(&mut *self.input) {
-                Ok(h) => h,
-                Err(Error::Eof) => return Err(Error::Eof),
-                Err(e) => return Err(e),
+            let record_pos = self.reader.position();
+            let Some(header) = peek_record(&mut self.reader)? else {
+                // Only the final `PreviousTagSize` (or nothing) may
+                // remain after the last tag.
+                self.stats.ended_mid_tag = self.reader.available() > 4;
+                return Err(Error::Eof);
             };
-            let body = read_body(&mut *self.input, header.data_size)?;
-            // Trailing PreviousTagSize.
-            let _ = read_u32_be(&mut *self.input)?;
+            self.stats.ended_mid_tag = false;
+            let total = RECORD_PREFIX + header.data_size as usize;
 
-            // Filtered (encrypted) tags carry an EncryptionTagHeader +
-            // FilterParams preamble in front of the codec body. Per F.1
-            // "non-compliant players will ignore tags with the filter
-            // flag set". We're a compliant *demuxer* but we don't carry
-            // a DRM client, so the most we can do is route the encrypted
-            // bytes downstream with `flags.discard = true` so decoders
-            // don't try to parse ciphertext.
+            let prev_size = {
+                let w = self.reader.window();
+                u32::from_be_bytes([w[0], w[1], w[2], w[3]])
+            };
+            if self.expected_prev_size.is_some_and(|e| e != prev_size) {
+                self.stats.previous_tag_size_mismatches += 1;
+            }
+            self.expected_prev_size = Some(11 + header.data_size);
+
+            let at_frontier = record_pos == self.index.scanned_to;
+            if at_frontier {
+                // One timeline for packets and seek results.
+                if !matches!(self.index.clock, Clock::Unanchored) {
+                    self.clock = self.index.clock;
+                }
+            }
+            let ts = if is_media(header.kind) {
+                self.advance_clock(header.timestamp_ms)
+            } else {
+                self.clock.place(header.timestamp_ms).0
+            };
+            let body = &self.reader.window()[RECORD_PREFIX..total];
+            if at_frontier {
+                let sync = is_sync_tag(
+                    header.kind,
+                    body.first().copied(),
+                    self.video_stream_index.is_some(),
+                );
+                self.index.note(record_pos, total, self.clock, ts, sync);
+            }
+
+            let mut out: Option<Packet> = None;
             if header.filter {
-                if let Some(pkt) = build_encrypted_packet(
-                    &header,
-                    &body,
-                    self.audio_stream_index,
-                    self.video_stream_index,
-                    &self.streams,
-                )? {
-                    return Ok(pkt);
+                // Filtered (encrypted) tags carry an EncryptionTagHeader
+                // + FilterParams preamble in front of the codec body
+                // (spec F.3). We carry no DRM client, so the encrypted
+                // bytes go downstream with `flags.discard = true` and
+                // decoders never see ciphertext as a frame.
+                let slot = match header.kind {
+                    Some(TagType::Audio) => self.audio_stream_index,
+                    Some(TagType::Video) => self.video_stream_index,
+                    _ => None,
+                };
+                if let Some(idx) = slot
+                    && self.active[idx as usize]
+                {
+                    match build_encrypted_packet(&self.streams[idx as usize], ts, body) {
+                        Ok(p) => out = p,
+                        Err(e) => {
+                            self.reader.consume(total);
+                            return Err(e);
+                        }
+                    }
                 }
-                continue;
+            } else {
+                match header.kind {
+                    None => self.stats.unknown_tags_skipped += 1,
+                    Some(TagType::ScriptData) => {
+                        // Script tags past the discovery window (a late
+                        // `onMetaData`, cue points, live captions) join
+                        // the metadata bag when first read.
+                        if record_pos >= self.script_parsed_to {
+                            let mut encryption = None;
+                            let mut xmp = None;
+                            parse_script_body(
+                                body,
+                                &mut self.metadata,
+                                &mut self.duration_micros,
+                                &mut self.keyframe_index,
+                                &mut encryption,
+                                &mut xmp,
+                                &mut self.embedded_images,
+                            );
+                            if let Some(x) = xmp {
+                                self.metadata.retain(|(k, _)| k != "xmp");
+                                self.metadata.push(("xmp".into(), x));
+                            }
+                            self.script_parsed_to = record_pos + total as u64;
+                        }
+                    }
+                    Some(TagType::Audio) => match self.audio_stream_index {
+                        None => self.stats.undeclared_stream_tags_dropped += 1,
+                        Some(idx) if !self.active[idx as usize] => {}
+                        Some(idx) => {
+                            let ex = ExAudioTagHeader::parse(body).ok().flatten();
+                            let stream = &mut self.streams[idx as usize];
+                            if !body.is_empty() {
+                                refresh_audio_stream(
+                                    stream,
+                                    &mut self.codec_keys[0],
+                                    body,
+                                    ts,
+                                    &self.metadata,
+                                    &mut self.stats,
+                                );
+                            }
+                            // Enhanced-RTMP `MultichannelConfig` frames
+                            // carry the stream's speaker layout (no
+                            // audio data); a new one supersedes the
+                            // last.
+                            if let Some(ex) = &ex
+                                && ex.packet_type == ExAudioPacketType::MultichannelConfig
+                            {
+                                let tail = &body[ex.bytes_consumed.min(body.len())..];
+                                let payload = match ex.multitrack {
+                                    Some(mt) => default_track_payload(mt, ex.fourcc, tail),
+                                    None => tail.to_vec(),
+                                };
+                                harvest_multichannel_config(&payload, &mut self.metadata, stream);
+                            }
+                            out = build_audio_packet(stream, ts, body, ex.as_ref());
+                            if out.is_some() {
+                                self.last_multitrack =
+                                    ex.as_ref().and_then(|ex| audio_multitrack_tracks(body, ex));
+                                self.last_mod_ex = ex.and_then(|ex| {
+                                    mod_ex_state(ex.timestamp_offset_nano, ex.mod_ex_entries)
+                                });
+                            }
+                        }
+                    },
+                    Some(TagType::Video) => match self.video_stream_index {
+                        None => self.stats.undeclared_stream_tags_dropped += 1,
+                        Some(idx) if !self.active[idx as usize] => {}
+                        Some(idx) => {
+                            let ex = ExVideoTagHeader::parse(body).ok().flatten();
+                            let stream = &mut self.streams[idx as usize];
+                            if !body.is_empty() {
+                                refresh_video_stream(
+                                    stream,
+                                    &mut self.codec_keys[1],
+                                    body,
+                                    ts,
+                                    &self.metadata,
+                                    &mut self.stats,
+                                );
+                            }
+                            // Enhanced-RTMP `Metadata` frames carry
+                            // AMF-encoded HDR `colorInfo` (no video
+                            // data); a new one replaces the last.
+                            if let Some(ex) = &ex
+                                && matches!(ex.packet_type, ExPacketType::Metadata)
+                            {
+                                let start = ex.bytes_consumed.min(body.len());
+                                harvest_video_metadata_frame(&body[start..], &mut self.metadata);
+                            }
+                            out = build_video_packet(stream, ts, body, ex.as_ref());
+                            if out.is_some() {
+                                self.last_multitrack =
+                                    ex.as_ref().and_then(|ex| video_multitrack_tracks(body, ex));
+                                self.last_mod_ex = ex.and_then(|ex| {
+                                    mod_ex_state(ex.timestamp_offset_nano, ex.mod_ex_entries)
+                                });
+                            }
+                        }
+                    },
+                }
             }
+            self.reader.consume(total);
+            if let Some(pkt) = out {
+                return Ok(pkt);
+            }
+        }
+    }
 
-            match header.kind {
-                Some(TagType::ScriptData) | None => continue,
-                Some(TagType::Audio) => {
-                    let idx = match self.audio_stream_index {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                    // Enhanced-RTMP `AudioPacketType.MultichannelConfig`
-                    // frames carry the stream's speaker layout (no audio
-                    // data). Harvest the parsed config into the metadata
-                    // bag + the stream's channel count here — the spec
-                    // defines it as the channel-mapping signal for codecs
-                    // that are not self-describing, and a new config
-                    // supersedes the prior one. The packet itself is
-                    // still emitted as header+discard for parity.
-                    if let Ok(Some(ex)) = ExAudioTagHeader::parse(&body)
-                        && ex.packet_type == ExAudioPacketType::MultichannelConfig
-                    {
-                        let start = ex.bytes_consumed.min(body.len());
-                        let tail = &body[start..];
-                        let payload = match ex.multitrack {
-                            Some(mt) => default_track_payload(mt, ex.fourcc, tail),
-                            None => tail.to_vec(),
-                        };
-                        harvest_multichannel_config(
-                            &payload,
-                            &mut self.metadata,
-                            &mut self.streams[idx as usize],
-                        );
-                    }
-                    if let Some((pkt, pending)) =
-                        build_audio_packet(&self.streams[idx as usize], &header, &body)
-                    {
-                        // Capture all tracks of a multitrack tag (or clear
-                        // the side-channel for a single-track tag) for
-                        // `last_multitrack_tracks`.
-                        self.last_multitrack = extract_multitrack_tracks(&body, false);
-                        // Capture the tag's ModEx state (nano offset +
-                        // entries) for `last_timestamp_offset_nano` /
-                        // `last_mod_ex_entries`, or clear it for a tag
-                        // without a ModEx prefix.
-                        self.last_mod_ex = extract_mod_ex(&body, false);
-                        if let Some(p) = pending {
-                            self.pending_packet = Some(pkt);
-                            return Ok(p);
-                        }
-                        return Ok(pkt);
-                    }
-                }
-                Some(TagType::Video) => {
-                    let idx = match self.video_stream_index {
-                        Some(i) => i,
-                        None => continue,
-                    };
-                    // Enhanced-RTMP `VideoPacketType.Metadata` frames carry
-                    // AMF-encoded HDR `colorInfo` (no video data). Harvest it
-                    // into the metadata bag here — the spec mandates it is
-                    // sent before the video section it affects, and a new
-                    // colorInfo replaces the prior one. The packet itself is
-                    // still emitted as header+discard for parity.
-                    if let Ok(Some(ex)) = ExVideoTagHeader::parse(&body)
-                        && matches!(ex.packet_type, ExPacketType::Metadata)
-                    {
-                        let start = ex.bytes_consumed.min(body.len());
-                        harvest_video_metadata_frame(&body[start..], &mut self.metadata);
-                    }
-                    if let Some((pkt, pending)) =
-                        build_video_packet(&self.streams[idx as usize], &header, &body)
-                    {
-                        // Capture all tracks of a multitrack tag (or clear
-                        // the side-channel for a single-track tag) for
-                        // `last_multitrack_tracks`.
-                        self.last_multitrack = extract_multitrack_tracks(&body, true);
-                        // Capture the tag's ModEx state (nano offset +
-                        // entries) for `last_timestamp_offset_nano` /
-                        // `last_mod_ex_entries`, or clear it for a tag
-                        // without a ModEx prefix.
-                        self.last_mod_ex = extract_mod_ex(&body, true);
-                        if let Some(p) = pending {
-                            self.pending_packet = Some(pkt);
-                            return Ok(p);
-                        }
-                        return Ok(pkt);
-                    }
-                }
-            }
+    /// Restrict packet delivery to the listed streams. Tags of the
+    /// other streams are stepped over without their payload being
+    /// copied.
+    fn set_active_streams(&mut self, indices: &[u32]) {
+        for (i, a) in self.active.iter_mut().enumerate() {
+            *a = indices.contains(&(i as u32));
         }
     }
 
@@ -662,140 +1524,121 @@ impl Demuxer for FlvDemuxer {
         self.duration_micros
     }
 
-    /// Seek to the nearest video keyframe at or before `pts` (in the
-    /// stream's time base — always 1/1000 s for FLV).
+    /// Seek to the last sync point **at or before** `pts` (stream time
+    /// base, always 1/1000 s) and return its timestamp. A sync point is
+    /// a video key frame, or any audio tag in an audio-only file. The
+    /// next packet read is that tag.
     ///
-    /// Two paths:
+    /// * With an `onMetaData` `keyframes` table the nearest listed key
+    ///   frame is found by bisection and checked against the file (a
+    ///   table that points at anything but a key frame is discarded and
+    ///   reported in [`FlvDemuxStats::keyframe_table_rejected`]); the
+    ///   short stretch from there to the target is then walked so a
+    ///   table that lists only some key frames still gives the exact
+    ///   answer.
+    /// * Without one, the demuxer uses the index it builds as tags are
+    ///   read. A target inside the part already read costs a bisection;
+    ///   a target beyond it walks tag headers forward from the furthest
+    ///   point seen (payloads are skipped), remembering every sync point
+    ///   so the walk is never repeated.
     ///
-    /// 1. **Toc path** — when `onMetaData.keyframes` carries parallel
-    ///    `filepositions[]` / `times[]` arrays, binary-search `times`
-    ///    for the largest entry ≤ target_seconds and jump to the
-    ///    corresponding byte offset. O(log n).
-    /// 2. **Scan path** — rewind to the start of the tag stream and
-    ///    walk tags forward, returning the first video keyframe tag
-    ///    whose timestamp is ≥ target_pts. (We can't reliably scan
-    ///    *backwards* in a flat tag stream without an index, so for
-    ///    target_pts > 0 we land "at or after" rather than "at or
-    ///    before". `seek_to(0)` always lands at the start.)
-    ///
-    /// Audio-only streams have no notion of "keyframe" (every audio
-    /// packet is independently decodable) — for the audio stream the
-    /// scan path stops at the first audio tag ≥ target_pts.
-    ///
-    /// `pts` is clamped at zero; values past the end of the file land
-    /// at the last keyframe (toc path) or fall through to EOF on the
-    /// next `next_packet()` call (scan path).
+    /// A target before the first sync point lands on the first one; a
+    /// target past the end lands on the last one. On a file that is
+    /// still being written the answer reflects the tags present at the
+    /// time of the call, and a later call sees the newer ones.
     fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
-        // Validate the requested stream index.
         if (stream_index as usize) >= self.streams.len() {
             return Err(Error::invalid(format!(
                 "FLV: stream index {stream_index} out of range (have {} stream(s))",
                 self.streams.len()
             )));
         }
-        let target_pts_ms = pts.max(0);
-
-        // Reset transient state so callers don't see a stale pending
-        // packet from before the seek.
-        self.pending_packet = None;
-
-        // Toc path — only meaningful when video is present (the toc
-        // describes video keyframes).
-        if let (Some(idx), Some(_video_stream_index)) =
-            (self.keyframe_index.clone(), self.video_stream_index)
-        {
-            // Defensive: empty / mismatched arrays should have been
-            // rejected at parse time, but guard anyway.
-            if !idx.times_seconds.is_empty() && idx.times_seconds.len() == idx.file_positions.len()
-            {
-                let target_seconds = (target_pts_ms as f64) / 1000.0;
-                let pos = match idx.times_seconds.binary_search_by(|t| {
-                    t.partial_cmp(&target_seconds)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                }) {
-                    Ok(i) => i,
-                    // bisect-left: `i` is the first entry strictly
-                    // greater than target. Step back to the entry at
-                    // or before target (clamping to 0).
-                    Err(i) => i.saturating_sub(1),
-                };
-                let dest = idx.file_positions[pos];
-                // `dest` is the absolute byte offset of the keyframe
-                // tag's TagType byte. Seek there so `next_packet` can
-                // re-read the tag header from that point.
-                self.input.seek(SeekFrom::Start(dest))?;
-                let landed_ms = (idx.times_seconds[pos] * 1000.0).round() as i64;
-                return Ok(landed_ms);
-            }
+        let target = pts.max(0);
+        if let Some(landed) = self.seek_by_table(target)? {
+            return Ok(landed);
         }
+        self.seek_by_scan(target)
+    }
+}
 
-        // Scan path — walk tags from the start looking for a video
-        // keyframe ≥ target_pts (or, for audio-only files, any audio
-        // tag ≥ target_pts).
-        self.input.seek(SeekFrom::Start(self.first_tag_pos))?;
-        // Are we seeking on the audio or video stream?
-        let seeking_video = match self.video_stream_index {
-            Some(i) => i == stream_index,
-            None => false,
+/// Bring a stream's parameters in line with the audio tag being read:
+/// fill a placeholder, follow a codec switch, and pick up a late or
+/// changed configuration record.
+fn refresh_audio_stream(
+    stream: &mut StreamInfo,
+    key: &mut Option<u32>,
+    body: &[u8],
+    ts: i64,
+    metadata: &[(String, String)],
+    stats: &mut FlvDemuxStats,
+) {
+    let now = audio_codec_key(body);
+    if now.is_some() && now != *key {
+        if let Ok(info) = build_audio_stream(stream.index, body, metadata) {
+            if key.is_some() {
+                stats.codec_changes += 1;
+            } else {
+                stream.start_time = Some(ts);
+            }
+            stream.params = info.params;
+            *key = now;
+        }
+        return;
+    }
+    if let Some(cfg) = audio_config_record(body) {
+        if cfg != stream.params.extradata {
+            stream.params.extradata = cfg;
+            stats.config_updates += 1;
+        }
+    } else if now.is_some_and(audio_header_is_authoritative) {
+        // The SoundRate / SoundSize / SoundType bits are the sample
+        // layout for these formats; follow them if they change.
+        let ah = AudioTagHeader::parse(body[0]);
+        let fmt = if ah.is_16bit {
+            SampleFormat::S16
+        } else {
+            SampleFormat::U8
         };
-        loop {
-            let tag_pos = self.input.stream_position()?;
-            let header = match TagHeader::read(&mut *self.input) {
-                Ok(h) => h,
-                Err(Error::Eof) => {
-                    // Past EOF — land at the end. `next_packet` will
-                    // surface EOF on the next call.
-                    return Ok(target_pts_ms);
-                }
-                Err(e) => return Err(e),
-            };
-            let kind = match header.kind {
-                Some(k) => k,
-                None => {
-                    skip_bytes(&mut *self.input, header.data_size as u64 + 4)?;
-                    continue;
-                }
-            };
-            let want_match = match kind {
-                TagType::Video if seeking_video || self.video_stream_index.is_some() => {
-                    // Peek the first byte of the body for the keyframe
-                    // flag without consuming the rest of the tag. The
-                    // Ex header (IsExHeader=1) reuses bits 6..4 as
-                    // FrameType so the same is_keyframe test works for
-                    // both legacy and enhanced video tags.
-                    if header.data_size == 0 {
-                        false
-                    } else {
-                        let mut b = [0u8; 1];
-                        self.input.read_exact(&mut b)?;
-                        let is_kf = if (b[0] & crate::ex_video::EX_HEADER_FLAG) != 0 {
-                            let ft = ExFrameType::from_u8((b[0] >> 4) & 0x07);
-                            ft.is_keyframe()
-                        } else {
-                            VideoTagHeader::parse(b[0]).is_keyframe()
-                        };
-                        // Rewind past the byte we just peeked so the
-                        // tag is fully unread when we either jump out
-                        // or skip past it below.
-                        self.input.seek(SeekFrom::Current(-1))?;
-                        is_kf && (header.timestamp_ms as i64) >= target_pts_ms
-                    }
-                }
-                TagType::Audio if !seeking_video && self.video_stream_index.is_none() => {
-                    // Audio-only: every audio packet is a keyframe.
-                    (header.timestamp_ms as i64) >= target_pts_ms
-                }
-                _ => false,
-            };
-            if want_match {
-                // Rewind to the start of this tag so `next_packet`
-                // re-reads its header on the next call.
-                self.input.seek(SeekFrom::Start(tag_pos))?;
-                return Ok(header.timestamp_ms as i64);
-            }
-            // Skip body + trailing PreviousTagSize and try the next.
-            skip_bytes(&mut *self.input, header.data_size as u64 + 4)?;
+        let p = &mut stream.params;
+        if p.sample_rate != Some(ah.sample_rate_hz())
+            || p.channels != Some(ah.channels())
+            || p.sample_format != Some(fmt)
+        {
+            p.sample_rate = Some(ah.sample_rate_hz());
+            p.channels = Some(ah.channels());
+            p.sample_format = Some(fmt);
+            stats.config_updates += 1;
         }
+    }
+}
+
+/// Video counterpart of [`refresh_audio_stream`].
+fn refresh_video_stream(
+    stream: &mut StreamInfo,
+    key: &mut Option<u32>,
+    body: &[u8],
+    ts: i64,
+    metadata: &[(String, String)],
+    stats: &mut FlvDemuxStats,
+) {
+    let now = video_codec_key(body);
+    if now.is_some() && now != *key {
+        if let Ok(info) = build_video_stream(stream.index, body, metadata) {
+            if key.is_some() {
+                stats.codec_changes += 1;
+            } else {
+                stream.start_time = Some(ts);
+            }
+            stream.params = info.params;
+            *key = now;
+        }
+        return;
+    }
+    if let Some(cfg) = video_config_record(body)
+        && cfg != stream.params.extradata
+    {
+        stream.params.extradata = cfg;
+        stats.config_updates += 1;
     }
 }
 
@@ -914,7 +1757,14 @@ fn build_audio_stream(
     // and AAC always reports 44 kHz regardless of the true rate carried
     // in AudioSpecificConfig — `audiosamplerate` is the producer's
     // declared truth.
-    if let Some(sr) = metadata_lookup_u32(metadata, "audiosamplerate")
+    //
+    // Not so for the formats whose sample layout *is* those header bits
+    // (linear PCM, ADPCM, generic-rate Nellymoser): there the tag header
+    // is the fact, and a disagreeing `onMetaData` is reported under
+    // `flv.conflict.*` instead of being believed.
+    let header_wins = audio_header_is_authoritative(ah.codec_id as u32);
+    if !header_wins
+        && let Some(sr) = metadata_lookup_u32(metadata, "audiosamplerate")
         && sr > 0
     {
         params.sample_rate = Some(sr);
@@ -928,7 +1778,10 @@ fn build_audio_stream(
         ah.codec_id,
         AUDIO_CODEC_NELLYMOSER_8K_MONO | AUDIO_CODEC_NELLYMOSER_16K_MONO | AUDIO_CODEC_SPEEX
     );
-    if !spec_mono && let Some(b) = metadata_lookup_bool(metadata, "stereo") {
+    if !spec_mono
+        && !header_wins
+        && let Some(b) = metadata_lookup_bool(metadata, "stereo")
+    {
         params.channels = Some(if b { 2 } else { 1 });
     }
     // Likewise the `audiosamplerate` override must not move Speex /
@@ -954,7 +1807,7 @@ fn build_audio_stream(
     // 1-bit SoundSize "only pertains to uncompressed formats" (E.4.2.1),
     // so for AAC / MP3 / Speex the onMetaData value is the producer's
     // declared truth.
-    if let Some(fmt) = metadata_audio_sample_format(metadata) {
+    if !header_wins && let Some(fmt) = metadata_audio_sample_format(metadata) {
         params.sample_format = Some(fmt);
     }
     Ok(StreamInfo {
@@ -1077,6 +1930,52 @@ fn build_video_stream(
     })
 }
 
+/// `onMetaData` audio properties → parameters, for a stream that has
+/// no tag of its own yet.
+fn apply_audio_metadata(params: &mut CodecParameters, metadata: &[(String, String)]) {
+    if let Some(sr) = metadata_lookup_u32(metadata, "audiosamplerate")
+        && sr > 0
+    {
+        params.sample_rate = Some(sr);
+    }
+    if let Some(b) = metadata_lookup_bool(metadata, "stereo") {
+        params.channels = Some(if b { 2 } else { 1 });
+    }
+    if let Some(kbps) = metadata_lookup_f64(metadata, "audiodatarate")
+        && kbps.is_finite()
+        && kbps >= 0.0
+    {
+        params.bit_rate = Some((kbps * 1000.0) as u64);
+    }
+    if let Some(fmt) = metadata_audio_sample_format(metadata) {
+        params.sample_format = Some(fmt);
+    }
+}
+
+/// `onMetaData` video properties → parameters, for a stream that has
+/// no tag of its own yet.
+fn apply_video_metadata(params: &mut CodecParameters, metadata: &[(String, String)]) {
+    if let Some(w) = metadata_lookup_u32(metadata, "width") {
+        params.width = Some(w);
+    }
+    if let Some(h) = metadata_lookup_u32(metadata, "height") {
+        params.height = Some(h);
+    }
+    if let Some(fps) = metadata_lookup_f64(metadata, "videoframerate")
+        .or_else(|| metadata_lookup_f64(metadata, "framerate"))
+        && fps.is_finite()
+        && fps > 0.0
+    {
+        params.frame_rate = Some(f64_to_rational(fps));
+    }
+    if let Some(kbps) = metadata_lookup_f64(metadata, "videodatarate")
+        && kbps.is_finite()
+        && kbps >= 0.0
+    {
+        params.bit_rate = Some((kbps * 1000.0) as u64);
+    }
+}
+
 /// Map an AMF Number frame-rate (29.97, 23.976, 60, ...) to a
 /// best-effort Rational. We snap a small set of NTSC-family rates to
 /// their canonical 1001-denominator forms; everything else uses a
@@ -1108,9 +2007,10 @@ fn f64_to_rational(fps: f64) -> Rational {
 /// mean "emit the header packet now and continue the loop after".
 fn build_audio_packet(
     stream: &StreamInfo,
-    hdr: &TagHeader,
+    ts: i64,
     body: &[u8],
-) -> Option<(Packet, Option<Packet>)> {
+    ex: Option<&ExAudioTagHeader>,
+) -> Option<Packet> {
     if body.is_empty() {
         // Enhanced-RTMP-v2 "audio silence message" (§`AudioPacketType`,
         // SequenceStart/SequenceEnd comments): "This silence message is
@@ -1129,12 +2029,12 @@ fn build_audio_packet(
         // decodable media"; `discard` keeps the empty body from reaching
         // a decoder as a frame.
         let mut pkt = Packet::new(stream.index, stream.time_base, Vec::new());
-        pkt.pts = Some(hdr.timestamp_ms as i64);
-        pkt.dts = Some(hdr.timestamp_ms as i64);
+        pkt.pts = Some(ts);
+        pkt.dts = Some(ts);
         pkt.flags.keyframe = true;
         pkt.flags.header = true;
         pkt.flags.discard = true;
-        return Some((pkt, None));
+        return Some(pkt);
     }
     // Enhanced RTMP / E-FLV ExAudioTagHeader path (SoundFormat=9).
     // Map onto the existing Packet semantics:
@@ -1150,7 +2050,7 @@ fn build_audio_packet(
     // inner per-track AudioPacketType and flags the wrapper on
     // `ex.multitrack` (mirrors the video header shape). The default
     // track's body is selected below via `split_tracks`.
-    if let Ok(Some(ex)) = ExAudioTagHeader::parse(body) {
+    if let Some(ex) = ex {
         if ex.packet_type == ExAudioPacketType::SequenceEnd {
             return None;
         }
@@ -1172,8 +2072,8 @@ fn build_audio_packet(
             body[payload_start..].to_vec()
         };
         let mut pkt = Packet::new(stream.index, stream.time_base, data);
-        pkt.pts = Some(hdr.timestamp_ms as i64);
-        pkt.dts = Some(hdr.timestamp_ms as i64);
+        pkt.pts = Some(ts);
+        pkt.dts = Some(ts);
         // Audio: every packet is independently decodable.
         pkt.flags.keyframe = true;
         match ex.packet_type {
@@ -1204,7 +2104,7 @@ fn build_audio_packet(
             }
             ExAudioPacketType::SequenceEnd => unreachable!(),
         }
-        return Some((pkt, None));
+        return Some(pkt);
     }
     let ah = AudioTagHeader::parse(body[0]);
     let payload_offset: usize;
@@ -1235,19 +2135,20 @@ fn build_audio_packet(
     }
     let data = body[payload_offset..].to_vec();
     let mut pkt = Packet::new(stream.index, stream.time_base, data);
-    pkt.pts = Some(hdr.timestamp_ms as i64);
-    pkt.dts = Some(hdr.timestamp_ms as i64);
+    pkt.pts = Some(ts);
+    pkt.dts = Some(ts);
     pkt.flags.keyframe = true; // audio: every packet is independently decodable
     pkt.flags.header = is_header;
-    Some((pkt, None))
+    Some(pkt)
 }
 
 /// Build a packet from a Video tag. Same shape as `build_audio_packet`.
 fn build_video_packet(
     stream: &StreamInfo,
-    hdr: &TagHeader,
+    ts: i64,
     body: &[u8],
-) -> Option<(Packet, Option<Packet>)> {
+    ex: Option<&ExVideoTagHeader>,
+) -> Option<Packet> {
     if body.is_empty() {
         return None;
     }
@@ -1264,7 +2165,7 @@ fn build_video_packet(
     //   PacketType=6 Multitrack     → header+discard (we don't track-split)
     //   PacketType=7 ModEx          → header+discard
     //   FrameType=Command           → discardable command (legacy parity)
-    if let Ok(Some(ex)) = ExVideoTagHeader::parse(body) {
+    if let Some(ex) = ex {
         if matches!(ex.packet_type, ExPacketType::SequenceEnd) {
             return None;
         }
@@ -1315,7 +2216,7 @@ fn build_video_packet(
             // to the seek-sequence boundary.
             body[payload_start..].to_vec()
         };
-        let dts = hdr.timestamp_ms as i64;
+        let dts = ts;
         let pts = dts + mt_cto.unwrap_or(0) as i64;
         let mut pkt = Packet::new(stream.index, stream.time_base, data);
         pkt.pts = Some(pts);
@@ -1348,7 +2249,7 @@ fn build_video_packet(
             pkt.flags.discard = true;
             pkt.flags.keyframe = false;
         }
-        return Some((pkt, None));
+        return Some(pkt);
     }
     let vh = VideoTagHeader::parse(body[0]);
 
@@ -1362,18 +2263,18 @@ fn build_video_packet(
         }
         let cmd_byte = body[1];
         let mut pkt = Packet::new(stream.index, stream.time_base, vec![cmd_byte]);
-        pkt.pts = Some(hdr.timestamp_ms as i64);
-        pkt.dts = Some(hdr.timestamp_ms as i64);
+        pkt.pts = Some(ts);
+        pkt.dts = Some(ts);
         pkt.flags.header = true;
         pkt.flags.discard = true;
         // FrameType=5 is not a random-access point.
         pkt.flags.keyframe = false;
-        return Some((pkt, None));
+        return Some(pkt);
     }
 
     let mut payload_offset: usize = 1;
-    let mut pts = hdr.timestamp_ms as i64;
-    let dts = hdr.timestamp_ms as i64;
+    let mut pts = ts;
+    let dts = ts;
     let mut is_header = false;
 
     if vh.codec_id == VIDEO_CODEC_H264 {
@@ -1418,7 +2319,7 @@ fn build_video_packet(
     pkt.dts = Some(dts);
     pkt.flags.keyframe = vh.is_keyframe();
     pkt.flags.header = is_header;
-    Some((pkt, None))
+    Some(pkt)
 }
 
 /// Build a packet from a filtered (encrypted) tag. The encrypted
@@ -1427,36 +2328,15 @@ fn build_video_packet(
 /// `flags.discard = true` so downstream consumers know not to feed it to
 /// a decoder. Returns `Ok(None)` if the tag is for a stream type we
 /// don't have (e.g. an encrypted video tag in an audio-only file).
-fn build_encrypted_packet(
-    hdr: &TagHeader,
-    body: &[u8],
-    audio_idx: Option<u32>,
-    video_idx: Option<u32>,
-    streams: &[StreamInfo],
-) -> Result<Option<Packet>> {
-    let target_idx = match hdr.kind {
-        Some(TagType::Audio) => audio_idx,
-        Some(TagType::Video) => video_idx,
-        // Script tags are required to be in-clear (F.1 §2.c / F.4) so
-        // an encrypted script tag is itself a spec violation — but we
-        // forward it via the audio stream slot if present, otherwise
-        // skip. This is conservative; the more common interpretation
-        // would be to drop, but losing a "weird" tag silently makes
-        // forensic debugging harder.
-        Some(TagType::ScriptData) | None => return Ok(None),
-    };
-    let Some(idx) = target_idx else {
-        return Ok(None);
-    };
+fn build_encrypted_packet(stream: &StreamInfo, ts: i64, body: &[u8]) -> Result<Option<Packet>> {
     let preamble = EncryptedTagPreamble::parse(body)?;
     if preamble.bytes_consumed > body.len() {
         return Ok(None);
     }
     let cipher = body[preamble.bytes_consumed..].to_vec();
-    let stream = &streams[idx as usize];
     let mut pkt = Packet::new(stream.index, stream.time_base, cipher);
-    pkt.pts = Some(hdr.timestamp_ms as i64);
-    pkt.dts = Some(hdr.timestamp_ms as i64);
+    pkt.pts = Some(ts);
+    pkt.dts = Some(ts);
     pkt.flags.discard = true;
     // For selective encryption with EncryptedAU=0 the bytes are
     // actually plaintext — but we still set discard, because the
@@ -1615,7 +2495,9 @@ fn parse_on_metadata(
                 // Duration is in seconds — convert to microseconds and
                 // store both a string form (for metadata) and the numeric
                 // form (for `duration_micros`).
-                if k == "duration" && duration_micros.is_none() && *n >= 0.0 {
+                // (A duration of 0 is what a writer leaves behind when
+                // it could not come back to fill the real one in.)
+                if k == "duration" && duration_micros.is_none() && *n > 0.0 {
                     let micros = (*n * 1_000_000.0).round();
                     if micros.is_finite() && micros >= 0.0 && micros < i64::MAX as f64 {
                         *duration_micros = Some(micros as i64);
@@ -1624,6 +2506,9 @@ fn parse_on_metadata(
                 metadata.push((k.clone(), format_number(*n)));
             }
             AmfValue::Boolean(b) => metadata.push((k.clone(), b.to_string())),
+            // Blank space a writer reserved so it can grow the
+            // `keyframes` table in place — not information.
+            AmfValue::String(s) if k == "filler" && s.bytes().all(|b| b == b' ') => {}
             AmfValue::String(s) => metadata.push((k.clone(), s.clone())),
             AmfValue::Object(_) | AmfValue::EcmaArray(_) | AmfValue::TypedObject { .. }
                 if k == "keyframes" && keyframe_index.is_none() =>
@@ -2115,52 +3000,6 @@ fn format_number(n: f64) -> String {
     } else {
         format!("{n}")
     }
-}
-
-fn read_u32_be<R: Read + ?Sized>(r: &mut R) -> Result<u32> {
-    let mut b = [0u8; 4];
-    r.read_exact(&mut b)?;
-    Ok(u32::from_be_bytes(b))
-}
-
-/// Read a tag payload of `size` bytes, with a pre-allocation safety
-/// check against the remaining length of the underlying stream.
-///
-/// The FLV `DataSize` field is a UI24 (max 16 777 215). A forged tag
-/// header on a small file (e.g. `data_size = 0xFFFFFF` on a 30-byte
-/// input) would otherwise cause [`Vec::with_capacity`] to commit ~16 MB
-/// before [`Read::read_exact`] fails with `UnexpectedEof`. We probe the
-/// stream's total length once and reject any `data_size` that exceeds
-/// "bytes remaining from current position" — that turns the OOM vector
-/// into an [`Error::InvalidData`] **before** any allocation occurs.
-///
-/// The probe uses [`Seek::stream_position`] + [`Seek::seek(End)`] +
-/// `seek(Start)` rather than `Seek::stream_len` (still unstable). On
-/// streams that don't support seeking-to-end (none of our inputs in
-/// practice — every container demuxer takes `Box<dyn ReadSeek>`) the
-/// probe falls back to "trust the size and let `read_exact` error".
-fn read_body<R: Read + Seek + ?Sized>(r: &mut R, size: u32) -> Result<Vec<u8>> {
-    let needed = size as u64;
-    if let Ok(cur) = r.stream_position()
-        && let Ok(end) = r.seek(SeekFrom::End(0))
-    {
-        // Restore the cursor before erroring or reading.
-        r.seek(SeekFrom::Start(cur))?;
-        let remaining = end.saturating_sub(cur);
-        if needed > remaining {
-            return Err(Error::invalid(format!(
-                "FLV tag: DataSize {needed} exceeds remaining stream bytes {remaining}"
-            )));
-        }
-    }
-    let mut out = vec![0u8; size as usize];
-    r.read_exact(&mut out)?;
-    Ok(out)
-}
-
-fn skip_bytes<R: Seek + ?Sized>(r: &mut R, n: u64) -> Result<()> {
-    r.seek(SeekFrom::Current(n as i64))?;
-    Ok(())
 }
 
 #[cfg(test)]

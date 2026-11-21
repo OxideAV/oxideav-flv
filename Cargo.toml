@@ -9,7 +9,6 @@ authors = ["Mark Karpeles"]
 description = "Pure-Rust Flash Video (FLV) container demuxer for oxideav"
 
 readme = "README.md"
-homepage = "https://github.com/OxideAV/oxideav-flv"
 keywords = ["multimedia", "flv", "flash", "container", "pure-rust"]
 categories = ["multimedia::video", "parser-implementations"]
 

@@ -6,7 +6,7 @@
 //!   `onMetaData.keyframes` toc (`-flvflags add_keyframe_index`). Used
 //!   to exercise the O(log n) bisect path.
 //! * `flv1_3s_with_metadata.flv` — same source, but no `keyframes`
-//!   table. Used to exercise the scan-forward fallback.
+//!   table. Used to exercise the index built while reading.
 //! * `audio_only_2s.flv` — MP3 audio only. Used to exercise the
 //!   audio-only branch of the scan path.
 //!
@@ -136,17 +136,11 @@ fn seek_without_keyframes_table_scans_forward() {
         .map(|s| s.index)
         .expect("flv1 video stream");
     let landed = dmx.seek_to(video_idx, 500).expect("seek_to 500");
-    // Scan path lands at the first keyframe >= target. With -g 5 -r 5
-    // the keyframes are at 0, 1000, ... — so 500 lands at 1000 ms.
-    assert!(
-        landed >= 500,
-        "scan-forward seek should land at-or-after target, got {landed}"
-    );
+    // With -g 5 -r 5 the key frames are at 0, 1000, ... — the last one
+    // at or before 500 ms is the one at 0.
+    assert_eq!(landed, 0, "seek lands on the key frame at or before target");
     let (_idx, pts, key) = first_data_packet(&mut *dmx).expect("packet after seek");
-    assert!(
-        key,
-        "first packet after scan-forward seek must be a keyframe"
-    );
+    assert!(key, "first packet after an index seek must be a keyframe");
     assert_eq!(pts, landed, "first packet pts must match landed pts");
 }
 
@@ -157,18 +151,17 @@ fn seek_in_audio_only_flv_returns_unsupported_or_audio_position() {
     assert_eq!(dmx.streams().len(), 1);
     assert_eq!(dmx.streams()[0].params.codec_id.as_str(), "mp3");
     let audio_idx = dmx.streams()[0].index;
-    // Seek 500 ms in. The scan path will land at the first audio
-    // packet ≥ 500 ms (every audio packet is independently decodable).
-    let landed = dmx
-        .seek_to(audio_idx, 500)
-        .expect("audio seek should succeed via scan path");
+    // Seek 500 ms in: every audio tag is a sync point, so the landing
+    // point is the last audio tag starting at or before 500 ms — within
+    // one MP3 frame (< 50 ms at any FLV-representable rate) of it.
+    let landed = dmx.seek_to(audio_idx, 500).expect("audio seek");
     assert!(
-        landed >= 500,
-        "audio seek should land at-or-after target 500, got {landed}"
+        (450..=500).contains(&landed),
+        "audio seek should land just at or before 500, got {landed}"
     );
     let (idx, pts, _key) = first_data_packet(&mut *dmx).expect("audio packet after seek");
     assert_eq!(idx, audio_idx);
-    assert!(pts >= 500, "first audio packet pts {pts} should be >= 500");
+    assert_eq!(pts, landed);
 }
 
 #[test]

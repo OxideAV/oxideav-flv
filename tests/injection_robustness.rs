@@ -186,17 +186,18 @@ fn data_size_one_byte_past_eof_rejected() {
 // ---- truncated trailer ----------------------------------------------------
 
 #[test]
-fn truncated_previous_tag_size_errors_cleanly() {
+fn missing_final_previous_tag_size_still_yields_the_tag() {
     // Valid tag, valid body, but the trailing 4-byte `PreviousTagSize`
-    // is missing. `read_u32_be` on the trailer must surface
-    // `UnexpectedEof` (mapped to `Error::Io`), not panic.
+    // is missing (a capture stopped right after the tag). The tag is
+    // complete, so it is delivered; the stream then ends normally.
     let body = [0x14u8, 0x00, 0x42];
     let tag = tag_with_forged_size(0x09, 0, &body, body.len() as u32);
     let mut bytes = flv_preamble(0x05);
     bytes.extend_from_slice(&tag);
     // intentionally no trailer
-    let (_, r) = drain(bytes);
-    assert!(r.is_err(), "missing trailer must error cleanly");
+    let (count, r) = drain(bytes);
+    assert!(r.is_ok(), "a complete final tag must not error, got {r:?}");
+    assert_eq!(count, 1);
 }
 
 // ---- malformed script data ------------------------------------------------
@@ -328,9 +329,12 @@ fn zero_length_audio_tag_is_skipped_not_panic() {
 // ---- mid-stream truncation -----------------------------------------------
 
 #[test]
-fn mid_tag_truncation_after_discovery_errors_cleanly() {
-    // Build a file with two valid tags + a third whose 11-byte header
-    // is fully present but whose body is truncated to one byte.
+fn mid_tag_truncation_ends_at_last_complete_tag() {
+    // Two valid tags + a third whose 11-byte header is fully present
+    // but whose body is cut to one byte (an interrupted download or a
+    // recording still in progress). Every complete tag is delivered,
+    // the stream ends with `Eof`, and the demuxer reports that it
+    // stopped inside a tag.
     let audio = tag_with_forged_size(0x08, 0, &[0x2F, 0x00, 0x00], 3);
     let video = tag_with_forged_size(0x09, 0, &[0x14, 0x00, 0x42], 3);
     let forged_third = tag_with_forged_size(0x09, 10, &[0x14], 5); // claims 5, only 1 follows
@@ -342,8 +346,13 @@ fn mid_tag_truncation_after_discovery_errors_cleanly() {
     bytes.extend_from_slice(&(video.len() as u32).to_be_bytes());
     bytes.extend_from_slice(&forged_third);
     // no trailer — body itself is already truncated
-    let (_count, r) = drain(bytes);
-    assert!(r.is_err(), "mid-stream truncation must error on read");
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
+    let mut dmx = oxideav_flv::open_demuxer_concrete(input, &NullCodecResolver).unwrap();
+    use oxideav_core::Demuxer;
+    assert!(dmx.next_packet().is_ok());
+    assert!(dmx.next_packet().is_ok());
+    assert!(matches!(dmx.next_packet(), Err(Error::Eof)));
+    assert!(dmx.stats().ended_mid_tag);
 }
 
 // ---- repeated tags-with-zero-size do not loop forever ---------------------
