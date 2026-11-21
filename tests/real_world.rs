@@ -969,3 +969,29 @@ fn script_tags_cannot_overflow_grow_without_bound_or_exhaust_the_stack() {
             .any(|(k, _)| k == "cuepoint.4294967295.k")
     );
 }
+
+#[test]
+fn scan_to_end_is_opt_in_and_gives_duration_and_a_full_index() {
+    let (bytes, kfs) = av_file(30, 30, None);
+    let total = drain(&mut open(bytes.clone())).len();
+    let mut d = open(bytes);
+    for _ in 0..10 {
+        d.next_packet().unwrap();
+    }
+    assert_eq!(d.duration_micros(), None);
+    assert!(d.indexed_sync_points() <= 1);
+    let last = d.scan_to_end().unwrap().unwrap();
+    assert!((29_950..30_000).contains(&last), "{last}");
+    assert_eq!(d.duration_micros(), Some(last * 1000));
+    assert_eq!(d.indexed_sync_points(), kfs.len());
+    // Reading carries on from where it was.
+    assert_eq!(drain(&mut d).len(), total - 10);
+    // A second scan has nothing left to walk and changes nothing.
+    assert_eq!(d.scan_to_end().unwrap(), Some(last));
+
+    // A declared duration is left alone.
+    let (bytes, _) = av_file(5, 30, Some(MetadataBag::new().number("duration", 77.0)));
+    let mut d = open(bytes);
+    d.scan_to_end().unwrap();
+    assert_eq!(d.duration_micros(), Some(77_000_000));
+}

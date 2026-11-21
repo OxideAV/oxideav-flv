@@ -1001,6 +1001,57 @@ mod tests {
         }
     }
 
+    /// The Ex framing bytes assembled by hand in `write_packet` /
+    /// `put_config` are the ones the crate's own header serialisers
+    /// produce.
+    #[test]
+    fn ex_prefixes_match_the_header_serialisers() {
+        use crate::ex_audio::{ExAudioPacketType, ExAudioTagHeader};
+        use crate::ex_video::{ExFrameType, ExPacketType, ExVideoTagHeader};
+        let f = FOURCC_HVC1.to_be_bytes();
+        let ser = |h: ExVideoTagHeader| {
+            let mut v = Vec::new();
+            h.to_bytes(&mut v).unwrap();
+            v
+        };
+        let base = |ft, pt| ExVideoTagHeader::new(ft, pt).with_fourcc(Some(FOURCC_HVC1));
+        assert_eq!(
+            ser(base(ExFrameType::KeyFrame, ExPacketType::SequenceStart)),
+            [EX_HEADER_FLAG | 0x10, f[0], f[1], f[2], f[3]]
+        );
+        assert_eq!(
+            ser(base(ExFrameType::InterFrame, ExPacketType::CodedFramesX)),
+            [EX_HEADER_FLAG | 0x20 | 3, f[0], f[1], f[2], f[3]]
+        );
+        let c = (-80i32 as u32).to_be_bytes();
+        assert_eq!(
+            ser(base(ExFrameType::KeyFrame, ExPacketType::CodedFrames)
+                .with_composition_time_offset_ms(Some(-80))),
+            [
+                EX_HEADER_FLAG | 0x10 | 1,
+                f[0],
+                f[1],
+                f[2],
+                f[3],
+                c[1],
+                c[2],
+                c[3]
+            ]
+        );
+        let a = FOURCC_OPUS.to_be_bytes();
+        for (pt, lead) in [
+            (ExAudioPacketType::SequenceStart, 0x90u8),
+            (ExAudioPacketType::CodedFrames, 0x91),
+        ] {
+            let mut v = Vec::new();
+            ExAudioTagHeader::new(pt)
+                .with_fourcc(Some(FOURCC_OPUS))
+                .to_bytes(&mut v)
+                .unwrap();
+            assert_eq!(v, [lead, a[0], a[1], a[2], a[3]]);
+        }
+    }
+
     #[test]
     fn sound_rate_index_accepts_nominal_rates() {
         assert_eq!(sound_rate_index(44_100), Some(3));

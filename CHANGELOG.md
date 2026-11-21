@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `FlvDemuxer::scan_to_end()`: the opt-in single pass over tag headers
+  that `open` never makes — indexes every sync point and, for a file
+  that declares no duration, derives one from the last media tag.
+
 - Scheduled `Fuzz` workflow (daily, 30 minutes) and two structured fuzz
   targets: `demux_seek` (tag-structured files with fuzz-controlled
   bodies, forged sizes, wrong back-pointers, raw injections and

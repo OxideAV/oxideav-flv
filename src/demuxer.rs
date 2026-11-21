@@ -322,6 +322,7 @@ pub fn open_concrete(
         last_mod_ex: None,
         embedded_images,
         stats: FlvDemuxStats::default(),
+        duration_is_scanned: false,
     })
 }
 
@@ -934,6 +935,9 @@ pub struct FlvDemuxer {
     /// case of a file with no embedded images.
     embedded_images: Vec<EmbeddedImage>,
     stats: FlvDemuxStats,
+    /// The duration came from [`FlvDemuxer::scan_to_end`], not from the
+    /// file, and is refreshed by the next scan.
+    duration_is_scanned: bool,
 }
 
 /// An embedded image harvested from an `onImageData` script tag
@@ -1096,6 +1100,40 @@ impl FlvDemuxer {
     /// seeks that had to look ahead; it is capped at 65 536 entries.
     pub fn indexed_sync_points(&self) -> usize {
         self.index.entries.len()
+    }
+
+    /// Walk the rest of the file once — tag headers only, payloads are
+    /// skipped — to index every sync point and learn where the stream
+    /// ends. `open` never does this on its own; call it when a complete
+    /// index or a duration is worth one pass over the file (a capture
+    /// that was never finalised, a file without `onMetaData`).
+    ///
+    /// Returns the timestamp of the last complete media tag in
+    /// milliseconds (`None` when there is none). If the file declared
+    /// no duration, [`Demuxer::duration_micros`] afterwards reports the
+    /// span from the first media tag to that one. The read position is
+    /// unchanged; on a file that is still growing the call can be
+    /// repeated and only walks the new part.
+    pub fn scan_to_end(&mut self) -> Result<Option<i64>> {
+        let resume = self.reader.position();
+        self.reader.seek(self.index.scanned_to)?;
+        let walked = self.walk_to(self.index.clock, i64::MAX);
+        self.reader.seek(resume)?;
+        walked?;
+        let Clock::At { ext: last, .. } = self.index.clock else {
+            return Ok(None);
+        };
+        if self.duration_micros.is_none() || self.duration_is_scanned {
+            let first = self
+                .streams
+                .iter()
+                .filter_map(|s| s.start_time)
+                .min()
+                .unwrap_or(0);
+            self.duration_micros = Some((last - first).max(0).saturating_mul(1000));
+            self.duration_is_scanned = true;
+        }
+        Ok(Some(last))
     }
 
     /// Step the timeline for a tag read at the cursor and keep the

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/OxideAV/oxideav-flv/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-flv/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-flv.svg)](https://crates.io/crates/oxideav-flv) [![docs.rs](https://docs.rs/oxideav-flv/badge.svg)](https://docs.rs/oxideav-flv) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Pure-Rust **Flash Video (FLV)** container demuxer for oxideav. Zero C
+Pure-Rust **Flash Video (FLV)** container demuxer and muxer for oxideav. Zero C
 dependencies, no FFI, no `*-sys` crates.
 
 Part of the [oxideav](https://github.com/OxideAV/oxideav-workspace)
@@ -87,9 +87,9 @@ oxideav-flv = "0.0"
     under `scriptdata.<name>`, composite values fan out with
     `.<subkey>` / `[i]` suffixes, so the producer's full argument
     structure reaches callers instead of being silently dropped.
-- `Demuxer::seek_to` — bisects the `keyframes` toc when present,
-  otherwise scans tags forward to the first video keyframe (or audio
-  packet, for audio-only files) at-or-after the requested pts.
+- `Demuxer::seek_to` — lands on the last sync point (coded video key
+  frame, or audio tag of an audio-only file) **at or before** the
+  requested pts; see "Real-world streams and seeking" below.
 - AMF0 `Reference` (marker `0x07`, spec E.4.4.2 type 7) preserved as
   `AmfValue::Reference(u16)`. AMF0 `Unsupported` (`0x0D`, spec §2.15) /
   `XMLDocument` (`0x0F`, §2.17) / `TypedObject` (`0x10`, §2.18) parse
@@ -241,8 +241,9 @@ oxideav-flv = "0.0"
     spec additions don't need parser changes. When `packet_type ==
     Metadata` the spec says `frameType` is ignored — no command byte
     is read and the trailing bytes remain the AMF metadata payload.
-  - Seek scan-forward path recognises Ex keyframes via the same
-    FrameType bit field.
+  - Seeking recognises Ex key frames via the same FrameType bit field
+    (`CodedFrames` / `CodedFramesX` only — a `SequenceStart` is not a
+    seek target).
 - Enhanced RTMP audio (E-FLV ExAudioTagHeader, Veovera
   `enhanced-rtmp-v2` §"Enhanced Audio"):
   - SoundFormat=9 (ExHeader) flags an audio tag as FourCC-coded. The
@@ -467,6 +468,75 @@ mirroring the encoder's "omit an all-absent group" convention — so a
 reset sentinel and an all-malformed frame both rebuild to
 `ColorInfo::default()`.
 
+### Real-world streams and seeking
+
+`open` reads the file header and then at most 256 tags / 4 MiB — enough
+for the first audio tag, the first video tag, their configuration
+records (also when those follow the first frames) and the script tags
+in front of them. It never asks the input how long it is and never
+scans for a duration or an index, so a live capture or a multi-gigabyte
+file opens in two `read` calls. `FlvDemuxer::scan_to_end()` is the
+opt-in single pass (tag headers only) that indexes every sync point and
+derives a duration for a file that declares none.
+
+| Situation | Behaviour |
+| --- | --- |
+| File cut inside a tag | Every complete tag is delivered, then `Eof`; `stats().ended_mid_tag` is set. |
+| File still being written | `next_packet` stops with `Eof` at the last complete tag and continues from there on the next call once more bytes exist; seeks see key frames as they arrive. |
+| No duration / no seek table | `duration_micros()` is `None`; seeking uses an index built as a by-product of reading (capped at 65 536 entries). |
+| Wrong `PreviousTagSize` | Never used for navigation; counted in `stats().previous_tag_size_mismatches`. |
+| Timestamp wrap | The 24 + 8-bit wire value is carried onto a 64-bit timeline, across the 32-bit wrap (49.7 days) and across a 24-bit wrap by writers that leave `TimestampExtended` at 0; `stats().timestamp_wraps`. |
+| Timestamp discontinuity | Packet times follow the stream; `stats().timestamp_discontinuities` counts steps of more than 1 s back or 10 s forward. Script tags (conventionally stamped 0) do not move the clock. |
+| `onMetaData` contradicts the tags | The tags win. Each disagreement is listed in `metadata()` as `flv.conflict.<what> = "declared=… stream=…"` (`audiocodecid`, `videocodecid`, `header_flags`, and for linear PCM / ADPCM / Nellymoser `audiosamplerate`, `audiosamplesize`, `stereo`). |
+| Sequence header late or changed | The stream's `extradata` is updated and the record is emitted as a `header` packet; `stats().config_updates`. A mid-stream codec switch rebuilds the stream parameters (`stats().codec_changes`). |
+| Stream starts beyond the discovery window | If the header flag and `audiocodecid` / `videocodecid` declare it, the stream exists from `open` (parameters from `onMetaData`) and is completed by its first tag; otherwise its tags are dropped and counted. |
+| Zero-length tags | Empty audio tag → the silence signal (zero-length `header` + `discard` packet); empty video / script tags and frame tags holding only framing bytes → skipped. |
+| Unknown tag types | Skipped by `DataSize`; `stats().unknown_tags_skipped`. |
+| Hostile script data | AMF nesting limited to 64 levels, AMF3 reference expansion to 64 MiB per value, the metadata bag to 65 536 entries. |
+
+Stream parameters come from the tag headers, sequence headers and
+`onMetaData` only — no codec payload is parsed. Consequently an AAC
+stream's rate / channels are those `onMetaData` declares (the tag
+header bits are fixed at 44 kHz stereo by the specification) and video
+dimensions are `onMetaData`'s `width` / `height`.
+
+`seek_to(stream, pts)` returns the timestamp of the last sync point at
+or before `pts` (the first one when `pts` precedes it, the last one when
+`pts` is past the end) and the next packet read is that tag.
+
+* With an `onMetaData` `keyframes` table: bisection, then a check that
+  the entry really is a key-frame tag at the stated time (a wrong table
+  is dropped, `stats().keyframe_table_rejected`), then a short forward
+  walk so a table that lists only some key frames still gives the exact
+  answer.
+* Without one: bisection in the index for targets inside the part
+  already read; a header-only forward walk from the furthest point seen
+  for targets beyond it, remembering every sync point passed.
+
+`Demuxer::set_active_streams` steps over the other streams' tags
+without copying their payloads.
+
+### Performance
+
+`cargo bench --bench long_file` synthesises a one-hour file (30 fps
+video with a key frame every 2 s + 43 audio tags/s: 263 040 media tags,
+95 MB) and reads / writes it through an unbuffered `File`. Medians of
+five runs each (three invocations, Apple M-series, other builds running
+on the machine):
+
+| Measure | Before | After |
+| --- | --- | --- |
+| Demux, full drain | 0.48 M packets/s | 16.3 M packets/s |
+| I/O per packet | 4 `read` + 3 `seek` calls | 0.01 `read`, 0 `seek` |
+| Allocations per packet | 2 (tag body + payload copy) | 1 (the packet payload) |
+| `open` | 13 µs, 14 `read` + 14 `seek` calls | 8 µs, 2 `read` + 1 `seek` |
+| Seek + first packet, no keyframe table (32 spread targets) | median 183 ms, worst 399 ms | median 5 µs; 2.6 ms for the first far seek (walks 40 MB of headers once) |
+| Seek + first packet, `onMetaData` keyframes | median 4 µs | median 5 µs (now verified against the file) |
+| Seek lands | first key frame at or after the target (no table) | last key frame at or before it |
+| Full index + duration of an unindexed file | — | 6.4 ms (`scan_to_end`) |
+| Mux | no `Muxer`; bare tag writers into a `BufWriter`: 4.5 M tags/s, one allocation per AVC / AAC tag | `FlvMuxer` into an unbuffered `File`: 15.0 M packets/s, 0 allocations per packet, 65 KiB peak heap |
+| Peak heap while demuxing the hour | 10 KiB (+ per-tag buffers) | 103 KiB (the 64 KiB window + index) |
+
 ### Robustness
 
 The demuxer is fuzz-shaped by a hand-crafted adversarial-input suite
@@ -479,12 +549,24 @@ truncated preamble, zero-length tags, and mid-stream truncation. The
 guarantee is "never panics, never allocates a gigabyte, never spins
 forever; either errors cleanly with `Error::InvalidData` / `Eof` / `Io`,
 or degrades to a stream that terminates on the first `next_packet()`."
-A pre-allocation guard in `read_body` rejects any tag whose `DataSize`
-exceeds the remaining bytes of the underlying `Read + Seek` stream
-*before* committing the `Vec`.
+The read window grows only when it is already full of bytes that were
+really read, so a forged 16 MiB `DataSize` in a short file allocates
+nothing; a tag that extends past the end of the input is "not there
+yet" and ends the stream cleanly.
 
 A `fuzz/` sub-crate (cargo-fuzz / libfuzzer) backs the hand-crafted
-suite with six targets:
+suite with eight targets, run daily by the `Fuzz` workflow:
+
+* `demux_seek` — tag-structured input: each record of the recipe
+  becomes a well-formed tag whose body is fuzz bytes (so the AMF,
+  Ex-header, ModEx, multitrack and encryption parsers are reached
+  directly), with opcodes for a forged `DataSize`, a wrong
+  `PreviousTagSize`, raw injected bytes and truncation; the file is
+  driven through `open`, `next_packet`, `seek_to` and
+  `set_active_streams`.
+* `mux_roundtrip` — fuzz-chosen codecs, muxer options and packets
+  through `FlvMuxer` and back through `FlvDemuxer`; packets, stream
+  facts, stats and seek landing points must agree.
 
 * `demuxer_open_next` — arbitrary bytes through `open_demuxer` and
   drain `next_packet` until error or EOF, with a per-iteration step
@@ -519,7 +601,60 @@ build is unaffected; `Cargo.lock` is gitignored.
 
 ### Muxer
 
-The muxer writes a playable FLV that round-trips bit-exactly back
+`FlvMuxer` (`open_muxer`, registered as the `flv` muxer) is the
+streaming `oxideav_core::Muxer`:
+
+```rust
+use oxideav_core::{Muxer, WriteSeek};
+use oxideav_flv::{FlvMuxerOptions, open_muxer_with_options};
+# fn demo(streams: &[oxideav_core::StreamInfo], packets: &[oxideav_core::Packet]) -> oxideav_core::Result<()> {
+let out: Box<dyn WriteSeek> = Box::new(std::fs::File::create("out.flv")?);
+let mut mux = open_muxer_with_options(
+    out,
+    streams, // at most one audio + one video stream
+    FlvMuxerOptions::new().with_keyframe_index(1800),
+)?;
+mux.write_header()?;
+for p in packets {
+    mux.write_packet(p)?;
+}
+mux.write_trailer()?;
+# Ok(())
+# }
+```
+
+* Each packet is written as one tag when it arrives — tag header and
+  codec framing assembled on the stack, small tags coalesced in a
+  64 KiB buffer, payloads of 32 KiB or more handed to the sink uncopied.
+  Nothing is buffered across packets.
+* `onMetaData` is written first with fixed-width placeholders;
+  `write_trailer` seeks back and fills in `duration`, `filesize`, the
+  measured data rates (when the streams declared none), the header's
+  audio / video flags (if a stream stayed empty) and, with
+  `with_keyframe_index(n)`, an `n`-entry `keyframes` table (thinned
+  evenly when the stream has more key frames). A sink that cannot seek
+  keeps the placeholders — duration 0, read back as "unknown" — and
+  still holds a valid stream; `with_finalize(false)` asks for that.
+* Codec carriage: `mp3`, `aac`, `pcm_s16le` / `pcm_u8`, `adpcm_swf`,
+  `nellymoser`, `pcm_alaw`, `pcm_mulaw`, `speex`, `flv1`, `flashsv`,
+  `flashsv2`, `vp6f`, `vp6a`, `h264` as legacy tags; `h265`, `h266`,
+  `av1`, `vp9`, `vp8`, `opus`, `flac`, `ac3`, `eac3` as Enhanced-RTMP
+  FourCC tags. `extradata` and `header`-flagged packets become sequence
+  headers (a record equal to the one in force is not repeated);
+  `pts − dts` becomes the composition time. Parameters the tag header
+  cannot express (48 kHz PCM, more than two legacy channels, a second
+  video stream) are refused with `Error::Unsupported` at open.
+* Text metadata: `Muxer::set_metadata` stores every plain key that the
+  muxer does not derive itself as an `onMetaData` string property.
+
+`tests/crosscheck.rs` checks both directions against a black-box
+reader / writer (`ffprobe` / `ffmpeg`, skipped at run time when absent)
+for ten codec pairs, legacy and FourCC: their files open here with the
+same stream facts and packet counts, and our remux of them reports the
+same there, with a duration within a frame and a decodable seek.
+
+The individual tag writers the muxer is built from are public too. They
+write a playable FLV that round-trips bit-exactly back
 through `FlvDemuxer`. The legacy write surface is complete: every
 SoundFormat the demuxer reads (PCM 0/3, ADPCM 1, Nellymoser 4/5/6,
 G.711 7/8, MP3 2/14, AAC 10, Speex 11) and every legacy CodecID (H.263,
@@ -607,7 +742,7 @@ Insertion order is preserved on the wire so the output is deterministic. The
 the read side (non-empty, parallel-length, ascending finite `times`,
 `filepositions` ≤ `2^53` so they survive the AMF0 Number round-trip)
 and round-trips through `FlvDemuxer::seek_to` via the O(log n) bisect
-path rather than the scan-forward fallback. Producers that need
+path rather than the built-while-reading index. Producers that need
 correct offsets in the toc typically reserve a fixed-size `onMetaData`
 slot up front, mux the body to learn the keyframe positions, and
 rewrite the slot in-place with the populated toc — the writer is

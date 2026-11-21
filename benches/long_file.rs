@@ -9,8 +9,9 @@
 //! * open time + the number of bytes / read calls / seek calls `open`
 //!   issues against the underlying file;
 //! * demux packets/s (full drain) from an unbuffered `File`;
-//! * seek latency (median / worst of 32 spread targets) with and
-//!   without an `onMetaData` keyframe table;
+//! * the opt-in `scan_to_end` pass, and seek latency (median / worst
+//!   of 32 spread targets) with and without an `onMetaData` keyframe
+//!   table;
 //! * peak heap during open + drain (counting global allocator).
 //!
 //! Every figure is the median of `RUNS` runs. Run with
@@ -354,6 +355,19 @@ fn bench_read(label: &str, path: &Path) {
         allocs as f64 / count as f64,
         io.0 as f64 / count as f64,
         io.1 as f64 / count as f64,
+    );
+    // opt-in full scan (headers only)
+    let mut scan = Vec::new();
+    for _ in 0..RUNS {
+        let input: Box<dyn ReadSeek> = Box::new(File::open(path).unwrap());
+        let mut d = oxideav_flv::open_demuxer_concrete(input, &NullCodecResolver).unwrap();
+        let t = Instant::now();
+        std::hint::black_box(d.scan_to_end().unwrap());
+        scan.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    println!(
+        "[{label}] scan_to_end (index + duration): {:.1} ms (median of {RUNS})",
+        median(scan)
     );
     // seek: 32 targets spread over the hour, visited in a scrambled order.
     let (mut d, _, _) = open_counted(path);
