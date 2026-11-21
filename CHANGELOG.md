@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-flv/compare/v0.0.6...v0.0.7) - 2026-11-21
+
+### Other
+
+- scan_to_end (opt-in full index + duration), README: real-world behaviour, seeking, before/after numbers
+- scheduled workflow, tag-structured demux_seek and mux_roundtrip targets, harness fixes
+- Harden script-data parsing; coded-key-frame sync points; black-box cross-check
+- streaming FlvMuxer on the registry, in-place onMetaData finalisation, long-file bench
+- windowed reader, bounded open, at-or-before seeking, 64-bit timeline, stream-health stats
+- API hygiene: non_exhaustive E-RTMP enums + tag/script records
+
 ### Added
 
 - `FlvDemuxer::scan_to_end()`: the opt-in single pass over tag headers
