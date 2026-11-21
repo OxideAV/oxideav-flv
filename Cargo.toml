@@ -6,7 +6,7 @@ rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-flv"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust Flash Video (FLV) container demuxer for oxideav"
+description = "Pure-Rust Flash Video (FLV) container demuxer and muxer for oxideav"
 
 readme = "README.md"
 keywords = ["multimedia", "flv", "flash", "container", "pure-rust"]
@@ -14,3 +14,7 @@ categories = ["multimedia::video", "parser-implementations"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[[bench]]
+name = "long_file"
+harness = false

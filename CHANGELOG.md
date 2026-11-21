@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `FlvMuxer` — a streaming `oxideav_core::Muxer`, registered as the
+  `flv` muxer (`open_muxer`, `open_muxer_concrete`,
+  `open_muxer_with_options` + `FlvMuxerOptions`). Each packet is written
+  as one tag as it arrives (64 KiB coalescing buffer, no per-packet
+  allocation, large payloads handed to the sink uncopied); the trailer
+  rewrites `onMetaData` `duration` / `filesize` / measured data rates
+  in place when the sink can seek and leaves valid placeholders when it
+  cannot. Carries the legacy audio / video codecs, AVC + AAC with
+  sequence headers and composition time, and the Enhanced-RTMP FourCC
+  codecs (`h265`, `h266`, `av1`, `vp9`, `vp8`, `opus`, `flac`, `ac3`,
+  `eac3`); mid-stream configuration changes become new sequence
+  headers; text metadata through `Muxer::set_metadata`.
+- `FlvMuxerOptions::with_keyframe_index(n)` reserves an
+  `onMetaData.keyframes` table of `n` entries that the trailer fills in
+  place (thinned evenly when the stream has more key frames).
+- `benches/long_file.rs`: one-hour synthetic file — open cost, demux
+  packets/s, seek latency, mux packets/s, peak heap and I/O calls.
+
 - Demuxer: `FlvDemuxer::stats()` → `FlvDemuxStats` (wrong
   `PreviousTagSize` fields, timestamp wraps and discontinuities, unknown
   tag types skipped, late / changed configuration records, mid-stream

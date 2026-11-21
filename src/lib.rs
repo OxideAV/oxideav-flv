@@ -1,4 +1,4 @@
-//! Pure-Rust Flash Video (FLV) container demuxer.
+//! Pure-Rust Flash Video (FLV) container demuxer and muxer.
 //!
 //! Reference: Adobe *Video File Format Specification* version 10
 //! (2008). The crate parses the 9-byte FLV header and the `FLV tag`
@@ -7,8 +7,9 @@
 //! metadata (duration, width, height, codec ids) and consumed
 //! internally.
 //!
-//! See the crate README for the supported codec map. A muxer slice
-//! is also provided: [`header::write`] emits the file header,
+//! See the crate README for the supported codec map. [`FlvMuxer`]
+//! ([`open_muxer`]) is the streaming [`oxideav_core::Muxer`]; the
+//! individual tag writers it is built from are public too: [`header::write`] emits the file header,
 //! [`tag::write_tag`] / [`tag::write_mp3_tag`] / [`tag::write_aac_raw_tag`]
 //! / [`tag::write_aac_sequence_header`]
 //! write audio tags, [`tag::write_h263_tag`] / [`tag::write_vp6_tag`] /
@@ -34,6 +35,7 @@ pub mod header;
 pub mod mod_ex;
 pub mod multichannel;
 pub mod multitrack;
+pub mod muxer;
 pub mod on_status;
 mod reader;
 pub mod script;
@@ -68,6 +70,10 @@ pub use mod_ex::{ModExEntry, ModExPayload};
 pub use multichannel::{AudioChannel, AudioChannelOrder, MultichannelConfig, mask_channel_labels};
 pub use multitrack::{
     JoinTrack, MultitrackPacketTrack, MultitrackTrack, join_tracks, split_tracks,
+};
+pub use muxer::{
+    FlvMuxer, FlvMuxerOptions, open as open_muxer, open_concrete as open_muxer_concrete,
+    open_with_options as open_muxer_with_options,
 };
 pub use on_status::{
     CODE_RECONNECT_REQUEST, COMMAND_NAME, LEVEL_STATUS, OnStatusInfo, parse_on_status_command,
@@ -104,10 +110,11 @@ pub use typed_meta::{
     TrackInfoIter, TypedAudioTrackInfo, TypedColorInfo, TypedMetadata, TypedVideoTrackInfo,
 };
 
-/// Register the demuxer, its probe, and the `.flv` extension with a
-/// [`ContainerRegistry`].
+/// Register the demuxer, the muxer, the probe, and the `.flv` extension
+/// with a [`ContainerRegistry`].
 pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_demuxer("flv", demuxer::open);
+    reg.register_muxer("flv", muxer::open);
     reg.register_extension("flv", "flv");
     reg.register_probe("flv", probe);
 }
