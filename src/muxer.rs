@@ -10,8 +10,9 @@
 //! length-independent fields are fixed-width AMF numbers. When the
 //! stream ends, [`Muxer::write_trailer`] seeks back and overwrites the
 //! ones that could not be known up front — `duration`, `filesize`, the
-//! measured data rates and, when asked for, the `keyframes` table — and
-//! returns to the end of the file. If the sink cannot seek, the trailer
+//! measured data rates and, when asked for, the `keyframes` table (plus
+//! the header's audio / video flags, should a stream have stayed
+//! empty) — and returns to the end of the file. If the sink cannot seek, the trailer
 //! leaves the placeholders (a duration of 0, i.e. "unknown / live") and
 //! still succeeds: the file is a valid stream either way.
 //!
@@ -49,6 +50,9 @@ use crate::tag::{
 /// to the sink.
 const BUFFER: usize = 64 * 1024;
 
+/// Upper bound on the reserved keyframe table (65 KiB of file).
+const MAX_KEYFRAME_ENTRIES: usize = 3_600;
+
 /// Largest tag payload (`DataSize` is a UI24).
 const MAX_DATA_SIZE: usize = 0x00FF_FFFF;
 
@@ -82,12 +86,13 @@ impl FlvMuxerOptions {
     }
 
     /// Reserve room for `capacity` keyframe-table entries (capped at
-    /// 100 000). When the stream has more key frames than that, an
+    /// 3 600 — two hours at one key frame every two seconds). When the
+    /// stream has more key frames than that, an
     /// evenly thinned subset is written; readers that walk forward from
     /// the nearest listed key frame (as [`crate::FlvDemuxer`] does)
     /// still seek exactly.
     pub fn with_keyframe_index(mut self, capacity: usize) -> Self {
-        self.keyframe_index_capacity = capacity.min(100_000);
+        self.keyframe_index_capacity = capacity.min(MAX_KEYFRAME_ENTRIES);
         self
     }
 
@@ -278,6 +283,8 @@ struct Track {
     config: Vec<u8>,
     /// Payload bytes written (for the measured data rate).
     bytes: u64,
+    /// Tags written for this stream (frames and sequence headers).
+    tags: u64,
     /// Declared bit rate, when the stream came with one.
     declared_bit_rate: Option<u64>,
 }
@@ -410,6 +417,7 @@ pub fn open_with_options(
             carriage,
             config: Vec::new(),
             bytes: 0,
+            tags: 0,
             declared_bit_rate: s.params.bit_rate,
         });
     }
@@ -475,19 +483,25 @@ fn amf_string(out: &mut Vec<u8>, key: &str, v: &str) {
     out.extend_from_slice(v.as_bytes());
 }
 
-/// Bytes of the `keyframes` object for `n` entries, without filler.
-fn keyframes_object_len(n: usize) -> usize {
+/// Bytes of the reserved region for `n` entries: the `keyframes`
+/// object plus the end marker of the enclosing array.
+fn keyframes_region_len(n: usize) -> usize {
     // key + Object marker, two (key + StrictArray marker + count + n
-    // Numbers), object end.
-    (2 + 9 + 1) + (2 + 13 + 1 + 4 + 9 * n) + (2 + 5 + 1 + 4 + 9 * n) + 3
+    // Numbers), object end, array end.
+    (2 + 9 + 1) + (2 + 13 + 1 + 4 + 9 * n) + (2 + 5 + 1 + 4 + 9 * n) + 3 + 3
 }
 
-/// Bytes of the filler property with an empty value.
-const FILLER_OVERHEAD: usize = 2 + 6 + 1 + 4;
-
-/// The reserved region: the `keyframes` object for `entries` followed
-/// by a `filler` long-string property padding it to exactly `region`
-/// bytes.
+/// The reserved tail of the `onMetaData` body: the `keyframes` object
+/// for `entries`, the end marker of the enclosing array, and zero bytes
+/// up to exactly `region` bytes.
+///
+/// The unused part sits *after* the value's end marker, inside the
+/// tag's `DataSize`: a reader that parses the name and the value never
+/// looks at it. It is a multiple of nine zero bytes, i.e. a run of AMF
+/// Numbers `0.0`, so a reader that keeps decoding values to the end of
+/// the tag finds well-formed ones. (Padding with a String property was
+/// tried first; a black-box reader gave up on `onMetaData` at a
+/// kilobyte-long string, and at AMF type 12.)
 fn keyframes_region(entries: &[(u64, i64)], region: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(region);
     amf_key(&mut out, "keyframes");
@@ -506,13 +520,10 @@ fn keyframes_region(entries: &[(u64, i64)], region: usize) -> Vec<u8> {
         out.push(0x00);
         out.extend_from_slice(&(*ms as f64 / 1000.0).to_be_bytes());
     }
-    out.extend_from_slice(&[0x00, 0x00, 0x09]);
-    let pad = region - out.len() - FILLER_OVERHEAD;
-    amf_key(&mut out, "filler");
-    out.push(0x0C);
-    out.extend_from_slice(&(pad as u32).to_be_bytes());
-    out.resize(out.len() + pad, b' ');
-    debug_assert_eq!(out.len(), region);
+    // End of the `keyframes` object, end of the onMetaData array.
+    out.extend_from_slice(&[0x00, 0x00, 0x09, 0x00, 0x00, 0x09]);
+    debug_assert!(out.len() <= region && (region - out.len()).is_multiple_of(9));
+    out.resize(region, 0);
     out
 }
 
@@ -535,7 +546,6 @@ fn is_structural_key(key: &str) -> bool {
             | "stereo"
             | "filesize"
             | "keyframes"
-            | "filler"
             | "canSeekToEnd"
             | "encryption"
             | "xmp"
@@ -620,6 +630,7 @@ impl FlvMuxer {
         let t = &mut self.tracks[idx];
         t.config.clear();
         t.config.extend_from_slice(config);
+        t.tags += 1;
         Ok(())
     }
 
@@ -755,12 +766,14 @@ impl Muxer for FlvMuxer {
         count += 1;
         let cap = self.options.keyframe_index_capacity;
         if cap > 0 && video.is_some() {
-            let region = keyframes_object_len(cap) + FILLER_OVERHEAD;
+            // The region includes the array's end marker.
+            let region = keyframes_region_len(cap);
             patch.keyframes = Some((body.len() as u64, region));
             body.extend_from_slice(&keyframes_region(&[], region));
-            count += 2;
+            count += 1;
+        } else {
+            body.extend_from_slice(&[0x00, 0x00, 0x09]);
         }
-        body.extend_from_slice(&[0x00, 0x00, 0x09]);
         body[count_at..count_at + 4].copy_from_slice(&count.to_be_bytes());
 
         // --- file header, PreviousTagSize0, the script tag ---
@@ -877,6 +890,7 @@ impl Muxer for FlvMuxer {
             self.note_keyframe(pos, ts);
         }
         self.tracks[idx].bytes += data.len() as u64;
+        self.tracks[idx].tags += 1;
         let dur_ms = packet.duration.map_or(0, |d| to_ms(d, packet.time_base));
         self.end_ms = self
             .end_ms
@@ -916,6 +930,17 @@ impl Muxer for FlvMuxer {
                     let kbps = t.bytes as f64 * 8.0 / seconds / 1000.0;
                     patches.push((at, kbps.to_be_bytes().to_vec()));
                 }
+            }
+            // The header's TypeFlags promised every stream handed to
+            // `open`; correct the promise if one never produced a tag.
+            let wrote = |video: bool| {
+                self.tracks
+                    .iter()
+                    .any(|t| t.carriage.is_video() == video && t.tags > 0)
+            };
+            if self.tracks.iter().any(|t| t.tags == 0) {
+                let flags = (u8::from(wrote(false)) << 2) | u8::from(wrote(true));
+                patches.push((4, vec![flags]));
             }
             if let Some((at, region)) = self.patch.keyframes {
                 patches.push((at, keyframes_region(&self.keyframes_for_file(), region)));
@@ -965,11 +990,14 @@ mod tests {
 
     #[test]
     fn keyframes_region_is_exact_for_any_fill() {
-        let cap = 7;
-        let region = keyframes_object_len(cap) + FILLER_OVERHEAD;
-        for n in 0..=cap {
+        let cap = MAX_KEYFRAME_ENTRIES;
+        let region = keyframes_region_len(cap);
+        for n in [0, 1, 7, cap - 1, cap] {
             let e: Vec<(u64, i64)> = (0..n as u64).map(|i| (i * 100, i as i64 * 2000)).collect();
-            assert_eq!(keyframes_region(&e, region).len(), region);
+            let r = keyframes_region(&e, region);
+            assert_eq!(r.len(), region);
+            assert_eq!(keyframes_region_len(n), region - 18 * (cap - n));
+            assert!(r[keyframes_region_len(n)..].iter().all(|b| *b == 0));
         }
     }
 

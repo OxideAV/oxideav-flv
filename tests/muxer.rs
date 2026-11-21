@@ -397,14 +397,10 @@ fn keyframe_table_is_written_in_place_and_used_for_seeking() {
         &packets,
     );
     // Reserving the table costs a fixed amount, known up front.
-    assert_eq!(tabled.len() - plain.len(), 100 * 18 + 60);
+    assert_eq!(tabled.len() - plain.len(), 100 * 18 + 47);
 
     let input: Box<dyn ReadSeek> = Box::new(Cursor::new(tabled));
     let mut d = open_demuxer_concrete(input, &NullCodecResolver).unwrap();
-    assert!(
-        meta(&d, "filler").is_none(),
-        "reserved space is not metadata"
-    );
     for target in [119_999i64, 0, 61_234, 2_000, 1_999, 100_000] {
         let want = target / 2_000 * 2_000;
         assert_eq!(d.seek_to(0, target).unwrap(), want);

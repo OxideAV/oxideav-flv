@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tests/crosscheck.rs`: ten codec pairs (legacy and Enhanced-RTMP
+  FourCC) written by a black-box writer are opened here and compared
+  with a black-box reader's stream facts and packet counts; the packets
+  are remuxed with `FlvMuxer` and the black-box reader must report the
+  same for our file and decode from a seek point in it. Skipped at run
+  time when the tools are absent.
+- `amf0::MAX_NESTING`, `amf3::MAX_NESTING`, `amf3::MAX_DECODED`.
+
 - `FlvMuxer` — a streaming `oxideav_core::Muxer`, registered as the
   `flv` muxer (`open_muxer`, `open_muxer_concrete`,
   `open_muxer_with_options` + `FlvMuxerOptions`). Each packet is written
@@ -62,7 +70,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Default` on `Amf3Array` / `Amf3Object`, and `with_*` setters on those
   plus `ColorInfo`, `ColorConfig`, `HdrCll`, `HdrMdcv`.
 
+### Fixed
+
+- AMF0 and AMF3 parsers recursed without bound on nested arrays /
+  objects: a script tag of nested array markers could exhaust the
+  stack. Nesting is limited to 64 levels.
+- AMF3 references expanded without bound: a short run of references to
+  one large string or array could decode to gigabytes. The total decoded
+  size of one value is limited to 64 MiB.
+- AMF0 strict arrays whose declared count exceeds the remaining data
+  are rejected before any element is parsed.
+- `onCuePoint` numbering scanned the whole metadata bag per cue point
+  (quadratic) and could overflow on a crafted `cuepoint.4294967295.*`
+  key.
+- `FlvMuxer` clears the header's audio / video flag for a stream that
+  never produced a tag, and pads its reserved keyframe table after the
+  value's end marker (a string filler property made a black-box reader
+  abandon `onMetaData`).
+- Fuzz harnesses: `script_metadata_roundtrip` panicked on every input
+  (its file had no media tags, so it never opened) and `amf3_roundtrip`
+  compared NaN-carrying values with `==`.
+
 ### Changed
+
+- A sync point is a coded key frame: AVC sequence headers /
+  end-of-sequence markers and Ex `SequenceStart` / `SequenceEnd` /
+  `Metadata` tags carry key-frame type bits but are no longer seek
+  targets.
+- A frame tag that holds only its framing bytes (some writers close a
+  stream with one) yields no packet.
+- `flv.conflict.header_flags` is reported for a stream the header
+  promises but the file lacks only once the whole file has been seen.
+- The metadata bag stops growing at 65 536 entries.
 
 - Demuxer I/O goes through one 64 KiB sliding window: a tag is parsed
   in place and its payload copied once (was: four `read` + three `seek`

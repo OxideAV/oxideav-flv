@@ -930,3 +930,42 @@ fn inactive_streams_are_skipped() {
     d.seek_to(0, 0).unwrap();
     assert_eq!(drain(&mut d).len(), all.len());
 }
+
+// ---- hostile script data ----------------------------------------------------
+
+#[test]
+fn script_tags_cannot_overflow_grow_without_bound_or_exhaust_the_stack() {
+    let mut f = Flv::new(true, false);
+    // A property that looks like the last possible cue-point index…
+    f.meta(&MetadataBag::new().string("cuepoint.4294967295.name", "x"));
+    // …followed by a real cue point (index arithmetic must not wrap),
+    let mut cue = vec![0x02, 0, 10];
+    cue.extend_from_slice(b"onCuePoint");
+    cue.extend_from_slice(&[0x03, 0, 1, b'k', 0x05, 0, 0, 0x09]);
+    f.tag(0x12, 0, &cue);
+    // a script tag nested 100 000 arrays deep,
+    let mut deep = vec![0x02, 0, 1, b'd'];
+    for _ in 0..100_000 {
+        deep.extend_from_slice(&[0x0A, 0, 0, 0, 1]);
+    }
+    deep.push(0x05);
+    f.tag(0x12, 0, &deep);
+    f.tag(0x08, 0, &mp3(10));
+    // and a caption-style script tag on every frame of a long stream.
+    let mut text = vec![0x02, 0, 10];
+    text.extend_from_slice(b"onTextData");
+    text.extend_from_slice(&[0x02, 0, 2, b'h', b'i']);
+    for i in 0..40_000u32 {
+        f.tag(0x12, i * 20, &text);
+        f.tag(0x08, i * 20, &[0x2F, 1]);
+    }
+    let mut d = open(f.finish());
+    assert_eq!(drain(&mut d).len(), 40_001);
+    assert!(d.metadata().len() <= 65_536, "{}", d.metadata().len());
+    assert!(d.metadata().len() > 60_000);
+    assert!(
+        d.metadata()
+            .iter()
+            .any(|(k, _)| k == "cuepoint.4294967295.k")
+    );
+}

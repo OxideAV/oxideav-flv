@@ -95,6 +95,10 @@ const MAX_DISCOVERY_TAGS: u32 = 256;
 /// never reads further than this, so opening a multi-gigabyte or
 /// still-growing file costs the same as opening a short one.
 const MAX_DISCOVERY_BYTES: u64 = 4 << 20;
+/// Most `(key, value)` entries the metadata bag will hold. Script tags
+/// keep arriving for as long as a live stream runs; past this many
+/// entries further ones are not recorded.
+const MAX_METADATA_ENTRIES: usize = 65_536;
 /// `PreviousTagSize` (UI32) + the 11-byte tag header: the fixed prefix
 /// of one record of the file body (spec §E.3).
 const RECORD_PREFIX: usize = 4 + 11;
@@ -145,6 +149,8 @@ pub fn open_concrete(
     let mut embedded_images: Vec<EmbeddedImage> = Vec::new();
     let mut clock = Clock::default();
     let mut tags_scanned: u32 = 0;
+    // Whether discovery saw the whole file (as far as it exists now).
+    let mut reached_end = false;
     while tags_scanned < MAX_DISCOVERY_TAGS {
         let have_any = found[0].is_some() || found[1].is_some();
         if found[0].is_some() && found[1].is_some() && !awaiting_config[0] && !awaiting_config[1] {
@@ -159,6 +165,7 @@ pub fn open_concrete(
             break;
         }
         let Some(header) = peek_record(&mut reader)? else {
+            reached_end = true;
             break;
         };
         let total = RECORD_PREFIX + header.data_size as usize;
@@ -241,7 +248,7 @@ pub fn open_concrete(
     }
 
     // Where `onMetaData` and the tags disagree the tags win; say so.
-    report_conflicts(&hdr, &found, keys, &mut metadata);
+    report_conflicts(&hdr, &found, keys, reached_end, &mut metadata);
 
     // Audio is stream 0 when present, video follows; a missing kind
     // leaves no gap.
@@ -352,16 +359,40 @@ fn is_media(kind: Option<TagType>) -> bool {
     matches!(kind, Some(TagType::Audio | TagType::Video))
 }
 
-/// Whether a tag is a point playback can start from: a video key frame
-/// when the file has video, any audio tag otherwise. `first` is the
-/// first body byte (the Audio/VideoTagHeader byte).
-fn is_sync_tag(kind: Option<TagType>, first: Option<u8>, has_video: bool) -> bool {
-    match (kind, first) {
-        (Some(TagType::Video), Some(b)) if has_video => {
+/// Whether a video tag's frame-type bits say "key frame". `first` is
+/// the first body byte.
+fn is_key_typed(first: u8) -> bool {
+    if (first & crate::ex_video::EX_HEADER_FLAG) != 0 {
+        ExFrameType::from_u8((first >> 4) & 0x07).is_keyframe()
+    } else {
+        VideoTagHeader::parse(first).is_keyframe()
+    }
+}
+
+/// Whether a tag is a point playback can start from: a coded video key
+/// frame when the file has video, any audio tag otherwise. `head` is
+/// the first two body bytes (fewer if the body is shorter).
+///
+/// Sequence headers and end-of-sequence markers carry the key-frame
+/// type bits too but hold no picture, so the packet-type field is
+/// consulted where the first two bytes expose it: legacy AVC
+/// (`AVCPacketType` must be 1) and single-track Ex tags (`CodedFrames`
+/// / `CodedFramesX`). ModEx- or multitrack-wrapped Ex tags keep the
+/// frame-type answer.
+fn is_sync_tag(kind: Option<TagType>, head: &[u8], has_video: bool) -> bool {
+    match (kind, head.first()) {
+        (Some(TagType::Video), Some(&b)) if has_video => {
+            if !is_key_typed(b) {
+                return false;
+            }
             if (b & crate::ex_video::EX_HEADER_FLAG) != 0 {
-                ExFrameType::from_u8((b >> 4) & 0x07).is_keyframe()
+                // PacketType: 1 CodedFrames, 3 CodedFramesX, 6
+                // Multitrack, 7 ModEx.
+                matches!(b & 0x0F, 1 | 3 | 6 | 7)
+            } else if (b & 0x0F) == VIDEO_CODEC_H264 {
+                head.get(1) == Some(&1)
             } else {
-                VideoTagHeader::parse(b).is_keyframe()
+                true
             }
         }
         (Some(TagType::Audio), Some(_)) => !has_video,
@@ -514,6 +545,7 @@ fn report_conflicts(
     hdr: &FlvHeader,
     found: &[Option<StreamInfo>; 2],
     keys: [Option<u32>; 2],
+    reached_end: bool,
     metadata: &mut Vec<(String, String)>,
 ) {
     let mut notes: Vec<(String, String)> = Vec::new();
@@ -579,7 +611,12 @@ fn report_conflicts(
         (false, false) => "none",
     };
     let seen = (keys[0].is_some(), keys[1].is_some());
-    if (hdr.has_audio, hdr.has_video) != seen {
+    // Tags of a kind the header denies are a contradiction as soon as
+    // one is seen; a kind the header promises is only missing once the
+    // whole file has been looked at.
+    let undeclared = (seen.0 && !hdr.has_audio) || (seen.1 && !hdr.has_video);
+    let absent = (hdr.has_audio && !seen.0) || (hdr.has_video && !seen.1);
+    if undeclared || (absent && reached_end) {
         notes.push((
             "flv.conflict.header_flags".into(),
             format!(
@@ -1103,19 +1140,28 @@ impl FlvDemuxer {
             }
             let header = parse_tag_header(&self.reader.window()[4..RECORD_PREFIX]);
             let total = RECORD_PREFIX + header.data_size as usize;
-            let first = if header.data_size > 0 {
-                if !self.reader.fill(RECORD_PREFIX + 1)? {
-                    break;
-                }
-                Some(self.reader.window()[RECORD_PREFIX])
-            } else {
-                None
-            };
+            let head_len = (header.data_size as usize).min(2);
+            if !self.reader.fill(RECORD_PREFIX + head_len)? {
+                break;
+            }
+            let head = [
+                self.reader
+                    .window()
+                    .get(RECORD_PREFIX)
+                    .copied()
+                    .unwrap_or(0),
+                self.reader
+                    .window()
+                    .get(RECORD_PREFIX + 1)
+                    .copied()
+                    .unwrap_or(0),
+            ];
+            let head = &head[..head_len];
             if record_pos == self.index.scanned_to {
                 clock = self.index.clock;
             }
             let ts = clock.stamp(header.kind, header.timestamp_ms);
-            let sync = is_sync_tag(header.kind, first, has_video);
+            let sync = is_sync_tag(header.kind, head, has_video);
             if sync && ts > target {
                 break;
             }
@@ -1144,7 +1190,9 @@ impl FlvDemuxer {
     }
 
     /// Verify that the keyframe table's claim "a key frame stamped
-    /// `table_ts` starts at byte `tag_pos`" holds in the file.
+    /// `table_ts` starts at byte `tag_pos`" holds in the file. (A video
+    /// tag with key-frame type bits is enough here: some writers list
+    /// the sequence header that precedes the first picture.)
     fn check_table_entry(&mut self, tag_pos: u64, table_ts: i64) -> Result<Option<IndexEntry>> {
         // The table gives the offset of the tag; the record starts at
         // the `PreviousTagSize` four bytes earlier.
@@ -1162,7 +1210,8 @@ impl FlvDemuxer {
         let header = parse_tag_header(&w[4..RECORD_PREFIX]);
         if header.data_size == 0
             || header.stream_id != 0
-            || !is_sync_tag(header.kind, Some(w[RECORD_PREFIX]), true)
+            || header.kind != Some(TagType::Video)
+            || !is_key_typed(w[RECORD_PREFIX])
         {
             return Ok(None);
         }
@@ -1368,7 +1417,7 @@ impl Demuxer for FlvDemuxer {
             if at_frontier {
                 let sync = is_sync_tag(
                     header.kind,
-                    body.first().copied(),
+                    &body[..body.len().min(2)],
                     self.video_stream_index.is_some(),
                 );
                 self.index.note(record_pos, total, self.clock, ts, sync);
@@ -1501,7 +1550,11 @@ impl Demuxer for FlvDemuxer {
                 }
             }
             self.reader.consume(total);
-            if let Some(pkt) = out {
+            // A frame tag that holds only its framing bytes carries
+            // nothing to decode (some writers close a stream with one).
+            if let Some(pkt) = out
+                && (!pkt.data.is_empty() || pkt.flags.header)
+            {
                 return Ok(pkt);
             }
         }
@@ -2367,6 +2420,11 @@ fn parse_script_body(
     //                                 preserved verbatim in metadata as
     //                                 cuepoint.<key> entries
     //   |AdditionalHeader  (F.2.1) — FLV encryption headline
+    // A stream can carry script tags for as long as it runs (captions,
+    // cue points, status); the bag stops growing at a fixed size.
+    if metadata.len() >= MAX_METADATA_ENTRIES {
+        return;
+    }
     let (name, p) = match parse_amf0_value(body, 0) {
         Ok(v) => v,
         Err(_) => return,
@@ -2392,19 +2450,18 @@ fn parse_script_body(
             // Annex A: per-cue parameter pack. Surface the fields under
             // a `cuepoint.<n>.<key>` prefix so callers see them without
             // pulling in a full AMF cue model.
+            //
+            // Cue points are appended in order, so the newest
+            // `cuepoint.<n>.` entry (found from the back) carries the
+            // highest index.
             let n = metadata
                 .iter()
-                .filter(|(k, _)| k.starts_with("cuepoint."))
-                .map(|(k, _)| {
-                    // extract integer index between the two dots
-                    k.split('.')
-                        .nth(1)
-                        .and_then(|s| s.parse::<u32>().ok())
-                        .unwrap_or(0)
+                .rev()
+                .find_map(|(k, _)| {
+                    let rest = k.strip_prefix("cuepoint.")?;
+                    rest.split(['.', '[']).next()?.parse::<u32>().ok()
                 })
-                .max()
-                .map(|m| m + 1)
-                .unwrap_or(0);
+                .map_or(0, |m| m.saturating_add(1));
             flatten_amf_value(&value, &format!("cuepoint.{n}"), metadata);
         }
         "onImageData" => {
@@ -2490,6 +2547,9 @@ fn parse_on_metadata(
         _ => return,
     };
     for (k, v) in entries {
+        if metadata.len() >= MAX_METADATA_ENTRIES {
+            break;
+        }
         match v {
             AmfValue::Number(n) => {
                 // Duration is in seconds — convert to microseconds and
@@ -2506,9 +2566,6 @@ fn parse_on_metadata(
                 metadata.push((k.clone(), format_number(*n)));
             }
             AmfValue::Boolean(b) => metadata.push((k.clone(), b.to_string())),
-            // Blank space a writer reserved so it can grow the
-            // `keyframes` table in place — not information.
-            AmfValue::String(s) if k == "filler" && s.bytes().all(|b| b == b' ') => {}
             AmfValue::String(s) => metadata.push((k.clone(), s.clone())),
             AmfValue::Object(_) | AmfValue::EcmaArray(_) | AmfValue::TypedObject { .. }
                 if k == "keyframes" && keyframe_index.is_none() =>
@@ -2665,6 +2722,9 @@ fn parse_additional_header(value: &AmfValue) -> Option<EncryptionHeadline> {
 /// pairs and append them to `out`. Used for `onCuePoint` payloads where
 /// the spec doesn't fix the property layout.
 fn flatten_amf_value(value: &AmfValue, prefix: &str, out: &mut Vec<(String, String)>) {
+    if out.len() >= MAX_METADATA_ENTRIES {
+        return;
+    }
     match value {
         AmfValue::Number(n) => out.push((prefix.into(), format_number(*n))),
         AmfValue::Boolean(b) => out.push((prefix.into(), b.to_string())),
@@ -2706,6 +2766,9 @@ fn flatten_amf_value(value: &AmfValue, prefix: &str, out: &mut Vec<(String, Stri
 /// [`flatten_amf_value`] uses for AMF0 — so callers consuming the
 /// `metadata[...]` bag see AVM+ payloads under the same prefix scheme.
 fn flatten_amf3_value(value: &Amf3Value, prefix: &str, out: &mut Vec<(String, String)>) {
+    if out.len() >= MAX_METADATA_ENTRIES {
+        return;
+    }
     match value {
         Amf3Value::Undefined => out.push((prefix.into(), "undefined".into())),
         Amf3Value::Null => out.push((prefix.into(), "null".into())),

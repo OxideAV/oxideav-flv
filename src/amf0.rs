@@ -143,9 +143,24 @@ impl AmfValue {
     }
 }
 
+/// Deepest nesting of Objects / arrays the parser follows. Real
+/// `onMetaData` payloads nest two or three levels; the bound keeps a
+/// crafted run of array markers from exhausting the stack.
+pub const MAX_NESTING: usize = 64;
+
 /// Parse a single AMF0 value starting at `pos`. On success the new
 /// position is returned so the caller can walk a sequence of values.
+///
+/// Values nested more than [`MAX_NESTING`] levels deep are rejected
+/// with [`Error::InvalidData`].
 pub fn parse_amf0_value(data: &[u8], pos: usize) -> Result<(AmfValue, usize)> {
+    parse_value(data, pos, 0)
+}
+
+fn parse_value(data: &[u8], pos: usize, depth: usize) -> Result<(AmfValue, usize)> {
+    if depth > MAX_NESTING {
+        return Err(Error::invalid("AMF0: value nested too deeply"));
+    }
     let mut p = pos;
     let marker = peek_byte(data, p)?;
     p += 1;
@@ -172,7 +187,7 @@ pub fn parse_amf0_value(data: &[u8], pos: usize) -> Result<(AmfValue, usize)> {
         }
         0x03 => {
             // Anonymous object.
-            let (body, np) = parse_object_body(data, p)?;
+            let (body, np) = parse_object_body(data, p, depth + 1)?;
             p = np;
             AmfValue::Object(body)
         }
@@ -191,7 +206,7 @@ pub fn parse_amf0_value(data: &[u8], pos: usize) -> Result<(AmfValue, usize)> {
             p = p
                 .checked_add(4)
                 .ok_or_else(|| Error::invalid("AMF0 overflow"))?;
-            let (body, np) = parse_object_body(data, p)?;
+            let (body, np) = parse_object_body(data, p, depth + 1)?;
             p = np;
             AmfValue::EcmaArray(body)
         }
@@ -199,9 +214,13 @@ pub fn parse_amf0_value(data: &[u8], pos: usize) -> Result<(AmfValue, usize)> {
             // Strict array — u32 BE count + values.
             let count = read_u32_be(data, p)? as usize;
             p += 4;
+            // Every element takes at least its marker byte.
+            if count > data.len().saturating_sub(p) {
+                return Err(Error::invalid("AMF0: strict array longer than its data"));
+            }
             let mut out = Vec::with_capacity(count.min(256));
             for _ in 0..count {
-                let (v, np) = parse_amf0_value(data, p)?;
+                let (v, np) = parse_value(data, p, depth + 1)?;
                 out.push(v);
                 p = np;
             }
@@ -246,7 +265,7 @@ pub fn parse_amf0_value(data: &[u8], pos: usize) -> Result<(AmfValue, usize)> {
             p += 2;
             let class_name = read_utf8(data, p, class_name_len)?;
             p += class_name_len;
-            let (body, np) = parse_object_body(data, p)?;
+            let (body, np) = parse_object_body(data, p, depth + 1)?;
             p = np;
             AmfValue::TypedObject { class_name, body }
         }
@@ -269,7 +288,11 @@ pub fn parse_amf0_value(data: &[u8], pos: usize) -> Result<(AmfValue, usize)> {
 /// Parse the "(key, value)* end-marker" body shared by Object (`0x03`)
 /// and EcmaArray (`0x08`). The terminator is a zero-length key
 /// followed by the object-end marker byte `0x09`.
-fn parse_object_body(data: &[u8], start: usize) -> Result<(Vec<(String, AmfValue)>, usize)> {
+fn parse_object_body(
+    data: &[u8],
+    start: usize,
+    depth: usize,
+) -> Result<(Vec<(String, AmfValue)>, usize)> {
     let mut p = start;
     let mut out: Vec<(String, AmfValue)> = Vec::new();
     loop {
@@ -284,7 +307,7 @@ fn parse_object_body(data: &[u8], start: usize) -> Result<(Vec<(String, AmfValue
         p += 2;
         let key = read_utf8(data, p, key_len)?;
         p += key_len;
-        let (value, np) = parse_amf0_value(data, p)?;
+        let (value, np) = parse_value(data, p, depth)?;
         p = np;
         out.push((key, value));
     }
@@ -634,6 +657,40 @@ mod tests {
             }
             _ => panic!("expected object"),
         }
+    }
+
+    #[test]
+    fn nesting_is_bounded() {
+        // 200 000 nested one-element strict arrays: must be an error,
+        // not a stack overflow.
+        let mut b = Vec::new();
+        for _ in 0..200_000 {
+            b.extend_from_slice(&[0x0A, 0, 0, 0, 1]);
+        }
+        b.push(0x05);
+        assert!(matches!(
+            parse_amf0_value(&b, 0),
+            Err(Error::InvalidData(_))
+        ));
+        // …and likewise through objects.
+        let mut b = Vec::new();
+        for _ in 0..200_000 {
+            b.extend_from_slice(&[0x03, 0, 1, b'k']);
+        }
+        assert!(parse_amf0_value(&b, 0).is_err());
+        // The limit itself is generous.
+        let mut b = Vec::new();
+        for _ in 0..MAX_NESTING {
+            b.extend_from_slice(&[0x0A, 0, 0, 0, 1]);
+        }
+        b.push(0x05);
+        assert!(parse_amf0_value(&b, 0).is_ok());
+    }
+
+    #[test]
+    fn strict_array_count_beyond_data_is_rejected_early() {
+        let b = [0x0A, 0xFF, 0xFF, 0xFF, 0xFF, 0x05];
+        assert!(parse_amf0_value(&b, 0).is_err());
     }
 
     #[test]

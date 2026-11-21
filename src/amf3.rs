@@ -271,6 +271,64 @@ struct State {
     objects: Vec<Amf3Value>,
     /// Traits reference table (§3.12 + §2.2).
     traits: Vec<TraitsEntry>,
+    /// Current Array / Object nesting.
+    depth: usize,
+    /// Bytes of decoded value produced so far (see [`MAX_DECODED`]).
+    produced: usize,
+}
+
+/// Deepest Array / Object nesting the decoder follows.
+pub const MAX_NESTING: usize = 64;
+
+/// Ceiling on the total size of the values one decode pass produces.
+///
+/// AMF3 references let a few bytes of input stand for an arbitrarily
+/// large earlier value, so the size of the output is not bounded by the
+/// size of the input. Every string and every complex value (Array,
+/// Object, Date, XML, ByteArray) is charged at its decoded size each
+/// time it is produced — as a literal or through a reference alike —
+/// and decoding stops with [`Error::InvalidData`] once the sum passes
+/// this bound. A script tag is at most 16 MiB, so honest data nested a
+/// few levels deep stays well below it.
+pub const MAX_DECODED: usize = 64 << 20;
+
+impl State {
+    fn charge(&mut self, bytes: usize) -> Result<()> {
+        self.produced = self.produced.saturating_add(bytes);
+        if self.produced > MAX_DECODED {
+            return Err(Error::invalid(
+                "AMF3: decoded value exceeds the size limit (reference expansion)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Approximate in-memory size of a decoded value.
+fn weight(v: &Amf3Value) -> usize {
+    const NODE: usize = 16;
+    match v {
+        Amf3Value::String(s) | Amf3Value::Xml(s) | Amf3Value::XmlDocument(s) => NODE + s.len(),
+        Amf3Value::ByteArray(b) => NODE + b.len(),
+        Amf3Value::Array(a) => {
+            NODE + a
+                .assoc
+                .iter()
+                .map(|(k, v)| k.len() + weight(v))
+                .sum::<usize>()
+                + a.dense.iter().map(weight).sum::<usize>()
+        }
+        Amf3Value::Object(o) => {
+            NODE + o.class_name.len()
+                + o.sealed_names.iter().map(String::len).sum::<usize>()
+                + o.sealed_values.iter().map(weight).sum::<usize>()
+                + o.dynamic_members
+                    .iter()
+                    .map(|(k, v)| k.len() + weight(v))
+                    .sum::<usize>()
+        }
+        _ => NODE,
+    }
 }
 
 /// Entry in the traits reference table.
@@ -332,15 +390,20 @@ fn parse_value(data: &[u8], pos: usize, state: &mut State) -> Result<(Amf3Value,
             p = np;
             date
         }
-        0x09 => {
-            let (arr, np) = read_array(data, p, state)?;
+        0x09 | 0x0A => {
+            if state.depth >= MAX_NESTING {
+                return Err(Error::invalid("AMF3: value nested too deeply"));
+            }
+            state.depth += 1;
+            let r = if marker == 0x09 {
+                read_array(data, p, state)
+            } else {
+                read_object(data, p, state)
+            };
+            state.depth -= 1;
+            let (v, np) = r?;
             p = np;
-            arr
-        }
-        0x0A => {
-            let (obj, np) = read_object(data, p, state)?;
-            p = np;
-            obj
+            v
         }
         0x0B => {
             let (s, np) = read_xml_like(data, p, state, matches_xml)?;
@@ -362,6 +425,11 @@ fn parse_value(data: &[u8], pos: usize, state: &mut State) -> Result<(Amf3Value,
             )));
         }
     };
+    // Complex values are charged whole each time one is produced, so a
+    // chain of references cannot multiply the output unnoticed.
+    if marker >= 0x07 {
+        state.charge(weight(&value))?;
+    }
     Ok((value, p))
 }
 
@@ -412,16 +480,18 @@ fn read_utf8_vr(data: &[u8], pos: usize, state: &mut State) -> Result<(String, u
     if u & 1 == 0 {
         // Reference path.
         let idx = (u >> 1) as usize;
-        let s = state
+        let len = state
             .strings
             .get(idx)
             .ok_or_else(|| Error::invalid("AMF3: string-ref out of range"))?
-            .clone();
-        Ok((s, p))
+            .len();
+        state.charge(len)?;
+        Ok((state.strings[idx].clone(), p))
     } else {
         let len = (u >> 1) as usize;
         let s = read_utf8(data, p, len)?;
         p += len;
+        state.charge(len)?;
         // Per §3.8: the empty string is never stored as a reference.
         if !s.is_empty() {
             state.strings.push(s.clone());
@@ -1470,6 +1540,60 @@ mod tests {
                 Amf3Value::ByteArray(vec![0xDE, 0xAD, 0xBE])
             ]
         );
+    }
+
+    #[test]
+    fn nesting_is_bounded() {
+        // 100 000 nested one-element arrays: an error, not a stack
+        // overflow. (0x09 array, U29 "1 dense element", empty key.)
+        let mut b = Vec::new();
+        for _ in 0..100_000 {
+            b.extend_from_slice(&[0x09, 0x03, 0x01]);
+        }
+        b.push(0x01);
+        assert!(matches!(
+            parse_amf3_value(&b, 0),
+            Err(Error::InvalidData(_))
+        ));
+        let mut b = Vec::new();
+        for _ in 0..MAX_NESTING {
+            b.extend_from_slice(&[0x09, 0x03, 0x01]);
+        }
+        b.push(0x01);
+        assert!(parse_amf3_value(&b, 0).is_ok());
+    }
+
+    #[test]
+    fn reference_expansion_is_bounded() {
+        // One 1 MiB string, then an array holding 200 references to
+        // it: ~600 bytes of references would become 200 MiB.
+        let big = 1usize << 20;
+        let mut b = vec![0x09];
+        b.extend_from_slice(&u29_lit_len(201));
+        b.push(0x01); // no associative part
+        b.push(0x06);
+        b.extend_from_slice(&u29_lit_len(big));
+        b.resize(b.len() + big, b'a');
+        for _ in 0..200 {
+            b.push(0x06);
+            b.extend_from_slice(&u29_ref(0));
+        }
+        assert!(matches!(
+            parse_amf3_value(&b, 0),
+            Err(Error::InvalidData(_))
+        ));
+        // A handful of references to the same string is ordinary.
+        let mut b = vec![0x09];
+        b.extend_from_slice(&u29_lit_len(4));
+        b.push(0x01);
+        b.push(0x06);
+        b.extend_from_slice(&u29_lit_len(big));
+        b.resize(b.len() + big, b'a');
+        for _ in 0..3 {
+            b.push(0x06);
+            b.extend_from_slice(&u29_ref(0));
+        }
+        assert!(parse_amf3_value(&b, 0).is_ok());
     }
 
     #[test]
