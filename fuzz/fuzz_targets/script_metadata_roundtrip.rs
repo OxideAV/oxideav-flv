@@ -136,6 +136,14 @@ fuzz_target!(|data: &[u8]| {
     if script::write_on_metadata(&mut buf, &bag).is_err() {
         return;
     }
+    // One media tag per kind, so the file has streams to open (a file
+    // of script tags alone is rightly refused).
+    for (kind, body) in [
+        (tag::TagType::Audio, &[0x2F, 0x00][..]),
+        (tag::TagType::Video, &[0x12, 0x00][..]),
+    ] {
+        tag::write_tag(&mut buf, kind, 0, 0, body).expect("tag");
+    }
 
     // Demux it.
     let input: Box<dyn ReadSeek> = Box::new(Cursor::new(buf));

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Scheduled `Fuzz` workflow (daily, 30 minutes) and two structured fuzz
+  targets: `demux_seek` (tag-structured files with fuzz-controlled
+  bodies, forged sizes, wrong back-pointers, raw injections and
+  truncation, driven through `open` / `next_packet` / `seek_to` /
+  `set_active_streams`) and `mux_roundtrip` (fuzz-chosen codecs,
+  options and packets through `FlvMuxer` and back). `demuxer_open_next`
+  now supplies the file header itself so mutation reaches the tag
+  stream (edge coverage 61 → 2 382 in two minutes).
+
 - `tests/crosscheck.rs`: ten codec pairs (legacy and Enhanced-RTMP
   FourCC) written by a black-box writer are opened here and compared
   with a black-box reader's stream facts and packet counts; the packets

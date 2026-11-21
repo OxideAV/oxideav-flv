@@ -33,7 +33,19 @@ use oxideav_flv::open_demuxer;
 const MAX_PACKETS: usize = 4096;
 
 fuzz_target!(|data: &[u8]| {
-    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(data.to_vec()));
+    // An input that does not already start with the file signature is
+    // taken as the file *body*: the 9-byte header is supplied (flags
+    // from the first byte) so the mutator's work goes into the tag
+    // stream instead of into rediscovering the magic.
+    let bytes = if data.starts_with(b"FLV") {
+        data.to_vec()
+    } else {
+        let flags = data.first().copied().unwrap_or(5) & 0x05;
+        let mut v = vec![b'F', b'L', b'V', 1, flags, 0, 0, 0, 9];
+        v.extend_from_slice(data.get(1..).unwrap_or(&[]));
+        v
+    };
+    let input: Box<dyn ReadSeek> = Box::new(Cursor::new(bytes));
     let mut dmx = match open_demuxer(input, &NullCodecResolver) {
         Ok(d) => d,
         Err(_) => return,

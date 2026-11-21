@@ -44,7 +44,15 @@ fuzz_target!(|data: &[u8]| {
     // and consume every byte we wrote.
     let (value2, consumed2) = parse_amf3_value(&enc, 0).expect("re-encoded AMF3 must decode");
     assert_eq!(consumed2, enc.len(), "decoder left trailing encoder bytes");
-    assert_eq!(value, value2, "value drifted across encode→decode");
+    // Compared through `Debug`: a Double / Date holding NaN is a value
+    // the decoder legitimately produces, and NaN != NaN under
+    // `PartialEq`. The byte-level fixed point below pins the exact
+    // bits.
+    assert_eq!(
+        format!("{value:?}"),
+        format!("{value2:?}"),
+        "value drifted across encode→decode"
+    );
 
     // Phase 4 — fixed point: a second encode must be byte-identical to
     // the first (the canonical form is stable under repeated encoding).

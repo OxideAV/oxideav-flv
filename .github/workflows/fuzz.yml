@@ -1,0 +1,26 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. An FLV file
+# is a flat run of tags whose 24-bit DataSize, 24 + 8-bit timestamp and
+# PreviousTagSize back-pointers are all attacker-controlled, wrapped
+# around several embedded grammars: AMF0 / AMF3 script data, the
+# Enhanced-RTMP ExVideo / ExAudio headers with their ModEx and
+# multitrack loops, and the encryption preamble. The targets share the
+# budget: `demuxer_open_next` and `demux_seek` (arbitrary and
+# tag-structured input through open / next_packet / seek_to — never a
+# panic, an unbounded allocation or a non-terminating walk),
+# `mux_roundtrip` (valid-by-construction packets through the muxer and
+# back, compared field by field), the AMF parsers and their
+# encode / decode differentials, and the legacy audio writers.
+
+on:
+  schedule:
+    - cron: "23 5 * * *"   # daily 05:23 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

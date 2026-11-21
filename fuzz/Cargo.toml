@@ -52,6 +52,20 @@ cargo-fuzz = true
 #                          in order. Differential mux -> demux test of
 #                          the legacy audio tag writers.
 #
+#  * `demux_seek`       — tag-structured input: every record of the
+#                          recipe becomes a well-formed tag with a
+#                          fuzz-controlled body (or a forged DataSize,
+#                          a wrong back-pointer, raw injected bytes, a
+#                          truncated tail), then `open` / `next_packet`
+#                          / `seek_to` / `set_active_streams` are
+#                          interleaved. Reaches the script, Ex-header,
+#                          ModEx, multitrack and encryption parsers
+#                          that arbitrary bytes almost never get to.
+#  * `mux_roundtrip`    — fuzz-chosen codecs, options and packets
+#                          through `FlvMuxer` and back through
+#                          `FlvDemuxer`; packets, stream facts, stats
+#                          and seek landing points must all agree.
+#
 # The fuzz crate links `oxideav-flv` via path-dep with default features
 # and depends on `oxideav-core` only transitively. No external codec
 # oracle: FLV is a clean container format and the per-codec interop is
@@ -104,5 +118,17 @@ doc = false
 [[bin]]
 name = "legacy_audio_roundtrip"
 path = "fuzz_targets/legacy_audio_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "demux_seek"
+path = "fuzz_targets/demux_seek.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "mux_roundtrip"
+path = "fuzz_targets/mux_roundtrip.rs"
 test = false
 doc = false
